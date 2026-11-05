@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="19 章正文里散落着 60 条「官方文档这么说、2.0.4 源码那么写」的核对结果，这一页把它们按章收进一张表：默认值、触发时机、参数名、未接线字段，每条都同时给出文档行号与源码行号，遇到对不上的描述先来这里查。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="附录 E 勘误汇总：官方文档 vs 2.0.4 源码 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="19 章正文里散落着 60 条「官方文档这么说、2.0.4 源码那么写」的核对结果，这一页把它们按章收进一张表：默认值、触发时机、参数名、未接线字段，每条都同时给出文档行号与源码行号，遇到对不上的描述先来这里查。" />
+    <title>附录 E 勘误汇总：官方文档 vs 2.0.4 源码 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="errata" data-root="..">
+    <main>
+      <article class="article">
+        <h1>附录 E · 勘误汇总：官方文档 vs 2.0.4 源码</h1>
+        <p class="lede">
+          这是全站最「不客气」的一页：把 19 章写作时逐条核对出来的偏差集中成一张表。左边是
+          <code>docs/v2/zh/**</code> 的原话，右边是 <code>agentscope-java-2.0.4</code> 里真正执行的代码，中间那句是「照文档写会怎么坑你」。
+          一共 <strong>60 条</strong>，去掉三组跨章重复后是 57 条独立偏差。每条都带文档与源码两套行号，可以自己复核。
+        </p>
+
+        <h2 id="how">怎么用这一页</h2>
+        <ul class="goals">
+          <li><strong>遇到「文档说可以、实际不生效」先来这里查</strong>：按章找，比翻 19 页正文快</li>
+          <li><strong>看「影响」那一列决定要不要改代码</strong>：写了会编译不过的，优先级最高；只是默认值不同的，知道就行</li>
+          <li><strong>两套出处都能点</strong>：文档那侧是 <code>docs/v2/zh/**</code> 的 md，源码那侧是 <code>agentscope-java-2.0.4</code> 的 Java 文件</li>
+          <li><strong>结论只对 2.0.4 负责</strong>：升级后先重新核对，别把这里的「未接线」当成永远成立</li>
+        </ul>
+        <div class="callout tip">
+          <span class="ct">三类偏差，处理方式不同</span>
+          <p>
+            <strong>写错了</strong>：按文档写会编译不过或配置无效，以源码为准；<strong>写旧了</strong>：文档比代码旧，先搜类名确认缺口是否已补；
+            <strong>没写全</strong>：文档只写 happy path，默认值、分支和隐藏字段要自己去源码里找。下面的表格里，三种都会遇到。
+          </p>
+        </div>
+
+        <h2 id="top">最该先知道的 8 条</h2>
+        <p>如果只看一分钟，看这八行——它们是最容易让人「照着文档做了一天，结果全白干」的偏差。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>你会怎么踩</th><th>一句话真相</th><th>详情</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>明明 <code>.stopOnReject(true)</code> 了，拒绝后模型还在重试</td>
+                <td>这个值只被存进 <code>ReactConfig</code>，core 主循环没有任何读取点</td>
+                <td><a href="#ch08-stop">08 章 · stopOnReject</a></td>
+              </tr>
+              <tr>
+                <td>没配 <code>compaction(...)</code>，长会话却被压缩，还冒出 <code>MEMORY.md</code></td>
+                <td>压缩与工具结果逐出<strong>默认就是开的</strong>，两个 disable 都是 false</td>
+                <td><a href="#ch15-default">15 章 · 默认值</a></td>
+              </tr>
+              <tr>
+                <td><code>tools.json</code> 写了 <code>allow</code>，<code>agent_spawn</code> 却还能用</td>
+                <td><code>agent_spawn</code> 在平台工具名单里，默认<strong>穿透 allow</strong></td>
+                <td><a href="#ch17-allow">17 章 · 平台工具</a></td>
+              </tr>
+              <tr>
+                <td>改了 <code>subagents/*.md</code> 的内容，运行中的 agent 没反应</td>
+                <td>默认装的是 Dynamic（每轮重载）；静态模式只补新名字，同名修改不生效</td>
+                <td><a href="#ch14-dynamic">14 章 · 两条加载路径</a></td>
+              </tr>
+              <tr>
+                <td>以为沙箱是「每个会话一个容器」，结果同用户多个会话共用一个</td>
+                <td><code>isolationScope</code> 源码默认落 <code>USER</code>，文档有两处写成 <code>SESSION</code></td>
+                <td><a href="#ch13-scope">13 章 · isolationScope</a></td>
+              </tr>
+              <tr>
+                <td><code>plan_exit</code> 按文档传 <code>rationale</code>，不报错但计划没退出</td>
+                <td>input schema 里只有一个 <code>summary</code>，多余字段被静默忽略</td>
+                <td><a href="#ch17-exit">17 章 · plan_exit 参数</a></td>
+              </tr>
+              <tr>
+                <td>照抄 <code>LocalApprovalGate.defaultPrompter()</code>，技能晋升永远批不下来</td>
+                <td>它永远返回 <code>Defer</code>，javadoc 自己写着 “never approves”</td>
+                <td><a href="#ch16-gate">16 章 · 默认闸门</a></td>
+              </tr>
+              <tr>
+                <td>市场技能按文档的三段路径找脚本，死活找不到</td>
+                <td>实际是四段：<code>.skills-cache/&lt;scope&gt;/&lt;source&gt;/&lt;name&gt;/</code></td>
+                <td><a href="#ch16-market">16 章 · 市场缓存路径</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="by-chapter">按章查</h2>
+        <p>
+          只列有偏差的 11 章（04、08、09、10、12–18）。01–03、05–07、11 与附录 A–D 没有发现「文档与源码不一致」的条目，不代表它们没有坑，
+          而是那些坑在正文的「陷阱与窍门」里，不属于勘误。同一处文档被两章引用时（Docker 镜像、isolationScope、本地状态存储强度），
+          两章都会列一次，方便按章阅读。
+        </p>
+
+        <h3 id="ch04">04 · 消息与事件（1 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch04-result">
+                <td>官方事件类型表没有 <code>AGENT_RESULT</code>，只写到 <code>AGENT_END</code></td>
+                <td><code>AgentEventType</code> 里确实有 <code>AGENT_RESULT</code>，它携带最终 <code>Msg</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentEventType.java:45">AgentEventType.java:45</span></td>
+                <td>想从事件流里重建最终消息，只等 <code>AGENT_END</code> 会拿到空结果；<code>call()</code> 能返回值靠的正是它</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch08">08 · 权限与人机交互（5 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch08-suggest">
+                <td>「建议规则」一键免问：<code>ConfirmResult.acceptedRules</code>、<code>toolCall.getSuggestedRules()</code></td>
+                <td>这两个 API <strong>不存在</strong>；<code>suggestedRules</code> 只生成，全仓没有 <code>getSuggestedRules()</code> 的消费点<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionDecision.java:93">PermissionDecision.java:93</span></td>
+                <td>照抄文档会编译不过；要「不再问」，得自己把默认建议写成 <code>PermissionRule</code> 塞进 <code>ConfirmResult.rules</code></td>
+              </tr>
+              <tr id="ch08-workdir">
+                <td><code>ACCEPT_EDITS</code> 自动放行工作目录内的编辑（<code>workingDirectories</code> 驱动）</td>
+                <td><code>PermissionEngine</code> 全文不读 <code>getWorkingDirectories()</code>；<code>ACCEPT_EDITS</code> 只按 <code>isReadOnly()</code> 放行<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionEngine.java:210">PermissionEngine.java:210</span></td>
+                <td>以为配了目录白名单就安全，实际目录内写工具仍走规则；要目录级控制得自己写 <code>PermissionRule</code></td>
+              </tr>
+              <tr id="ch08-stop">
+                <td><code>.stopOnReject(true)</code>：拒绝即终止循环</td>
+                <td>值只被赋进 <code>ReactConfig</code>，core 里除了赋值与 getter 没有读取点<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5241">ReActAgent.java:5241</span></td>
+                <td>拒绝后模型会继续下一轮；要「一拒就停」，用中间件监听 <code>AllToolsDeniedEvent</code> 再发 <code>RequestStopEvent</code></td>
+              </tr>
+              <tr id="ch08-danger">
+                <td>内置危险路径保护：<code>ToolDangerousPathConstants</code> + <code>isDangerousPath()</code></td>
+                <td>常量表与符号链接解析都在，但生产代码零调用点；内置文件工具是注解工具，不走 <code>ToolBase</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolDangerousPathConstants.java:37">ToolDangerousPathConstants.java:37</span></td>
+                <td>以为框架会拦 <code>.env</code>/<code>.ssh</code>，实际不会；要保护就自己继承 <code>ToolBase</code> 并在 <code>checkPermissions</code> 里调</td>
+              </tr>
+              <tr id="ch08-readonly">
+                <td>只读模式下，读操作应当自动放行</td>
+                <td><code>@Tool.readOnly</code> 默认 <code>false</code>，内置的 <code>view_text_file</code>/<code>list_directory</code> 都没标<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Tool.java:107">Tool.java:107</span></td>
+                <td><code>EXPLORE</code> 下连读文件都会被拒；要么给工具补 <code>readOnly = true</code>，要么别用 <code>EXPLORE</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch09">09 · Middleware 与 Hook（3 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch09-sysprompt">
+                <td><code>onSystemPrompt</code> 画在 <code>onReasoning</code> 里面，「每次组装 system prompt 时触发」</td>
+                <td>实际在 <code>AgentBase.notifyPreCall()</code> 里调一次 <code>seedSystemMsg()</code>，<strong>每次 <code>call</code> 只跑一次</strong>，不在每轮 reasoning 里<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/AgentBase.java:744">AgentBase.java:744</span></td>
+                <td>把「每轮都要刷新的时间/预算」写在这里，只会拿到第一次的值；逐轮逻辑放 <code>onReasoning</code></td>
+              </tr>
+              <tr id="ch09-signature">
+                <td>文档的 <code>TimingMiddleware</code>、<code>DynamicContextMiddleware</code> 示例没有 <code>RuntimeContext ctx</code> 参数</td>
+                <td><code>MiddlewareBase</code> 的五个方法签名都带 <code>ctx</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareBase.java:59">MiddlewareBase.java:59</span></td>
+                <td>照抄直接编译不过；以接口签名为准，IDE 里实现一次就知道参数顺序</td>
+              </tr>
+              <tr id="ch09-todo">
+                <td>任务清单示例既 <code>toolkit.registerTool(new TodoTools())</code> 又 <code>enableTaskList(true)</code></td>
+                <td><code>enableTaskList</code> 自己就会注册 <code>TodoTools</code> 并加 <code>TaskReminderMiddleware</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5560">ReActAgent.java:5560</span></td>
+                <td>同一套能力注册两遍，同名工具被覆盖，不报错但没必要；只留 <code>enableTaskList(true)</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch10">10 · ReActAgent 与 HarnessAgent（1 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch10-fromagent">
+                <td>「已有 <code>ReActAgent</code>？用 <code>fromAgent(...)</code> 升级成 Harness」</td>
+                <td>javadoc 明说<strong>搬完并不行为等价</strong>：Harness 会额外装工作区投影、tracing、默认 skill/subagent 中间件，还会替你补一个落盘的 <code>JsonFileAgentStateStore</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1417">HarnessAgent.java:1417</span></td>
+                <td>迁移后行为、磁盘产物、上下文都会变；不是「换个类名」的升级，迁移前先跑对比用例</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch12">12 · 工作区与文件系统（5 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch12-scope">
+                <td>Docker spec 的 <code>isolationScope</code> 默认值是 <code>SESSION</code><span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:137">filesystem.md:137</span></td>
+                <td>字段默认是 <code>null</code>，由 <code>build()</code> 统一落 <code>USER</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2415">HarnessAgent.java:2415</span></td>
+                <td>按 SESSION 估算容器数会算多：同一个用户开多个会话其实共用一个容器（同一隔离键）</td>
+              </tr>
+              <tr id="ch12-image">
+                <td>Docker 的 <code>image</code> 标成「必填」<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:136">filesystem.md:136</span></td>
+                <td><code>DockerSandboxClientOptions</code> 有默认值 <code>ubuntu:22.04</code>，<code>create()</code> 里还有兜底<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClientOptions.java:36">DockerSandboxClientOptions.java:36</span></td>
+                <td>不写也能起，但默认镜像没有 python3、常用工具，<code>edit_file</code> 之类会莫名其妙失败</td>
+              </tr>
+              <tr id="ch12-plans">
+                <td>模式 1 的路由表列了 8 条，没有 <code>plans/</code><span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:62">filesystem.md:62</span></td>
+                <td>源码路由表里有 <code>plans/</code> 这一条<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/RemoteFilesystemSpec.java:268">RemoteFilesystemSpec.java:268</span></td>
+                <td>按文档排查「计划文件写到哪去了」会找不到落点；实际 <code>plans/</code> 也进 KV</td>
+              </tr>
+              <tr id="ch12-limit">
+                <td><code>read</code> 的 <code>limit</code> 默认值未提</td>
+                <td>接口 javadoc 说默认 2000 行<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:61">AbstractFilesystem.java:61</span>，但 <code>FilesystemTool</code> 传 0 表示「全部行」</td>
+                <td>以为天然有 2000 行保护，实际工具层不做限制；大文件一次读进上下文，很容易把窗口打满</td>
+              </tr>
+              <tr id="ch12-store">
+                <td><code>workspace.md</code> 把 remote 与 sandbox 两种模式一起说成「本地 store 会报错」</td>
+                <td>remote 抛异常<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431">:2431</span>，sandbox 只 <code>log.warn</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2459">:2459</span></td>
+                <td>sandbox 下漏配分布式 store 不会启动失败，多副本时会静默各写各的</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch13">13 · 沙箱与受控执行（5 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch13-image">
+                <td>Docker 的 <code>image</code> 标「必填」<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:136">filesystem.md:136</span></td>
+                <td>默认 <code>ubuntu:22.04</code>，<code>create()</code> 里还有兜底<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClientOptions.java:36">DockerSandboxClientOptions.java:36</span></td>
+                <td>示例看起来「必须写」；不写能跑，但默认镜像缺 python3，<code>edit_file</code> 会返回 unexpected server response</td>
+              </tr>
+              <tr id="ch13-scope">
+                <td><code>filesystem.md</code> 两处写「后端默认 SESSION」<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:137">filesystem.md:137</span><span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:237">:237</span></td>
+                <td>spec 字段是 <code>null</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:44">SandboxFilesystemSpec.java:44</span>，<code>build()</code> 落 <code>USER</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2415">HarnessAgent.java:2415</span>；<code>sandbox.md</code> 自己的表也写 USER 是默认<span class="src" data-src="docs/v2/zh/docs/harness/sandbox.md:44">sandbox.md:44</span>——两篇文档互相矛盾</td>
+                <td>按 SESSION 规划容量会偏大；实际同用户多会话复用容器，跨用户才隔离</td>
+              </tr>
+              <tr id="ch13-snapshot">
+                <td>把 <code>OssSnapshotSpec</code> / <code>RedisSnapshotSpec</code> / <code>JdbcSnapshotSpec</code> 列成 harness 的东西<span class="src" data-src="docs/v2/zh/docs/harness/sandbox.md:74-76">sandbox.md:74-76</span></td>
+                <td>harness 只有 <code>Noop</code> / <code>Local</code> / <code>Remote</code> 三种<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/SandboxSnapshot.java:32-36">SandboxSnapshot.java:32-36</span>；那三个在 oss / redis / mysql / jdbc 扩展模块里，且都 <code>extends RemoteSnapshotSpec</code></td>
+                <td>只引 <code>agentscope-harness</code> 找不到那三个类；要快照到 Redis/OSS 得额外引扩展模块</td>
+              </tr>
+              <tr id="ch13-timeout">
+                <td><code>execute</code> 的默认超时未提</td>
+                <td>工具层写死 30 秒<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:78">ShellExecuteTool.java:78</span>，沙箱层的 120 秒只在传 <code>null</code> 时生效<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:214-216">AbstractBaseSandbox.java:214-216</span></td>
+                <td>想改超时得让模型显式传 <code>timeout</code>；改沙箱层默认值没用，永远收不到 null</td>
+              </tr>
+              <tr id="ch13-store">
+                <td>「多副本部署必须配分布式 store」<span class="src" data-src="docs/v2/zh/docs/harness/sandbox.md:111">sandbox.md:111</span></td>
+                <td>确实只是 <code>log.warn</code>，与 remote 模式的硬抛异常不同<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431-2439">HarnessAgent.java:2431-2439</span><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2459">:2459</span></td>
+                <td>「必须」听起来会拦住你，实际只 warn；多副本上线前把这条 warn 当失败处理</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch14">14 · 子 Agent 与团队（4 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch14-name">
+                <td>工作区 spec 的 front matter 示例里写了 <code>name: researcher</code>（<code>subagent.md:293-301</code>）</td>
+                <td>Loader 从不读 <code>name</code>，名字由文件名派生；未知键被 YAML 读入后直接忽略，不报错也不警告<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/AgentSpecLoader.java:217-347">AgentSpecLoader.java:217-347</span></td>
+                <td>以为改 <code>name</code> 就能改名，实际 <code>agent_spawn</code> 里用的是文件名；写不写都不影响结果</td>
+              </tr>
+              <tr id="ch14-dynamic">
+                <td>「后台任务完成 → 下一轮前以 <code>&lt;system-reminder&gt;</code> 注入」（<code>subagent.md:145-157</code>）</td>
+                <td>这段代码在静态 <code>SubagentsMiddleware</code> 里；默认装的是 Dynamic，它只渲染任务摘要，不 drain delivery。默认路径的推送来自 completion callback → inbox → <code>InboxMiddleware</code>，文案是 <code>&lt;system-notification&gt;</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/DynamicSubagentsMiddleware.java:147-172">DynamicSubagentsMiddleware.java:147-172</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2327-2346">HarnessAgent.java:2327-2346</span></td>
+                <td>照文档去找 <code>system-reminder</code> 会以为推送没生效；实际要看 <code>HintBlockEvent</code> 里的 <code>system-notification</code></td>
+              </tr>
+              <tr id="ch14-generate">
+                <td><code>agent_generate</code>「默认关闭」，示例只给一句「拿到 builder 内部的 <code>SubagentsMiddleware</code> 引用」</td>
+                <td>全仓没有生产调用点：<code>enableAgentGenerateTool</code> 只出现在定义与 javadoc 里，<code>build()</code> 不调它，builder 也没有对应方法；<code>HarnessAgent</code> 只暴露 <code>getSubagentAgentManager()</code> 与 <code>getTaskRepository()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:251-270">SubagentsMiddleware.java:251-270</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:518-545">HarnessAgent.java:518-545</span></td>
+                <td>想「运行时让 agent 自己生成子 agent」在这版做不到；只能预先写 spec 或编程式声明</td>
+              </tr>
+              <tr id="ch14-mode">
+                <td>「<code>mode: subagent</code> 表示只能作为子 agent」</td>
+                <td>只有 <code>PRIMARY</code> 被强制（<code>createAgentIfPresent</code> 直接返回 empty）；<code>SUBAGENT</code> 没有被顶层入口拦截——javadoc 自己写了「current core does not own that check」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:68-82">SubagentDeclaration.java:68-82</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/DefaultAgentManager.java:107-120">DefaultAgentManager.java:107-120</span></td>
+                <td>标了 <code>subagent</code> 的声明仍可能被当作主 agent 使用；想强约束得在入口自己校验</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch15">15 · 压缩、记忆与逐出（10 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch15-default">
+                <td><code>compaction.md</code>：「压缩与逐出默认关闭，要显式配 <code>compaction(...)</code>」</td>
+                <td>Builder 字段默认就是 <code>CompactionConfig.builder().build()</code> 与 <code>ToolResultEvictionConfig.defaults()</code>，两个 disable 均 false；javadoc 也写 enabled by default<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1227-1231">HarnessAgent.java:1227-1231</span></td>
+                <td>没配也会压缩、也会逐出、也会生成 <code>MEMORY.md</code>；要「什么都不发生」必须显式关四项</td>
+              </tr>
+              <tr id="ch15-timing">
+                <td><code>compaction.md</code>：「工具执行后触发卸载」</td>
+                <td>在 <code>onReasoning</code> 里做，即<strong>下一次推理前</strong>，不是工具执行后<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/ToolResultEvictionMiddleware.java:79-84">ToolResultEvictionMiddleware.java:79-84</span></td>
+                <td>想「刚卸完立刻补读」的时序推断会错位；大结果在两次推理之间才被替换</td>
+              </tr>
+              <tr id="ch15-exclude">
+                <td><code>compaction.md</code>：默认排除工具含 <code>list_files</code></td>
+                <td>默认集合只有 6 个：<code>read_file</code>、<code>write_file</code>、<code>edit_file</code>、<code>memory_search</code>、<code>memory_get</code>、<code>session_search</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ToolResultEvictionConfig.java:66-73">ToolResultEvictionConfig.java:66-73</span></td>
+                <td><code>list_files</code> 的结果<strong>会被逐出</strong>；文件清单类工具多的时候要自己加进排除集</td>
+              </tr>
+              <tr id="ch15-flush-who">
+                <td><code>compaction.md</code>：压缩前的 flush 由 <code>MemoryFlushMiddleware</code> 触发</td>
+                <td>由 <code>ConversationCompactor</code> 直接 new 一个 <code>MemoryFlushManager</code>，不经过 <code>MemoryFlushMiddleware</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:106-109">CompactionMiddleware.java:106-109</span></td>
+                <td>只给 <code>MemoryFlushMiddleware</code> 配拦截器/开关，管不到压缩前那次 flush</td>
+              </tr>
+              <tr id="ch15-transcript">
+                <td><code>compaction.md</code> / <code>memory.md</code>：offload 到 <code>.log.jsonl</code></td>
+                <td>摘要里嵌入的是 <code>resolveContextPath()</code> 返回的 <code>.jsonl</code>；而每次转写<strong>两份都写</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/session/SessionTranscriptWriter.java:166-182">SessionTranscriptWriter.java:166-182</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/session/SessionTree.java:326-347">SessionTree.java:326-347</span></td>
+                <td>按 <code>.log.jsonl</code> 去解析摘要里的引用会找不到；摘要指向另一个（精简）文件</td>
+              </tr>
+              <tr id="ch15-prompt">
+                <td><code>memory.md</code>：三处 flush 用同一份 <code>flushPrompt</code></td>
+                <td>压缩前那次用 2 参构造，固定 <code>DEFAULT_FLUSH_PROMPT</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryFlushManager.java:95-97">MemoryFlushManager.java:95-97</span></td>
+                <td>改了 <code>flushPrompt</code>，压缩前那次还是老风格；同一份 MEMORY.md 出现两种口径</td>
+              </tr>
+              <tr id="ch15-async">
+                <td><code>memory.md</code>：flush 与 offload 都是 fire-and-forget</td>
+                <td>只有 flush 是；offload 在压缩链路里同步执行，transcript 用 <code>concatWith</code> 阻塞到写完<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:155-183">ConversationCompactor.java:155-183</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/TranscriptMiddleware.java:61-79">TranscriptMiddleware.java:61-79</span></td>
+                <td>每次 <code>call()</code> 会多出几毫秒到几十毫秒（磁盘慢更明显）；对延迟敏感要关 transcript</td>
+              </tr>
+              <tr id="ch15-tools">
+                <td><code>memory.md</code>：启用记忆后自动获得两个工具，<code>memory_search</code> 最多 30 条</td>
+                <td>注册 4 个对象、暴露 6 个工具名；<code>memory_search</code> 无条数上限<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2687-2693">HarnessAgent.java:2687-2693</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/MemorySearchTool.java:45-89">MemorySearchTool.java:45-89</span></td>
+                <td>以为结果天然有上限；搜索范围大时要自己在提示词或工具参数里限条数</td>
+              </tr>
+              <tr id="ch15-overflow">
+                <td><code>memory.md</code>：溢出恢复的前提是你配了 <code>compaction(...)</code></td>
+                <td>默认已配，所以默认就具备恢复能力；反过来说 <code>compaction(null)</code> 会同时失去这条兜底<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:958-968">HarnessAgent.java:958-968</span></td>
+                <td>关压缩的同时也关掉了溢出兜底；长会话会直接抛 <code>Context overflow</code></td>
+              </tr>
+              <tr id="ch15-archive">
+                <td><code>memory.md</code>：按「天数」归档日流水账</td>
+                <td>按<strong>文件名里的日期</strong>解析，解析失败直接跳过（<code>MEMORY.md</code> 因此不受影响）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryMaintenanceMiddleware.java:217-241">MemoryMaintenanceMiddleware.java:217-241</span></td>
+                <td>自己改名或手写的日账不会被归档；想让维护流程接管，文件名必须是 <code>YYYY-MM-DD.md</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch16">16 · 技能：从 SKILL.md 到治理（10 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch16-reject">
+                <td>闸门内置三种：「直接拒绝（默认）、本地人工确认、推消息后等」</td>
+                <td><code>RejectAllGate</code> 返回的是 <code>Defer</code>，不是 <code>Reject</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/RejectAllGate.java:23-46">RejectAllGate.java:23-46</span></td>
+                <td>「拒绝」意味着草稿作废；实际是挂起等你手动批，草稿会一直堆着</td>
+              </tr>
+              <tr id="ch16-gate">
+                <td>示例 <code>new LocalApprovalGate(LocalApprovalGate.defaultPrompter())</code></td>
+                <td><code>defaultPrompter()</code> 永远返回 <code>Defer</code>，javadoc 写 “never approves”<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/LocalApprovalGate.java:82-88">:82-88</span></td>
+                <td>照抄示例 = 永远批不下来；要真批，用 <code>stdinPrompter</code> 或自己实现返回 <code>Approve</code> 的 gate</td>
+              </tr>
+              <tr id="ch16-umbrella">
+                <td>「可选叠加一个 LLM 伞合并扫描（默认只 dry-run，输出报告）」</td>
+                <td>无 LLM 调用；只按前缀聚类写 <code>REPORT.md</code>，javadoc 明写推迟到未来版本<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillCurator.java:248-258">:248-258</span></td>
+                <td>别指望它给出合并建议；报告只能当「哪些技能名字像」的线索</td>
+              </tr>
+              <tr id="ch16-market">
+                <td>市场技能落在 <code>&lt;wsRoot&gt;/.skills-cache/&lt;source&gt;/&lt;name&gt;/</code></td>
+                <td><code>.skills-cache/&lt;scope&gt;/&lt;source&gt;/&lt;name&gt;</code>；空 scope 收敛为 <code>_shared</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/MarketplaceStager.java:139-200">:139-200</span></td>
+                <td>按三段路径找不到脚本，实际多一层；排查「脚本找不到」时按四段找</td>
+              </tr>
+              <tr id="ch16-read-skill">
+                <td>「每次调 <code>load_skill_through_path</code> / <code>read_skill</code> 时自动记一笔」</td>
+                <td><code>read_skill</code> 在 2.0.4 没有实现，只出现在计数白名单里<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SkillUsageMiddleware.java:46-54">:46-54</span></td>
+                <td>写提示词时别让模型调 <code>read_skill</code>；它不存在，只会浪费一轮</td>
+              </tr>
+              <tr id="ch16-load">
+                <td><code>load_skill_through_path(skillId, path="SKILL.md")</code> 返回 markdown 正文</td>
+                <td>返回头部信息 + 完整文档（front matter + 正文），四反引号围栏<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillLoadTool.java:232-256">:232-256</span></td>
+                <td>用返回内容做 <code>patch</code> 时，<code>old_string</code> 要跟含 front matter 的视图对齐</td>
+              </tr>
+              <tr id="ch16-workspace-skill">
+                <td>「工作区里的 skill 不用任何注册，把目录放好就生效」</td>
+                <td>第 3 层的注册前置是 <code>Files.isDirectory(wsInfo.getSkillsDir())</code>；第 4 层需要 <code>filesystem != null</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:896-916">:896-916</span></td>
+                <td>沙箱/远程模式下宿主目录不存在时，第 3 层会静默缺席；技能看起来「没生效」但没报错</td>
+              </tr>
+              <tr id="ch16-usage">
+                <td>使用计数「为后面的清理、灰度发布提供数据」</td>
+                <td>计数只在已有 <code>created_by</code> 记录时生效，而中间件传的是 <code>skillId</code>、晋升记的是纯名字<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillUsageStore.java:184-200">SkillUsageStore.java:184-200</span></td>
+                <td>正常链路里 view 计数不会增长；靠计数做灰度会永远看不到流量</td>
+              </tr>
+              <tr id="ch16-stale">
+                <td>「超过 30 天没用的 skill 标为 stale」</td>
+                <td>只看 <code>created_by="agent"</code> 且未 <code>pinned</code> 的记录；anchor 是 lastUsed/lastViewed/lastPatched 的最大值<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillCurator.java:205-241">:205-241</span></td>
+                <td>手写技能、草稿、置顶技能都不会被整理；「清理没用的技能」只能清到 agent 自己造的那批</td>
+              </tr>
+              <tr id="ch16-promotion-gate">
+                <td>「用 <code>enableSkillPromotionGate</code> 加审核闸门」</td>
+                <td>闸门只在 <code>enableSkillManageTool</code> 分支内被消费；没开工具时传了也不生效<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2783-2841">:2783-2841</span></td>
+                <td>配置看起来生效、实际没装配；只在调 <code>promoteSkill</code> 时才会发现永远 deferred</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch17">17 · 计划模式、工具装配与 MCP（9 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch17-plan-list">
+                <td>plan 阶段白名单是「4 个工具」：<code>plan_enter</code>/<code>plan_write</code>/<code>plan_exit</code>/<code>todo_write</code><span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:11">plan-mode.md:11</span></td>
+                <td><strong>9 个</strong>：另含 <code>agent_spawn</code>、<code>agent_send</code>、<code>agent_list</code>、<code>task_output</code>、<code>task_list</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:60-70">PlanModeMiddleware.java:60-70</span></td>
+                <td>以为 plan 阶段不能派子 agent，实际可以；只读限制会随 <code>propagatePlanMode</code> 传给子 agent</td>
+              </tr>
+              <tr id="ch17-exit">
+                <td><code>plan_exit</code> 的参数是 <code>rationale</code>（可选）<span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:45">:45</span></td>
+                <td>input schema 里只有 <code>summary</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/PlanModeTools.java:162-174">PlanModeTools.java:162-174</span></td>
+                <td>按文档传 <code>rationale</code> 不会报错，只是被 schema 静默忽略；计划退出理由永远是空</td>
+              </tr>
+              <tr id="ch17-deny-message">
+                <td>拒绝结果是 <code>[Tool denied — plan mode is active]\nOnly read-only tools and …</code><span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:70-73">:70-73</span></td>
+                <td>实际是一段以 <code>Blocked: you are in PLAN mode (read-only).</code> 开头的长文案，带「先调查/用 plan_write/准备好再 plan_exit」的指令<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:72-76">:72-76</span></td>
+                <td>按文档文案做字符串匹配/断言会失效；日志里搜 <code>Blocked: you are in PLAN mode</code></td>
+              </tr>
+              <tr id="ch17-subagent-plan">
+                <td>「已知缺口：子 agent 不会自动继承只读限制」，建议手动限制或自己开 plan 模式<span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:151-156">:151-156</span></td>
+                <td><strong>已修</strong>：构建期 <code>configurePlanMode</code> 下传配置；运行期 <code>propagatePlanMode</code> 对新建与复用的子 agent 强制 <code>enterPlanMode</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:598-618">:598-618</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:739-746">AgentSpawnTool.java:739-746</span></td>
+                <td>再按文档手动限制子 agent，会变成双层限制；排查「子 agent 为什么写不了文件」时先看这条</td>
+              </tr>
+              <tr id="ch17-toolsconfig">
+                <td>「不想用文件？直接 <code>builder.toolsConfig(ToolsConfig.builder()...)</code>」<span class="src" data-src="docs/v2/zh/docs/harness/workspace.md:449">workspace.md:449</span></td>
+                <td><code>ToolsConfig</code> 里<strong>没有</strong> <code>builder()</code>：它是一个 100 行的普通 POJO，只能 <code>new</code> + setter<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfig.java:43-99">ToolsConfig.java:43-99</span></td>
+                <td>照文档写直接编译不过；改为 <code>new ToolsConfig()</code> 再逐个 set</td>
+              </tr>
+              <tr id="ch17-allow">
+                <td>「<code>allow</code> 会连内置工具一起砍，务必把 <code>read_file</code>/<code>memory_search</code>/<code>agent_spawn</code> 一并列出」<span class="src" data-src="docs/v2/zh/docs/harness/workspace.md:447">:447</span></td>
+                <td><code>agent_spawn</code> 在 37 个平台工具里，<strong>默认活过 allow</strong>；<code>read_file</code>/<code>memory_search</code> 确实会被砍<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/HarnessPlatformTools.java:35-78">HarnessPlatformTools.java:35-78</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:77-79">ToolFilter.java:77-79</span></td>
+                <td>以为白名单能关掉子 agent，实际关不掉；要关得用 <code>deny</code> 或 <code>disableSubagents()</code></td>
+              </tr>
+              <tr id="ch17-toolsjson">
+                <td>「<code>tools.json</code> 三种文件系统模式下行为一致，都是 build 时读」<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:498-502">filesystem.md:498-502</span></td>
+                <td>沙箱/远端在 build 期可能<strong>读不到</strong>：catch 后只打 debug、返回空，配置静默失效<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfigLoader.java:62-74">ToolsConfigLoader.java:62-74</span></td>
+                <td>沙箱模式下 allow/deny 完全没生效，日志里只有 debug；排查工具面时先确认文件被读到了</td>
+              </tr>
+              <tr id="ch17-hidden">
+                <td><code>workspace.md</code> 的 <code>tools.json</code> 仅展示 <code>allow</code>/<code>deny</code>/<code>mcpServers</code></td>
+                <td>另有 <code>defaultToolsEnabled</code>、<code>strictAllow</code>；MCP 条目还有 <code>enableTools</code>/<code>disableTools</code>/<code>prefixToolNames</code>/<code>required</code>/<code>timeout</code>/<code>initializationTimeout</code>/<code>queryParams</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerConfig.java:44-133">McpServerConfig.java:44-133</span></td>
+                <td>不知道这些字段，就只能在「工具为什么全没了」「MCP 为什么超时」之间反复试</td>
+              </tr>
+              <tr id="ch17-hitl">
+                <td>「退出 Plan Mode 走 HITL 确认（<code>ConfirmResult(true)</code>）」<span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:49-66">plan-mode.md:49-66</span></td>
+                <td>实际是 <code>PermissionDecision.ask(...)</code>，走<strong>权限引擎</strong>的确认链，不是另一个 <code>ConfirmResult</code> 回调；因此在 <code>DONT_ASK</code> 下会变成 DENY<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/PlanModeTools.java:180-192">PlanModeTools.java:180-192</span></td>
+                <td>无人值守（<code>DONT_ASK</code>）配 plan 模式会卡死；模型反复请求退出、反复被拒，直到耗尽 <code>maxIters</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch18">18 · 网关、渠道与异步（7 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch18-channel">
+                <td>「<code>agent.channel(...)</code> 会在后台自动完成所有接线」<span class="src" data-src="docs/v2/zh/docs/harness/channel.md:17">channel.md:17</span></td>
+                <td>它只建 <code>HarnessGateway.create()</code>（无 <code>ChannelManager</code>、无 <code>MessageBus</code>）。路由与串行可用，<strong>主动投递与网关侧唤醒不可用</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:661-667">HarnessAgent.java:661-667</span></td>
+                <td>想主动播报/异步唤醒，必须另建 <code>GatewayBootstrap</code> + <code>WakeupDispatcher</code>，<code>agent.channel()</code> 不够</td>
+              </tr>
+              <tr id="ch18-gate">
+                <td>「同一 session 的并发消息会公平排队」<span class="src" data-src="docs/v2/zh/docs/harness/channel.md:12">channel.md:12</span></td>
+                <td>只有默认的 <code>LocalSessionTurnGate</code> 是排队；换成抛 <code>TurnBusyException</code> 的分布式 gate，整轮变成 <code>Mono.empty()</code>，<strong>静默丢弃</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:694-720">HarnessGateway.java:694-720</span></td>
+                <td>用户看到「发出去了没回复」，HTTP 可能是 200 + 空 body；客户端必须把空当「忙，请重试」</td>
+              </tr>
+              <tr id="ch18-bus">
+                <td>全文未出现 <code>MessageBus</code> / <code>InboxMiddleware</code> / <code>AsyncToolMiddleware</code> / <code>WakeupDispatcher</code></td>
+                <td>这四样组成「后台结果怎么回到对话」的完整链路，缺一环就表现为「异步没效果」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AsyncToolMiddleware.java:237-294">AsyncToolMiddleware.java:237-294</span></td>
+                <td>只配 <code>asyncToolTimeout</code> 不够；没有 bus/dispatcher，占位结果之后永远没有第二轮</td>
+              </tr>
+              <tr id="ch18-route">
+                <td>「多 HarnessAgent 路由」示例里 <code>.agent("sales", salesAgent)</code> 隐含「<code>sales</code> 就是路由 id」</td>
+                <td>只有<strong>非主</strong> agent 用这个 key；主 agent 用 <code>agent.getAgentId()</code>，为空才退成 <code>"main"</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:159-165">HarnessGateway.java:159-165</span></td>
+                <td>绑主 agent 时写 <code>.agent("sales", mainAgent)</code> 不生效；路由仍落到 <code>main</code> 或它的真实 id</td>
+              </tr>
+              <tr id="ch18-dm-scope">
+                <td><code>DmScope</code> 的四个枚举值描述成四种不同粒度<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/DmScope.java:18-30">DmScope.java:18-30</span></td>
+                <td><code>PER_PEER</code> 与 <code>PER_CHANNEL_PEER</code> 生成<strong>完全相同</strong>的 key（channel 本就在第一段）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:204-210">ChannelRouter.java:204-210</span></td>
+                <td>以为换了枚举会话会更细，实际没变化；要多一段区分只能用 <code>PER_ACCOUNT_CHANNEL_PEER</code></td>
+              </tr>
+              <tr id="ch18-stream">
+                <td><code>dispatchStream</code> 被描述成「可选：流式分发」<span class="src" data-src="docs/v2/zh/docs/harness/channel.md:299-304">channel.md:299-304</span></td>
+                <td>默认实现是 <code>Flux.error("Streaming dispatch not supported")</code>，<strong>不会</strong>回退到 <code>dispatch</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/Channel.java:105-107">Channel.java:105-107</span></td>
+                <td>没实现 <code>dispatchStream</code> 就用流式，会直接报错；要么自己实现，要么走普通 <code>dispatch</code></td>
+              </tr>
+              <tr id="ch18-two-buses">
+                <td>没提 <code>GatewayBootstrap</code> 与消息总线、唤醒器的关系</td>
+                <td><code>GatewayBootstrap.build()</code> 不建 bus；官方 <code>AsyncSubagentExample</code> 把 bus 只交给 dispatcher，而 agent 因未调 <code>.messageBus(...)</code> 会自动落到 <code>&lt;workspace&gt;/.agentscope/bus</code>——两边不是同一目录<span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/harness/async/AsyncSubagentExample.java:66-95">AsyncSubagentExample.java:66-95</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2504-2516">HarnessAgent.java:2504-2516</span></td>
+                <td>后台任务跑完了却从不触发下一轮；修法是一行：把同一个 bus 实例显式交给 <code>.messageBus(bus)</code> 与 <code>new WakeupDispatcher(bus, gateway)</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+
+        <h2 id="why">为什么会有这些差异</h2>
+        <p>把 60 条放在一起看，成因其实只有三类，认出类型就能猜出该信哪边：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">文档滞后于代码</span>
+            <div>
+              2.0.x 迭代快，文档按某个早期提交写成，后来行为改了、字段补了，文档没跟上。典型：17 章「子 agent 不继承 plan 模式」的缺口已经修了，
+              文档还留着「已知缺口」。这类先搜类名/方法名，看源码里有没有新 API。
+            </div>
+          </li>
+          <li>
+            <span class="sh">示例从 1.x 或别的语言搬来</span>
+            <div>
+              1.x 的 <code>memory.addMessage()</code>、<code>StaticLongTermMemoryHook</code>、Python 部署页的示例，都还在文档站里。典型：09 章示例缺
+              <code>RuntimeContext</code> 参数（07 章 1.x 记忆 API 整包换成新接口，不在这 60 条里，正文有专段说）。这类先看包级 <code>@Deprecated</code> 与签名。
+            </div>
+          </li>
+          <li>
+            <span class="sh">只写 happy path，不写默认值与兜底</span>
+            <div>
+              文档说「可以配」，没说「不配时是什么」。典型：15 章压缩默认开启、12 章 Docker 镜像有默认值、18 章 <code>dispatchStream</code> 默认直接报错。
+              这类必须去 <code>build()</code> 和字段初始化处看默认值。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="verify">自己核对的三步</h2>
+        <p>这张表会过期。升级版本或怀疑某条结论时，按下面三步复核，比记结论可靠：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">搜「读取点」，不只看定义</span>
+            <div>
+              字段和 setter 存在，不代表有人读。搜字段名在 <code>build()</code>、中间件、引擎里的出现次数；只有赋值 + getter 的，就是空接线。
+              08 章的四项、12 章的 <code>useLegacyXmlWorkspaceContext</code> 都是这样确认的。
+            </div>
+          </li>
+          <li>
+            <span class="sh">先找字段默认值，再找 build() 的覆盖</span>
+            <div>
+              spec 字段写 <code>null</code>，<code>build()</code> 可能落一个完全不同的默认值（<code>isolationScope</code> 就是这样从 SESSION 变成 USER 的）。
+              两处都要看，只看一处就会得出相反结论。
+            </div>
+          </li>
+          <li>
+            <span class="sh">跑一个最小用例，看日志与事件流</span>
+            <div>
+              默认值、触发时机、返回结构这三类偏差，跑一次比读十遍快：打开 DEBUG 日志、打印事件类型、把返回值原样贴出来。
+              本页每条「影响」都描述了预期现象，可以直接当验收标准。
+            </div>
+          </li>
+        </ol>
+        <div class="callout warn">
+          <span class="ct">别把这张表当成「官方文档不可信」</span>
+          <p>
+            大部分偏差是「文档没写全」，不是「文档写错」。真正的用法是：<strong>文档负责告诉你有什么，源码负责告诉你现在怎么跑</strong>。
+            遇到冲突时以 2.0.4 的代码为准，并把版本号记在结论旁边——没有版本号的结论，下个月就可能变成谣言。
+          </p>
+        </div>
+
+        <h2 id="next">接着看什么</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>你现在想做什么</th><th>去哪</th><th>为什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>看某条偏差的完整推导与代码</td><td><a href="../chapters/12-workspace-filesystem.html#doc-gap">12</a>–<a href="../chapters/18-gateway-channel-bus.html#doc-gap">18 章</a>的「官方说了什么 vs 源码实际是什么」</td><td>本页只留结论，推导、复现代码和练习在正文</td></tr>
+              <tr><td>按报错找修法</td><td><a href="errors.html">附录 B：报错速查</a></td><td>31 条错误文本与源码抛出点逐字对齐</td></tr>
+              <tr><td>按文件找讲解</td><td><a href="source-map.html">附录 D：源码地图</a></td><td>core 20 个包 + harness 15 个子包，外加六条追踪路线</td></tr>
+              <tr><td>按 Builder 方法找写法</td><td><a href="api-cheatsheet.html">附录 C：API 速查</a></td><td>含「五种以为有、其实没有」的写法，与本页互补</td></tr>
+              <tr><td>直接读官方原文</td><td><a href="https://github.com/agentscope-ai/agentscope-java/tree/main/docs/v2/zh/docs/harness">docs/v2/zh/docs/harness/</a></td><td>结论以源码为准，但整体设计与取舍仍值得读</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

@@ -1,0 +1,923 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 13 章把执行关进容器，这一章回答「谁去做」。框架里其实是两件不同的事：委派——主 agent 把一个任务交给临时子 agent，拿回一段文本；协作——多个成员共享一块任务板和一个邮箱，按角色互相推进。前者靠 agent_spawn 一族工具，后者靠 team 工具，装配条件与失败方式完全不同。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="14 子 Agent 与团队 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 13 章把执行关进容器，这一章回答「谁去做」。框架里其实是两件不同的事：委派——主 agent 把一个任务交给临时子 agent，拿回一段文本；协作——多个成员共享一块任务板和一个邮箱，按角色互相推进。前者靠 agent_spawn 一族工具，后者靠 team 工具，装配条件与失败方式完全不同。" />
+    <title>14 子 Agent 与团队 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="14-subagent-team" data-root="..">
+    <main>
+      <article class="article">
+        <h1>14 · 子 Agent 与团队：把「谁去做」拆成两层</h1>
+        <p class="lede">
+          第 13 章把执行关进容器，这一章回答「谁去做」。框架里其实是两件不同的事：<strong>委派</strong>——主
+          agent 把一个任务交给临时子 agent，拿回一段文本；<strong>协作</strong>——多个成员共享一块任务板和一个邮箱，按角色互相推进。前者靠
+          <code>agent_spawn</code> 一族工具，后者靠 <code>team</code> 工具；两套都接在 <code>HarnessAgent.build()</code>
+          里，但装配条件、默认值、失败方式完全不同。这一章按「来源 → 声明 → 工作区 → 运行 → 结果 → 装配 → 团队」拆开，每个结论都对到
+          2.0.4 的行号。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说出子 agent 的四个来源（内置 <code>general-purpose</code>、<code>subagents/*.md</code>、编程式声明、自定义工厂），以及各自什么时候被加载</li>
+          <li>背下 <code>SubagentDeclaration</code> 的关键默认值，并在 <code>build()</code> 之前就知道哪三种组合会抛异常</li>
+          <li>给定 <code>workspaceMode</code> 与 <code>workspace.path</code>，推出子 agent 的工作区落在哪、会话槽位叫什么、system prompt 从哪来</li>
+          <li>解释 <code>timeout_seconds</code> 的三种结局：正常返回、提升为后台任务（<code>timeout_promoted</code>）、强制同步下硬超时（<code>timeout</code>）</li>
+          <li>从 <code>build()</code> 判断实际安装的是 <code>DynamicSubagentsMiddleware</code> 还是静态 <code>SubagentsMiddleware</code>，以及这决定了哪套结果回推路径</li>
+          <li>画出团队的四个零件：<code>TeamClient</code>、<code>TeamContext</code>、<code>TeamTool</code>、<code>TeamsMiddleware</code>，并说出角色是怎么裁剪工具面的</li>
+        </ul>
+
+        <h2 id="why">先说为什么：委派和协作是两件事</h2>
+        <p>
+          官方文档把两者放在同一篇「子 Agent」里讲，容易让人以为团队只是子 agent 的批量版。源码里它们的依赖是分开的：子 agent
+          依赖 <code>AgentSpawnTool</code> + <code>TaskRepository</code>；团队依赖 <code>TeamClient</code> +
+          <code>TeamContext</code>，并且要显式打开。先建立这张三层图，后面就不会混：
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">调用层：让谁开始干活</span>
+            <div class="ld">
+              <code>agent_spawn</code> 创建（或复用）一个子 agent 实例并可选地执行任务；<code>agent_send</code>
+              往实例追加消息；<code>agent_list</code> 列出当前活跃实例<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:287-335"
+                >AgentSpawnTool.java:287-335</span
+              >。三者都在 <code>AgentSpawnTool</code> 一个类里。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">结果层：干完之后结果放哪</span>
+            <div class="ld">
+              同步调用把最终文本塞进工具结果；<code>timeout_seconds=0</code> 则落一条任务记录，返回
+              <code>task_id</code>，由 <code>task_output</code> / <code>wait_async_results</code> /
+              <code>task_list</code> / <code>task_cancel</code> 管理<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/TaskTool.java:53-63"
+                >TaskTool.java:53-63</span
+              >。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">协作层：多个成员怎么对齐</span>
+            <div class="ld">
+              一块共享任务板 + 一个邮箱 + 计划审批：<code>team</code> 一个工具 18 个 action，按
+              <code>TeamContext.availableActions()</code> 裁剪<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/TeamTool.java:34-59"
+                >TeamTool.java:34-59</span
+              >。子 agent 之间默认没有这层。
+            </div>
+          </div>
+        </div>
+        <div class="callout">
+          <span class="ct">最容易搞混的一对：agent_key 不是 agent_id</span>
+          <p>
+            提示词模板专门用粗体写了这句：<code>agent_key</code> 是 spawn 输出里的运行时句柄（以
+            <code>agent:</code> 开头），既不是 <code>agent_id</code>，也不是 <code>session_id</code>，更不是
+            <code>task_id</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:110"
+              >SubagentsMiddleware.java:110</span
+            >。四个标识各管一段：<code>agent_id</code> 选「哪个 spec」，<code>agent_key</code> 选「哪个实例」，
+            <code>session_id</code> 选「哪段状态」，<code>task_id</code> 选「哪次后台执行」。
+          </p>
+        </div>
+
+        <h2 id="minimal">最小可跑：写一个 md，主 agent 自己会用</h2>
+        <p>
+          最省事的路径是把 spec 写进 <code>workspace/subagents/</code>：文件名（去掉 <code>.md</code>）就是
+          <code>agent_id</code>，front matter 里<strong>不要</strong>再写 <code>name</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/AgentSpecLoader.java:44-72"
+            >AgentSpecLoader.java:44-72</span
+          >。主 agent 不需要任何注册代码：
+        </p>
+        <pre data-lang="java" data-file="SubagentMinimal（自包含，可直接跑）">Path workspace = Files.createTempDirectory("agentscope-subagent-demo");
+Files.createDirectories(workspace.resolve("subagents"));
+Files.writeString(
+        workspace.resolve("subagents/reviewer.md"),
+        """
+        ---
+        description: 代码审查专家。当用户要 review 改动、找问题时使用。
+        ---
+        你是代码评审子 agent：先收集上下文，再按文件给建议，最后给 1-5 分。
+        """);
+
+HarnessAgent agent =
+        HarnessAgent.builder()
+                .name("orchestrator")
+                .sysPrompt("你是编排者。需要审查代码时委派给 reviewer，然后汇总它的结论。")
+                .model("dashscope:qwen-plus")
+                .workspace(workspace)
+                .build();
+
+RuntimeContext ctx = RuntimeContext.builder().userId("alice").sessionId("s-1").build();
+agent.call(new UserMessage("review 一下 src/main/java 下的改动"), ctx).block();</pre>
+        <p>跑起来之后有三件事值得停下来确认：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">system prompt 里多了一段，但不是你写的 sysPrompt</span>
+            <div>
+              <code>## Subagents</code> 段是中间件在每次 reasoning 前拼到<strong>首条 SYSTEM 消息</strong>上的，
+              不在 builder 的 sysPrompt 里，也不落盘<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:653-663"
+                >SubagentsMiddleware.java:653-663</span
+              >。里面会列出当前可用的 agent id（每行 <code>- `name`: description</code>），以及
+              <code>timeout_seconds</code> 的 0/30/600 语义。
+            </div>
+          </li>
+          <li>
+            <span class="sh">默认是「每轮重扫」，不是「构建时定死」</span>
+            <div>
+              Harness 默认装有 filesystem，所以安装的是 <code>DynamicSubagentsMiddleware</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2633-2648"
+                >HarnessAgent.java:2633-2648</span
+              >。它每次 reasoning 都按「filesystem 的 <code>subagents/*.md</code>（Layer 1）覆盖本地目录（Layer
+              2）」重新加载并 <code>replaceAgents</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/DynamicSubagentsMiddleware.java:147-222"
+                >DynamicSubagentsMiddleware.java:147-222</span
+              >。于是你<strong>中途新增或改写同名 md</strong>，下一个 reasoning 就能看到。
+            </div>
+          </li>
+          <li>
+            <span class="sh">agent_spawn 的返回值不只是结果</span>
+            <div>
+              它先给三行元信息，再给 <code>status: ok</code> 和 <code>reply:</code>（同步路径）<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1599-1610"
+                >AgentSpawnTool.java:1599-1610</span
+              >：<code>agent_key</code>、<code>agent_id</code>、<code>session_id</code>。如果这次 spawn
+              被允许暴露给用户，还会多一行 <code>subagent_id</code> 与 <code>status: exposed</code>。
+            </div>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <span class="ct">description 才是「路由表」</span>
+          <p>
+            可用列表只渲染 name + description<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:653-658"
+              >:653-658</span
+            >，模型据此决定委派给谁。官方文档里那句「『代码评审』远不如『当用户要 review PR…』有效」是对的行为建议，不是修辞。
+          </p>
+        </div>
+
+        <h2 id="sources">四个来源：谁在什么时候被加载</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>来源</th><th>加载时机</th><th>同名冲突时</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>内置 <code>general-purpose</code></td>
+                <td>build 时，恒为第一条</td>
+                <td>—</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:211-217">HarnessAgentBuilderSupport.java:211-217</span></td>
+              </tr>
+              <tr>
+                <td><code>workspace/subagents/*.md</code></td>
+                <td>动态模式每轮重扫；静态模式 build 时扫一次，之后只补「base 里没有的名字」</td>
+                <td>动态：后加载覆盖先加载</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/DynamicSubagentsMiddleware.java:174-222">DynamicSubagentsMiddleware.java:174-222</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:613-641">SubagentsMiddleware.java:613-641</span></td>
+              </tr>
+              <tr>
+                <td>编程式 <code>.subagent(...)</code></td>
+                <td>build 时</td>
+                <td>被动态声明按名字覆盖</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:219-226">HarnessAgentBuilderSupport.java:219-226</span></td>
+              </tr>
+              <tr>
+                <td>自定义 <code>.subagentFactory(...)</code></td>
+                <td>build 时</td>
+                <td>同样可被同名动态声明覆盖</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:228-239">:228-239</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="ct">subagentFactory 的 lambda 入参是「子 agent 名字」，不是任务文本</span>
+          <p>
+            桥接代码只有一行：<code>(rc) -&gt; custom.factory().apply(custom.name())</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:237"
+              >HarnessAgentBuilderSupport.java:237</span
+            >。注释也说明了原因：<code>Function&lt;String, Agent&gt;</code> 是 B-0 之前的旧签名，不接收
+            <code>RuntimeContext</code>，所以这里把 <code>rc</code> 丢掉。需要「按父身份隔离」时，别走自定义工厂，走编程式
+            <code>SubagentDeclaration</code>，让框架用 <code>deriveChildSessionId</code> 帮你分桶。
+          </p>
+        </div>
+        <p>
+          另一点：框架自己构建的本地子 agent（含 <code>general-purpose</code> 与所有声明式来源）都会
+          <code>.asLeafSubagent()</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:374"
+            >:374</span
+          >、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:520">:520</span>，而
+          <code>leafSubagent</code> 会在 <code>build()</code> 里直接跳过子 agent 中间件的安装<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2633"
+            >HarnessAgent.java:2633</span
+          >——这就是「leaf worker 不许再 spawn」的实现方式。自定义工厂返回的 agent 不受这条约束，只剩工具层的
+          <code>MAX_SPAWN_DEPTH=3</code> 兜底<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:109-111"
+            >AgentSpawnTool.java:109-111</span
+          >。
+        </p>
+
+        <h2 id="declare">声明：字段、默认值与三条互斥</h2>
+        <p>
+          <code>SubagentDeclaration</code> 同时服务工作区文件与编程式两条路，只是前者只能填子集（没有
+          <code>url</code>/<code>headers</code>/<code>remote*</code>）<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/AgentSpecLoader.java:323-346"
+            >AgentSpecLoader.java:323-346</span
+          >。Builder 的默认值是判断「不写会怎样」的唯一依据：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>默认值</th><th>说明</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>workspaceMode</code></td><td><code>ISOLATED</code></td><td>没给 path 时自动建 <code>agents/&lt;name&gt;/workspace</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:397">:397</span></td></tr>
+              <tr><td><code>steps</code></td><td><code>10</code></td><td>子 agent 单次最多迭代次数；<code>maxIters</code> 是兼容别名</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:404">:404</span></td></tr>
+              <tr><td><code>mode</code></td><td><code>ALL</code></td><td><code>PRIMARY</code> 只允许当主 agent，不允许被 spawn</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:405">:405</span></td></tr>
+              <tr><td><code>hidden</code></td><td><code>false</code></td><td><code>true</code> 时不出现在 LLM 可见列表，但仍可程序化 spawn</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:406">:406</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:669-674">SubagentsMiddleware.java:669-674</span></td></tr>
+              <tr><td><code>persistSession</code></td><td><code>false</code></td><td>false 时每次 spawn 都是新实例；true 时按 <code>(parentSessionId, agentId, label)</code> 复用</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:407">:407</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:366-402">AgentSpawnTool.java:366-402</span></td></tr>
+              <tr><td><code>inheritParentPermissions</code></td><td><code>true</code></td><td>父的 DENY 规则会随 spawn 传给子</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:408">:408</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1258-1286">:1258-1286</span></td></tr>
+              <tr><td><code>exposeToUser</code></td><td><code>null</code></td><td>三态：true 强制暴露、false 强制不暴露、null 不表态（听调用方/LLM）</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:301">:301</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1461-1485">:1461-1485</span></td></tr>
+              <tr><td><code>enablePendingToolRecovery</code></td><td><code>null</code></td><td>null＝继承父 agent 的恢复配置，不写就跟随</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:447-450">:447-450</span></td></tr>
+              <tr><td><code>tools</code></td><td>空列表</td><td>空＝继承父工具；非空＝白名单，且会开 <code>strictAllow</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:287-305">:287-305</span></td></tr>
+              <tr><td><code>remoteStreaming</code></td><td><code>true</code></td><td>Remote 专用；父用 <code>streamEvents()</code> 时把远端 SSE 转发回来</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:351-363">:351-363</span></td></tr>
+              <tr><td><code>remoteStreamDetail</code></td><td><code>FULL</code></td><td>回传多少远端事件：STATUS / FULL / VERBOSE</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:362-363">:362-363</span></td></tr>
+              <tr><td><code>remoteAskPolicy</code></td><td><code>DENY</code></td><td>远端 HITL 确认默认自动拒绝；要转发给父流用 <code>PROPAGATE</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:417">:417</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「三个来源互斥」不是文档口号，是 <code>build()</code> 里逐条校验的异常：<code>url</code> 与
+          <code>workspace(Path)</code> 互斥、<code>url</code> 与 <code>inlineAgentsBody</code> 互斥、
+          <code>workspace(Path)</code> 与非空 <code>inlineAgentsBody</code> 互斥，另外 name/description
+          为空也会直接抛<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:667-699"
+            >SubagentDeclaration.java:667-699</span
+          >。远程声明长这样（注意 <code>url</code> 只能编程式写）：
+        </p>
+        <pre data-lang="java" data-file="远程子 agent 声明">.subagent(
+        SubagentDeclaration.builder()
+                .name("remote-researcher")
+                .description("远端调研子 agent")
+                .url("http://agent-task-server:8080")
+                .headers(Map.of("Authorization", "Bearer xxx"))
+                .remoteAskPolicy(RemoteAskPolicy.PROPAGATE)
+                .build())</pre>
+        <p>
+          远程声明的工厂会返回一个 <code>RemoteSubagentStub</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:488-491"
+            >:488-491</span
+          >，它只在注册表里占位：<code>doCall</code> 固定回一段「本子 agent 只支持远程 HTTP 执行，请用
+          agent_spawn 且 timeout_seconds=0」<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/RemoteSubagentStub.java:38-48"
+            >RemoteSubagentStub.java:38-48</span
+          >。真正提交远程任务的是 <code>AgentSpawnTool</code> 里的 <code>RemoteTaskRunSpec</code>。
+        </p>
+
+        <h2 id="workspace">工作区：四种组合、一个会话槽位、两份 prompt 来源</h2>
+        <p>
+          <code>resolveDeclaredWorkspace</code> 的分支不多，但顺序决定结果，必须按表背：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th><code>workspaceMode</code></th><th><code>workspace.path</code></th><th>运行根目录</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>ISOLATED</code></td><td>有</td><td>用你给的 path（Loader 会按主工作区解析相对路径）</td></tr>
+              <tr><td><code>ISOLATED</code></td><td>无</td><td><code>mainWorkspace/agents/&lt;name&gt;/workspace</code>，并自动 <code>createDirectories</code></td></tr>
+              <tr><td><code>SHARED</code></td><td>有</td><td><strong>忽略 path</strong>，直接用 <code>mainWorkspace</code></td></tr>
+              <tr><td><code>SHARED</code></td><td>无</td><td><code>mainWorkspace</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          出处：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:709-732">HarnessAgentBuilderSupport.java:709-732</span>；相对路径解析见 <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/AgentSpecLoader.java:360-370">AgentSpecLoader.java:360-370</span>
+        </p>
+        <p>
+          会话槽位是另一条独立的规则：<code>ISOLATED</code> 且父上下文存在时，子 sessionId 形如
+          <code>{name}[@{parentSessionId}][#{userId}]</code>；<code>SHARED</code> 或父上下文缺失时退回纯
+          <code>{name}</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:660-691"
+            >:660-691</span
+          >。空白的 uid/sid 段会被丢掉，斜杠、空格、控制字符统一替换成下划线<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:698-703"
+            >:698-703</span
+          >。这条规则解释了为什么「同一用户在不同会话里 spawn 同名子 agent 互不污染」，也解释了为什么
+          <code>SHARED</code> 子 agent 会共用父的整棵状态树。
+        </p>
+        <p>system prompt 只有两个来源，二选一：</p>
+        <ul>
+          <li><code>workspace.path != null</code>：读 <code>&lt;path&gt;/AGENTS.md</code>；读不到或读失败就是空串，<strong>不会</strong>回落到正文<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:735-753">:735-753</span>。</li>
+          <li>没有 path：用 <code>inlineAgentsBody</code>（工作区文件里就是 <code>---</code> 之后的正文）。</li>
+          <li>两者最终都会追加 <code>SUBAGENT_CONTEXT_SECTION</code>——那段「你是 subagent、完成任务、不要发起用户对话、不要再 spawn」的角色约束<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:86-129">:86-129</span>。</li>
+        </ul>
+        <div class="callout warn">
+          <span class="ct">写了 path 又写了正文，正文会被丢掉</span>
+          <p>
+            Loader 发现 <code>workspace.path</code> 与非空 body 同时存在时，会 <code>warn</code> 并把 body
+            置空，提示你把提示词放进 <code>&lt;path&gt;/AGENTS.md</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/AgentSpecLoader.java:276-284"
+              >AgentSpecLoader.java:276-284</span
+            >。这不是「两者拼接」，是「path 赢，正文作废」。
+          </p>
+        </div>
+        <p>
+          工具面也有一条容易忽略的连锁反应：声明里给了 <code>tools</code> 白名单后，子 agent 的
+          <code>ToolsConfig</code> 会被改成 <code>strictAllow=true</code>、<code>defaultToolsEnabled=false</code>，
+          只保留白名单里且父级本来就允许的工具<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:287-305"
+            >:287-305</span
+          >。所以「白名单」不是加法，是「先继承父级，再按白名单做交集」。
+        </p>
+
+        <h2 id="spawn">运行：超时、实例与暴露</h2>
+        <p>
+          <code>agent_spawn</code> 的参数只有五个：<code>agent_id</code>（必填）、<code>task</code>、
+          <code>label</code>、<code>timeout_seconds</code>、<code>expose_to_user</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:301-335"
+            >:301-335</span
+          >。真正复杂的全是 <code>timeout_seconds</code> 的分支：
+        </p>
+        <div class="timeline">
+          <ul>
+            <li>
+              <span class="who">timeout &gt; 0</span>
+              <div class="what">同步等待，默认 30 秒、上限 600 秒；模型传 null 用默认，传负数当 0 处理<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1498-1506">:1498-1506</span>。</div>
+            </li>
+            <li>
+              <span class="who">timeout = 0</span>
+              <div class="what">立即建后台任务并返回 <code>task_id</code>（形如 <code>task_&lt;uuid&gt;</code>），子 agent 在后台跑<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1632-1671">:1632-1671</span>。</div>
+            </li>
+            <li>
+              <span class="who">同步超时（默认）</span>
+              <div class="what">不取消、不丢结果：把还在跑的执行「提升」为 <code>AdoptedTaskRunSpec</code> 后台任务，返回 <code>status: timeout_promoted</code> + 新 <code>task_id</code>；提示词明确写「不要重试同一个任务」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1001-1051">:1001-1051</span>。</div>
+            </li>
+            <li>
+              <span class="who">同步超时（force-sync）</span>
+              <div class="what">硬失败：中断子 agent，返回 <code>status: timeout</code>，<strong>不</strong>提升为后台任务<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1013-1026">:1013-1026</span>。</div>
+            </li>
+          </ul>
+        </div>
+        <p>
+          force-sync 是应用侧的旋钮，不是模型参数。当前调用的 <code>RuntimeContext</code> 里放
+          <code>CTX_FORCE_SYNC=true</code> 即可覆盖 LLM 的异步选择；再放
+          <code>CTX_FORCE_SYNC_TIMEOUT_SECONDS</code> 则<strong>完全覆盖</strong> LLM 传的超时（<code>&lt;=0</code>
+          回退 30 秒，仍受 600 秒上限约束）<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1518-1545"
+            >:1518-1545</span
+          >。未设置 override 时，force-sync 会把 LLM 的 <code>0</code> 改写成 30 秒，而不是提交后台任务。
+        </p>
+        <pre data-lang="java" data-file="应用侧强制同步">RuntimeContext ctx =
+        RuntimeContext.builder()
+                .sessionId("s-1")
+                .put(AgentSpawnTool.CTX_FORCE_SYNC, true)
+                .put(AgentSpawnTool.CTX_FORCE_SYNC_TIMEOUT_SECONDS, 120)
+                .build();</pre>
+        <p>
+          实例寻址有三条路，优先级从高到低：<code>agent_key</code>（spawn 输出里的完整句柄）→
+          <code>label</code>（spawn 时自设的人类可读名）→ 新建。label 在同一父会话内重名会被拒：
+          <code>Error: Label already in use: …</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:405-407"
+            >:405-407</span
+          >。<code>agent_send</code> 与 <code>agent_spawn</code> 遵守同一套 force-sync 与超时规则<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:547-609"
+            >:547-609</span
+          >。
+        </p>
+        <p>
+          <code>expose_to_user</code> 是四层优先级：<code>RuntimeContext</code> 里的
+          <code>CTX_EXPOSE_TO_USER</code> &gt; 声明里的三态 &gt; LLM 传参 &gt; false<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1461-1485"
+            >:1461-1485</span
+          >。一旦暴露，会生成 <code>subagentId</code>、往父事件流发一条 <code>SubagentExposedEvent</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1570-1597"
+            >:1570-1597</span
+          >，前端可以据此让用户直接和这个子 agent 对话（示例见
+          <code>SubagentSendDirectlyExample</code> 的 <code>sendToSubagentStream(subagentId, …)</code>）。
+        </p>
+
+        <h2 id="tasks">结果：任务记录、四个工具与两条回推路径</h2>
+        <p>
+          后台任务不是内存里的一张表。默认实现把状态写成
+          <code>agents/&lt;parentAgentId&gt;/tasks/&lt;sessionId&gt;.json</code>，是一份
+          <code>taskId → TaskRecord</code> 的 JSON map；分布式部署时这个路径会被路由到共享存储，沙箱模式下则落在<strong>宿主</strong>
+          工作区<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/task/WorkspaceTaskRepository.java:44-54"
+            >WorkspaceTaskRepository.java:44-54</span
+          >。三个维护常量值得记住：心跳 30 秒、孤儿判定 10 分钟、清扫 5 分钟<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/task/WorkspaceTaskRepository.java:88-102"
+            >:88-102</span
+          >。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>工具</th><th>关键默认值 / 语义</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>task_output</code></td>
+                <td><code>block</code> 默认 true、<code>timeout</code> 默认 30000ms、上限 600000ms；跨节点拿不到本地 future 时降级返回 <code>status: running</code> + 提示轮询</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/TaskTool.java:104-126">TaskTool.java:104-126</span></td>
+              </tr>
+              <tr>
+                <td><code>task_cancel</code></td>
+                <td>终态任务直接返回「已终态，不能取消」；否则写取消标记，由执行节点轮询后中止</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/TaskTool.java:142-172">:142-172</span></td>
+              </tr>
+              <tr>
+                <td><code>task_list</code></td>
+                <td>读持久化存储，压缩或迁移后仍准确；可按 running/completed/failed/cancelled 过滤，非法值当作「全部」</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/TaskTool.java:174-226">:174-226</span></td>
+              </tr>
+              <tr>
+                <td><code>wait_async_results</code></td>
+                <td>默认 60 秒、上限 120 秒、3 秒轮询；连续 2 次空等后拒绝再阻塞；barrier 完成时把每个任务的结果直接写进工具返回</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/WaitAsyncResultsTool.java:51-57">WaitAsyncResultsTool.java:51-57</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/WaitAsyncResultsTool.java:97-113">:97-113</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          <span class="ct">wait_async_results 的三种模式，别把「任意一条」当「全部」</span>
+          <p>
+            传 <code>task_ids</code> 或 <code>wait_all=true</code> 时是 barrier：等到集合全部终态，并把结果内联返回；两者都不传时是遗留的
+            inbox-any 模式，<strong>任意一条</strong> inbox 消息到达就返回<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/WaitAsyncResultsTool.java:33-49"
+              >WaitAsyncResultsTool.java:33-49</span
+            >。barrier 还会把已读任务 <code>markDelivered</code>，避免同一结果再被推送一遍<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/WaitAsyncResultsTool.java:376-413"
+              >:376-413</span
+            >。
+          </p>
+        </div>
+        <p>「任务完成后会自动回到上下文」这句话在源码里有<strong>两条</strong>实现，走哪条取决于装的是哪个中间件：</p>
+        <div class="compare">
+          <div class="col pick">
+            <h4>默认路径：inbox + wakeup</h4>
+            <ul>
+              <li>默认 <code>messageBus</code> 是 <code>WorkspaceMessageBus(filesystem, ".agentscope/bus")</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2504-2511">:2504-2511</span>，只要 filesystem 存在（默认总是存在）就会创建。</li>
+              <li>子 agent 中间件把 <code>TaskCompletionCallback</code> 挂到仓库上：完成时 <code>inboxPush</code> 一条 <code>&lt;system-notification&gt;</code>，再 <code>enqueueWakeup</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2320-2354">:2320-2354</span>。</li>
+              <li><code>InboxMiddleware</code> 下一轮开始前 drain，把 hint 注入上下文（以及一条 <code>HintBlockEvent</code>）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/InboxMiddleware.java:82-180">InboxMiddleware.java:82-180</span>。</li>
+              <li>这套在 Dynamic 与静态中间件下都生效。</li>
+            </ul>
+          </div>
+          <div class="col">
+            <h4>静态中间件额外路径：system-reminder</h4>
+            <ul>
+              <li>只在 <code>SubagentsMiddleware.onReasoning</code> 里：<code>findPendingDeliveries</code> → 拼一条 role=USER、name=system、metadata.synthetic=true 的消息<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:413-449">SubagentsMiddleware.java:413-449</span>。</li>
+              <li>最多列 10 条，其余给一句 <code>... and N more — call task_list()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:492-549">:492-549</span>。</li>
+              <li><code>markDelivered</code> 只在 reasoning <strong>成功完成后</strong>执行——先标后崩会永久丢消息，反过来只多推一次<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:450-479">:450-479</span>。</li>
+              <li><code>DynamicSubagentsMiddleware.onReasoning</code> 不调这段，所以默认路径看不到它。</li>
+            </ul>
+          </div>
+        </div>
+
+        <h2 id="assemble">装配：build() 里的顺序与两个「隐式默认」</h2>
+        <p>
+          这一段是本章和官方文档差异最大的地方。把 <code>build()</code> 里与子 agent 有关的几行按顺序读一遍：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先有 messageBus，后有 InboxMiddleware</span>
+            <div>
+              <code>messageBus == null &amp;&amp; filesystem != null</code> 时自动创建 <code>WorkspaceMessageBus</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2507-2511"
+                >HarnessAgent.java:2507-2511</span
+              >；随后无条件装 <code>InboxMiddleware</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2614-2616"
+                >:2614-2616</span
+              >。所以默认部署里「inbox」是开着的，不需要你配置。
+            </div>
+          </li>
+          <li>
+            <span class="sh">团队先装，子 agent 后装</span>
+            <div>
+              <code>teamsModeClient != null &amp;&amp; teamsModeContext != null</code> 才装 <code>TeamsMiddleware</code>
+              并注册工具<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2618-2630"
+                >:2618-2630</span
+              >；子 agent 分支在其后<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2632-2648"
+                >:2632-2648</span
+              >。两者互不替代，可以同时开。
+            </div>
+          </li>
+          <li>
+            <span class="sh">子 agent 分支的三层条件</span>
+            <div>
+              外层：<code>!leafSubagent &amp;&amp; !disableSubagents &amp;&amp; model != null</code>；内层：
+              <code>filesystem != null &amp;&amp; !disableDynamicSubagents</code> 走 Dynamic，否则走静态<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2633-2664"
+                >:2633-2664</span
+              >。由于 <code>resolveFilesystem</code> 的默认分支一定会返回一个 <code>LocalFilesystemSpec</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:147-168"
+                >HarnessAgentBuilderSupport.java:147-168</span
+              >，<strong>Dynamic 才是默认</strong>；静态版要靠 <code>disableDynamicSubagents()</code> 主动退回。
+            </div>
+          </li>
+          <li>
+            <span class="sh">等待工具最后装，且要能看见团队</span>
+            <div>
+              <code>messageBus != null</code> 时注册 <code>WaitAsyncResultsTool</code>，任务仓库从刚捕获的子
+              agent 中间件里取；若同时有团队，再挂一个 <code>hasOutstandingTeamWork</code> 探针，免得 lead 在队友还在跑时被劝「别再等了」<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2670-2685"
+                >:2670-2685</span
+              >。
+            </div>
+          </li>
+          <li>
+            <span class="sh">tools.json 的 allow 裁不掉这些工具</span>
+            <div>
+              <code>ToolFilter</code> 的规则是：显式 <code>deny</code> 永远生效；<code>allow</code> 只裁「目录工具」，<code>HarnessPlatformTools</code>
+              里的名字默认保留<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:27-43"
+                >ToolFilter.java:27-43</span
+              >。这张平台工具表包含 <code>agent_spawn/agent_send/agent_list</code>、<code>task_*</code>、<code>wait_async_results</code>、
+              <code>team</code> 与 18 个别名、plan 三件套、<code>skill_manage</code> 等<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/HarnessPlatformTools.java:35-78"
+                >HarnessPlatformTools.java:35-78</span
+              >。真不想让模型用，只能显式 deny，或用 <code>disableSubagents()</code>/<code>disableDynamicSubagents()</code>。
+            </div>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <span class="ct">两个「隐式默认」</span>
+          <p>
+            ① 默认就有 messageBus（因为 filesystem 默认存在），所以 <code>wait_async_results</code> 与 Inbox 默认都在；
+            ② 默认装的是 Dynamic（同样因为 filesystem），所以 spec 文件是热加载的。把这两条记住，<code>build()</code>
+            里大半的「为什么会有这个工具」就不用查了。
+          </p>
+        </div>
+
+        <h2 id="team">团队：一块任务板、一个邮箱、一套角色</h2>
+        <p>
+          团队的入口只有一行 builder：<code>teamsMode(client, context[, sessionId])</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1298-1329"
+            >HarnessAgent.java:1298-1329</span
+          >。四个零件各管一段：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>零件</th><th>职责</th><th>关键事实</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>TeamClient</code></td>
+                <td>任务板 + 邮箱的远程/本地接口</td>
+                <td>19 个抽象方法 + 1 个默认重载；<code>claimTask</code> 的 <code>expectedVersion &lt;= 0</code> 表示「按当前版本认领」，因为模型经常不填乐观锁<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/team/TeamClient.java:44-56">TeamClient.java:44-56</span></td>
+              </tr>
+              <tr>
+                <td><code>TeamContext</code></td>
+                <td>「我是谁、我的队友是谁、我能做什么」</td>
+                <td>record：teamName / namespace / objective / myRole / isLead / members / availableActions / recoveryContext；<code>resolvedNamespace()</code> 空则 <code>"default"</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/team/TeamContext.java:21-68">TeamContext.java:21-68</span></td>
+              </tr>
+              <tr>
+                <td><code>TeamTool</code></td>
+                <td>一个 <code>team</code> 工具，18 个 action</td>
+                <td>action 不在 <code>availableActions</code> 里时直接回 <code>{"error":"action '…' is not allowed for role …"}</code>；CAS 冲突回 <code>conflict: …</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/TeamTool.java:92-98">TeamTool.java:92-98</span></td>
+              </tr>
+              <tr>
+                <td><code>TeamsMiddleware</code></td>
+                <td>把团队上下文拼进 system prompt、注册工具、处理唤醒</td>
+                <td>lead 得 create/assign/spawn/shutdown/approve/complete；worker 得 list/claim/message（按 action 白名单裁剪）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/TeamsMiddleware.java:49-54">TeamsMiddleware.java:49-54</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          任务板本身比子 agent 的「一次执行」更像一个状态机：<code>pending → in_progress → completed / failed</code>，
+          后两个是终态；<code>claimableOf</code> 只挑「pending、未被人占、且所有 <code>blockedBy</code> 都已完成」的条目<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/team/TeamTask.java:36-82"
+            >TeamTask.java:36-82</span
+          >。本地实现 <code>LocalTeamClient</code> 用 <code>BaseStore</code> 的 CAS 模拟文件锁，任务 id 是递增的
+          <code>task-N</code>；<code>claimTask</code> 对「已被自己认领」是幂等的<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/team/LocalTeamClient.java:126-175"
+            >LocalTeamClient.java:126-175</span
+          >。
+        </p>
+        <pre data-lang="java" data-file="TeamMinimal（自包含骨架）">BaseStore store = new InMemoryStore();
+TeamClient client = new LocalTeamClient(store);
+TeamContext leadCtx =
+        new TeamContext(
+                "release-triage",          // teamName
+                "default",                 // namespace
+                "定位发布失败原因并给出结论", // objective
+                "lead",                    // myRole
+                true,                      // isLead
+                List.of(new TeamContext.MemberSnapshot("lead", "orchestrator", "active")),
+                List.of()                  // 空 = 不裁剪 action
+                );
+
+HarnessAgent lead =
+        HarnessAgent.builder()
+                .name("lead")
+                .model("dashscope:qwen-plus")
+                .teamsMode(client, leadCtx, "team-session-1")
+                .build();</pre>
+        <p>
+          团队中间件有两个「只对某种角色」的行为，值得单独记：lead 在每轮开始时刷新一次任务板摘要
+          <code>boardDigest</code>，里面会写「你还欠着哪几个任务」以及「全 settled 了，去写总结并 completeTeam」；worker
+          在轮次结束时把仍是 <code>in_progress</code> 且归自己的任务直接 <code>failTask</code>，理由取它最后一条 assistant
+          文本（截断到 4000 字符）<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/TeamsMiddleware.java:280-350"
+            >:280-350</span
+          >。这是「worker 的一轮就是它的全部执行」这个模型的直接后果。
+        </p>
+        <p>
+          唤醒也是团队特有的：<code>TeamsMiddleware</code> 用两张静态表分别按 <code>sessionId</code> 与
+          <code>team|member</code> 查找实例，<code>TeamWakeups</code> 让 <code>TeamClient</code> 能按成员名叫醒一个会话；
+          唤醒时先 <code>inboxPush</code> 一条 <code>source=team_event</code> 的 hint，再 <code>enqueueWakeup</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/TeamsMiddleware.java:95-99"
+            >:95-99</span
+          >、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/TeamsMiddleware.java:218-260">:218-260</span
+          >。没绑会话时通知先缓存，下一轮再补，避免「事件早于绑定」丢失。
+        </p>
+        <div class="callout warn">
+          <span class="ct">只给 client 不给 context，团队不会装，而且不报错</span>
+          <p>
+            <code>build()</code> 的条件是「两个都非空」<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2619"
+              >HarnessAgent.java:2619</span
+            >，没有校验、没有 warn。表现是：没有 <code>team</code> 工具、system prompt 里也没有团队段。排查团队「没生效」时先看这一条。
+          </p>
+        </div>
+
+        <h2 id="doc-gap">官方说了什么 vs 源码实际是什么</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>源码事实</th><th>依据</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>工作区 spec 的 front matter 示例里写了 <code>name: researcher</code>（<code>subagent.md:293-301</code>）</td>
+                <td>Loader 从不读 <code>name</code>，名字由文件名派生；未知键被 YAML 读入后直接忽略，不报错也不警告。写不写都不影响结果，但会误导你以为可以改名</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/AgentSpecLoader.java:217-347">AgentSpecLoader.java:217-347</span></td>
+              </tr>
+              <tr>
+                <td>「后台任务完成 → 下一轮前以 <code>&lt;system-reminder&gt;</code> 注入」（<code>subagent.md:145-157</code>）</td>
+                <td>这段代码在静态 <code>SubagentsMiddleware</code> 里；默认装的是 Dynamic，它只渲染任务摘要，不 drain delivery。默认路径的推送来自 completion callback → inbox → <code>InboxMiddleware</code>，文案是 <code>&lt;system-notification&gt;</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/DynamicSubagentsMiddleware.java:147-172">DynamicSubagentsMiddleware.java:147-172</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2327-2346">HarnessAgent.java:2327-2346</span></td>
+              </tr>
+              <tr>
+                <td><code>agent_generate</code>「默认关闭」，示例只给了一句「拿到 builder 内部的 SubagentsMiddleware 引用」</td>
+                <td>全仓没有生产调用点：<code>enableAgentGenerateTool</code> 只出现在定义与 javadoc 里，<code>build()</code> 不调用它，builder 也没有对应方法；<code>HarnessAgent</code> 只暴露了 <code>getSubagentAgentManager()</code> 与 <code>getTaskRepository()</code>，拿不到中间件实例</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:251-270">SubagentsMiddleware.java:251-270</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:518-545">HarnessAgent.java:518-545</span></td>
+              </tr>
+              <tr>
+                <td>「<code>mode: subagent</code> 表示只能作为子 agent」</td>
+                <td>只有 <code>PRIMARY</code> 被强制（<code>createAgentIfPresent</code> 直接返回 empty）；<code>SUBAGENT</code> 没有被顶层入口拦截——javadoc 自己写了「current core does not own that check」</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/SubagentDeclaration.java:68-82">SubagentDeclaration.java:68-82</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/DefaultAgentManager.java:107-120">DefaultAgentManager.java:107-120</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cheatsheet">速查</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>你想做的事</th><th>写法</th><th>注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>加一个最省的子 agent</td><td><code>workspace/subagents/&lt;id&gt;.md</code></td><td>必须写 <code>description</code>；不要写 <code>name</code></td></tr>
+              <tr><td>编程式声明</td><td><code>.subagent(SubagentDeclaration.builder()…build())</code></td><td>name/description 必填，三种来源三选一</td></tr>
+              <tr><td>自己的 agent 当子 agent</td><td><code>.subagentFactory(name, n -&gt; agent)</code></td><td>lambda 入参是名字；不自动 leaf、不自动分桶</td></tr>
+              <tr><td>让子 agent 读父工作区</td><td><code>.workspaceMode(SHARED)</code></td><td>path 会被忽略；会话槽位退回纯名字</td></tr>
+              <tr><td>后台跑</td><td><code>timeout_seconds=0</code></td><td>返回 <code>task_id</code>，结果走 inbox 推送</td></tr>
+              <tr><td>强制同步</td><td><code>CTX_FORCE_SYNC=true</code></td><td>超时硬失败，不提升为后台</td></tr>
+              <tr><td>让用户直连子 agent</td><td><code>expose_to_user=true</code></td><td>生成 <code>subagent_id</code> 与 <code>SubagentExposedEvent</code></td></tr>
+              <tr><td>退回静态中间件</td><td><code>disableDynamicSubagents()</code></td><td>同名 spec 的修改不再热更新</td></tr>
+              <tr><td>彻底关掉子 agent</td><td><code>disableSubagents()</code></td><td>连 <code>general-purpose</code> 一起没有</td></tr>
+              <tr><td>开团队</td><td><code>teamsMode(client, context[, sessionId])</code></td><td>client 与 context 都必须非空</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. 以为 <code>subagentFactory</code> 的 lambda 收到任务文本</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>工厂里打印参数，永远是子 agent 的名字；任务文本根本传不到工厂。</dd>
+            <dt>因为</dt>
+            <dd>桥接是 <code>(rc) -&gt; custom.factory().apply(custom.name())</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:237">HarnessAgentBuilderSupport.java:237</span>，任务文本由 <code>DefaultAgentManager.invokeAgent</code> 作为 user message 传入<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/DefaultAgentManager.java:179-195">:179-195</span>。</dd>
+            <dt>改成</dt>
+            <dd>工厂只负责「造一个 agent」，需要按任务定制就在 agent 的 sysPrompt/工具里做；要父身份隔离，改用编程式声明。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 改了同名 <code>subagents/*.md</code>，静态模式不生效</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>调了 <code>disableDynamicSubagents()</code> 之后，新增文件能被发现，但改已有文件的内容没反应。</dd>
+            <dt>因为</dt>
+            <dd>静态版的 <code>loadSubagentSnapshot</code> 只把「base 里不存在」的名字加进来，同名直接跳过<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:621-633">:621-633</span>；而且快照按 <code>RuntimeContext</code> 缓存，建一次就一直用<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:598-606">:598-606</span>。</dd>
+            <dt>改成</dt>
+            <dd>要么保留默认的 Dynamic（每轮 replace），要么重建 agent；不要在静态模式里期待热更新。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. spec 文件明明在，agent_spawn 说 Unknown agent_id</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>Error: Unknown agent_id: reviewer</code>，但 <code>subagents/reviewer.md</code> 确实存在。</dd>
+            <dt>因为</dt>
+            <dd>三种可能，按概率排：① front matter 没写 <code>description</code>，Loader 直接返回 null<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/AgentSpecLoader.java:241-247">AgentSpecLoader.java:241-247</span>；② 文件不在<strong>直接子级</strong>（Loader 不递归）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/AgentSpecLoader.java:90-122">:90-122</span>；③ 声明是 <code>mode: primary</code>，被当成 PRIMARY-only 拒绝<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/DefaultAgentManager.java:115-118">DefaultAgentManager.java:115-118</span>。</dd>
+            <dt>改成</dt>
+            <dd>打开 debug 日志看 Loader 的 warn；确认文件层级；把 <code>mode</code> 改成 <code>all</code> 或删掉。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. timeout_promoted 之后又 spawn 了一遍</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>同一份任务跑了两遍，日志里两份结果；有时还会撞同一个 label。</dd>
+            <dt>因为</dt>
+            <dd>同步超时不是失败，执行被挂到 <code>AdoptedTaskRunSpec</code> 上继续跑，返回值是 <code>status: timeout_promoted</code> + 新 task_id<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1027-1041">:1027-1041</span>；提示词模板也专门写了「Do NOT retry the same task」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:139-140">SubagentsMiddleware.java:139-140</span>。</dd>
+            <dt>改成</dt>
+            <dd>把 <code>timeout_promoted</code> 当异步任务处理：等推送、<code>task_output</code> 或 <code>wait_async_results(task_ids=…)</code>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. 以为 tools.json 的 allow 能关掉 agent_spawn</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>allow</code> 里只写了三个文件工具，模型却还能 spawn、还能用 team。</dd>
+            <dt>因为</dt>
+            <dd>平台工具默认穿透 allow；日志会写 <code>kept N platform tool(s) outside allow</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:109-139">ToolFilter.java:109-139</span>。</dd>
+            <dt>改成</dt>
+            <dd>用 <code>deny</code> 精确列名字，或用 builder 的 <code>disableSubagents()</code>；团队没有 disable 开关，只能 deny 或干脆不装。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">6. 团队 worker 一轮结束，任务被标成 failed</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>worker 明明还在思考，板上的 <code>in_progress</code> 任务变成了 <code>failed</code>，理由是它最后一段话。</dd>
+            <dt>因为</dt>
+            <dd><code>TeamsMiddleware.onAgent</code> 对非 lead 在轮次结束时执行 <code>settleOwnedTasks</code>，把仍归自己的 <code>in_progress</code> 全部 <code>failTask</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/TeamsMiddleware.java:301-350">:301-350</span>。这是设计：worker 没有被再次唤醒的保证，悬着的任务会让 lead 永远等。</dd>
+            <dt>改成</dt>
+            <dd>在 worker 的提示词里要求「结束前要么 completeTask，要么 failTask 并写清原因」；长任务拆小，别让一轮装不下。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>默认配置下，装的是 Dynamic 还是静态中间件？各自的 spec 加载时机与「改名/改内容」行为是什么？</summary>
+          <p>
+            默认 Dynamic：<code>build()</code> 的内层条件是 <code>filesystem != null &amp;&amp; !disableDynamicSubagents</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2634">HarnessAgent.java:2634</span>，而 filesystem 默认一定存在。Dynamic 每轮重新跑两层加载（filesystem 覆盖本地目录）并 <code>replaceAgents</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/DynamicSubagentsMiddleware.java:147-157">DynamicSubagentsMiddleware.java:147-157</span>，所以新增和改内容都生效。静态版在 build 时扫一次本地目录，运行期只补「base 里没有的名字」，同名修改不生效<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:613-641">SubagentsMiddleware.java:613-641</span>。
+          </p>
+        </details>
+        <details>
+          <summary>同步 spawn 超时后发生了什么？force-sync 下有什么不同？</summary>
+          <p>
+            普通同步：超时只结束「观察」，不结束「执行」。还在跑的 <code>CompletableFuture</code> 被包成 <code>AdoptedTaskRunSpec</code> 注册进仓库，调用方拿到 <code>status: timeout_promoted</code> 和一个新 <code>task_id</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1027-1041">AgentSpawnTool.java:1027-1041</span>。force-sync：<code>innerSub.dispose()</code> 触发 <code>doFinally(CANCEL)</code> → <code>interruptAgent</code>，返回 <code>status: timeout</code>，不注册后台任务<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:1013-1026">:1013-1026</span>。
+          </p>
+        </details>
+        <details>
+          <summary>团队里 lead 和 worker 拿到的工具面为什么不同？空 <code>availableActions</code> 意味着什么？</summary>
+          <p>
+            <code>TeamTool</code> 在每次调用前检查 <code>context.availableActions()</code>，不在集合里的 action 直接回错误；<code>normalize</code> 会去掉 <code>_</code>/<code>-</code> 并转小写，另有几条兼容别名（<code>listClaimableTasks</code>/<code>unclaimTask</code> 跟着 <code>claimTask</code> 放行，<code>listMessages</code> 跟着发消息放行，<code>failTask</code> 跟着 <code>completeTask</code> 放行）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/TeamTool.java:644-673">TeamTool.java:644-673</span>。空或 null 表示<strong>不裁剪</strong>，所有 action 都放行；所以「安全默认」是显式给 lead/worker 各写一份白名单，而不是留空。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">看见「四种工作区组合」的落点</span>
+            <div>
+              写两个 spec：<code>a.md</code> 用默认（ISOLATED、无 path），<code>b.md</code> 写 <code>workspace.mode: shared</code>。
+              各 spawn 一次，然后看宿主目录：<code>a</code> 会多出 <code>agents/a/workspace/</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:719-731">HarnessAgentBuilderSupport.java:719-731</span>，<code>b</code>
+              没有新目录，直接读写主工作区。再把 <code>a.md</code> 加上 <code>workspace.path: ./defs/a</code> 和一个非空正文，确认日志出现「body will be ignored」并且 <code>./defs/a/AGENTS.md</code> 才是 prompt 来源。
+            </div>
+          </li>
+          <li>
+            <span class="sh">亲手摸到任务记录文件</span>
+            <div>
+              用 <code>timeout_seconds=0</code> spawn 一个会跑十几秒的任务，立刻去
+              <code>&lt;workspace&gt;/agents/&lt;name&gt;/tasks/&lt;sessionId&gt;.json</code> 看结构（taskId、status、createdAt、result）；再在同一个会话里调
+              <code>task_list</code> 与 <code>task_output(block=false)</code>，对比两者的输出。最后把进程杀掉重启，确认 <code>task_list</code> 仍能读出这条记录——这就是「压缩/迁移后仍准确」的来源<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/subagent/task/WorkspaceTaskRepository.java:44-54">:44-54</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">对比两条推送路径</span>
+            <div>
+              同一段后台任务代码，跑两遍：默认（Dynamic）一遍，<code>.disableDynamicSubagents()</code> 一遍。用
+              <code>streamEvents()</code> 观察：默认应看到 <code>InboxMiddleware</code> 产生的 <code>HintBlockEvent</code>（内容含
+              <code>&lt;system-notification&gt;</code>）；静态版还会多一条 role=USER、name=system 的
+              <code>&lt;system-reminder&gt;</code> 消息进入后续上下文<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SubagentsMiddleware.java:413-449">SubagentsMiddleware.java:413-449</span>。这一步能把「文档写的」和「默认跑的」彻底分开。
+            </div>
+          </li>
+          <li>
+            <span class="sh">团队最小闭环（可选，不接模型也能验证状态机）</span>
+            <div>
+              用 <code>new InMemoryStore()</code> + <code>new LocalTeamClient(store)</code>，直接调
+              <code>createTask</code> → <code>claimTask</code> → <code>completeTask</code>，观察 <code>version</code> 每次 +1；再连续两次
+              <code>claimTask</code> 同一条任务，确认第二次是幂等返回而不是冲突<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/team/LocalTeamClient.java:126-175">LocalTeamClient.java:126-175</span>。最后给一条带
+              <code>blockedBy</code> 的任务，确认 <code>claimableOf</code> 在依赖完成前不返回它。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">完成这一章之后</h2>
+        <p>
+          现在你手里有三张图：子 agent 的「来源 → 声明 → 工作区 → 任务」链、两条结果回推路径、团队的「板 + 邮箱 + 角色」模型。
+          下一章换一个方向：不管子 agent 多能干，父 agent 的上下文总会满——第 15 章看压缩、记忆刷写与工具结果逐出。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="15-compaction-memory.html">15 上下文压缩、记忆与结果逐出</a></td><td><code>CompactionMiddleware</code> 与 <code>ToolResultEvictionMiddleware</code> 在 <code>build()</code> 里就排在子 agent 中间件前面</td></tr>
+              <tr><td><a href="12-workspace-filesystem.html">12 工作区与文件系统</a></td><td>本章反复用到的 <code>agents/&lt;id&gt;/…</code> 布局、namespace 与 filesystem 默认值</td></tr>
+              <tr><td><a href="13-sandbox.html">13 沙箱与受控执行</a></td><td>沙箱模式下任务记录为什么落宿主、子 agent 的 ISOLATED 工作区怎么进容器</td></tr>
+              <tr><td><a href="17-plan-mode-tools.html">17 计划模式与工具装配</a></td><td><code>tools.json</code> 的平台工具穿透规则、plan mode 怎么随 spawn 传给子 agent</td></tr>
+              <tr><td><a href="../appendix/api-cheatsheet.html#h-plan">附录 C：Harness ⑥计划模式与团队</a></td><td><code>teamsMode</code> 与相关 builder 的一页清单</td></tr>
+              <tr><td>官方 <code>docs/v2/zh/docs/harness/subagent.md</code></td><td>本章「文档 vs 源码」以它为对照；流式转发那一节仍值得读</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">一句话记住这一章</span>
+          <p>
+            四个标识别混（agent_id / agent_key / session_id / task_id）、Dynamic 是默认、超时只结束观察不结束执行、团队要 client+context 两个都给——把这四句对上
+            <code>formatSpawnInfo</code>、<code>HarnessAgent:2634</code>、<code>handleExecError</code>、<code>HarnessAgent:2619</code>
+            四个位置，本章就不用背了。
+          </p>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

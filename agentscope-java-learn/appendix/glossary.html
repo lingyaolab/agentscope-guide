@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="读官方文档最烦的不是英文，是一个概念有五个名字：代码里叫 ToolUseBlock，文档里叫 tool call，界面上叫「工具调用」，中文教程里又叫「函数调用」。这张表按主题把 2.0.4 里真正会遇到的术语各给一句话，每行都标了第一次讲它的章节——忘了就回去看那一章，别在这里硬背。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="附录 A 术语表：中英对照 + 一句话直觉 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="读官方文档最烦的不是英文，是一个概念有五个名字：代码里叫 ToolUseBlock，文档里叫 tool call，界面上叫「工具调用」，中文教程里又叫「函数调用」。这张表按主题把 2.0.4 里真正会遇到的术语各给一句话，每行都标了第一次讲它的章节——忘了就回去看那一章，别在这里硬背。" />
+    <title>附录 A 术语表：中英对照 + 一句话直觉 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="glossary" data-root="..">
+    <main>
+      <article class="article">
+        <h1>附录 A · 术语表：中英对照 + 一句话直觉</h1>
+        <p class="lede">
+          读官方文档最烦的不是英文，是<strong>一个概念有五个名字</strong>：代码里叫 <code>ToolUseBlock</code>，文档里叫
+          tool call，界面上叫「工具调用」，中文教程里又叫「函数调用」。这张表按主题把 2.0.4 里真正会遇到的术语各给一句话，
+          每行都标了第一次讲它的章节——忘了就回去看那一章，别在这里硬背。
+        </p>
+
+        <h2 id="how">怎么用这张表</h2>
+        <ul class="goals">
+          <li><strong>先看「一句话直觉」那一列</strong>。名字只是索引，直觉才是能用的东西</li>
+          <li>标 <span class="tag-star">★</span> 的是必须能脱口而出的：说不清它们，后面的章节会一直卡</li>
+          <li>「章」这一列是第一次系统讲它的地方；附录只负责提醒，不负责讲透</li>
+          <li>表里出现的类名都可以在源码里搜到，包路径统一是 <code>io.agentscope.core.*</code>，Harness 的在 <code>io.agentscope.harness.agent.*</code></li>
+        </ul>
+        <div class="callout tip">
+          <span class="ct">三对最容易混的概念，先在这里分清</span>
+          <p>
+            <strong>State vs Memory</strong>：<code>AgentState</code> 是「一份会话的全部可存内容」，<code>Memory</code>
+            只是其中「进上下文的那串消息」。<strong>Hook vs Middleware</strong>：Hook 是<em>切点回调</em>（到点叫你），
+            Middleware 是<em>包裹层</em>（能改写这一段怎么做）。<strong>Event vs HookEvent</strong>：<code>AgentEvent</code>
+            是<em>给外部消费者</em>的事件流，<code>HookEvent</code> 是<em>给框架内部 Hook</em> 的切点对象，两套类型不通。
+          </p>
+        </div>
+
+        <h2 id="agent">Agent 与运行时</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>术语</th><th>中文</th><th>一句话直觉</th><th>章</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>Agent</code> <span class="tag-star">★</span></td>
+                <td>智能体接口</td>
+                <td>只承诺四件事：能 <code>call</code>、能被 <code>observe</code>、有旧版 <code>stream</code>、能发事件；<strong><code>streamEvents</code> 不在这个接口上</strong></td>
+                <td><a href="../chapters/10-react-vs-harness.html#minimal">10</a></td>
+              </tr>
+              <tr>
+                <td><code>AgentBase</code></td>
+                <td>智能体基类</td>
+                <td>所有 agent 的共同底座：生命周期、Hook 分发、错误兜底、优雅停机登记</td>
+                <td><a href="../chapters/10-react-vs-harness.html#line-by-line">10</a></td>
+              </tr>
+              <tr>
+                <td><code>ReActAgent</code> <span class="tag-star">★</span></td>
+                <td>ReAct 引擎</td>
+                <td>唯一的内置循环实现：「推理 → 调工具 → 再推理」，全站 18 章的每个能力最后都落到它</td>
+                <td><a href="../chapters/02-first-agent.html">02</a></td>
+              </tr>
+              <tr>
+                <td><code>HarnessAgent</code> <span class="tag-star">★</span></td>
+                <td>Harness 外壳</td>
+                <td><strong>不是 <code>ReActAgent</code> 的子类</strong>：它 <code>implements Agent, AutoCloseable</code>，内部持有一个 <code>delegate</code></td>
+                <td><a href="../chapters/10-react-vs-harness.html#why">10</a></td>
+              </tr>
+              <tr>
+                <td><code>delegate</code></td>
+                <td>被委托者</td>
+                <td>Harness 内部真正在跑循环的那个 <code>ReActAgent</code> 实例；Harness 只做转发和加装</td>
+                <td><a href="../chapters/10-react-vs-harness.html#why">10</a></td>
+              </tr>
+              <tr>
+                <td><code>RuntimeContext</code> <span class="tag-star">★</span></td>
+                <td>运行时上下文</td>
+                <td>一次调用的「我是谁、在哪个会话」：<code>userId</code> + <code>sessionId</code>，每次调用都可以不同</td>
+                <td><a href="../chapters/02-first-agent.html">02</a></td>
+              </tr>
+              <tr>
+                <td>session</td>
+                <td>会话</td>
+                <td>就是 <code>(userId, sessionId)</code> 这对坐标；换坐标 = 换一份记忆，换一份权限规则</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+              <tr>
+                <td><code>AgentRun</code></td>
+                <td>一次运行</td>
+                <td>描述某一次调用处在哪个阶段（排队 / 运行 / 完成 / 失败），不是「会话」</td>
+                <td><a href="../chapters/10-react-vs-harness.html#line-by-line">10</a></td>
+              </tr>
+              <tr>
+                <td><code>RunControl</code></td>
+                <td>运行控制</td>
+                <td>决定这次调用是排队、开跑还是被取消；中断能否生效取决于它此刻的状态</td>
+                <td><a href="../chapters/10-react-vs-harness.html#interrupt">10</a></td>
+              </tr>
+              <tr>
+                <td><code>interrupt()</code></td>
+                <td>中断</td>
+                <td>让正在跑的循环在下一个检查点停下，结果消息的 reason 是 <code>INTERRUPTED</code></td>
+                <td><a href="../chapters/10-react-vs-harness.html#interrupt">10</a></td>
+              </tr>
+              <tr>
+                <td>graceful shutdown</td>
+                <td>优雅停机</td>
+                <td>JVM 要关时，先把在跑的请求收尾并落盘，而不是直接掐掉</td>
+                <td><a href="../chapters/10-react-vs-harness.html#interrupt">10</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          <code>Agent</code> 的三个父接口：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/Agent.java:47">Agent.java:47</span>；<code>AgentBase</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/AgentBase.java:91">AgentBase.java:91</span>；<code>HarnessAgent</code> 的声明：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:169">HarnessAgent.java:169</span>
+        </p>
+
+        <h2 id="message">消息与内容块</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>术语</th><th>中文</th><th>一句话直觉</th><th>章</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>Msg</code> <span class="tag-star">★</span></td>
+                <td>消息</td>
+                <td>对话的最小单位：<code>role</code> + 内容块列表 + <code>metadata</code>；<code>getTextContent()</code> 在没有文本时返回<strong>空串</strong>而不是 null</td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>MsgRole</code></td>
+                <td>消息角色</td>
+                <td>只有四个：<code>USER</code> / <code>ASSISTANT</code> / <code>SYSTEM</code> / <code>TOOL</code></td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>ContentBlock</code> <span class="tag-star">★</span></td>
+                <td>内容块</td>
+                <td>一条消息里可以<strong>同时</strong>有文本、思考、工具调用、图片——不是一个消息一种类型</td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>TextBlock</code></td>
+                <td>文本块</td>
+                <td>你看到的「回答正文」</td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>ThinkingBlock</code></td>
+                <td>思考块</td>
+                <td>推理模型的思维链；<strong>存进记忆，但不会再发给模型</strong></td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>ToolUseBlock</code> <span class="tag-star">★</span></td>
+                <td>工具调用块</td>
+                <td>模型说「我要调这个工具」：<code>id</code> / <code>name</code> / <code>input</code> / <code>state</code>，HITL 全靠 <code>id</code> 对齐</td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>ToolResultBlock</code></td>
+                <td>工具结果块</td>
+                <td>工具执行后的结果：内容块 + <code>ToolResultState</code> + 关联的调用 id</td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>DataBlock</code></td>
+                <td>数据块</td>
+                <td>图片 / 音频 / 视频 / 文件的统一容器（旧的 <code>ImageBlock</code> 等还在，但新代码用它）</td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>HintBlock</code></td>
+                <td>提示块</td>
+                <td>中间件或 RAG 插进来的「背景提示」，不算对话历史，也不会污染 assistant 正文</td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>ToolCallState</code></td>
+                <td>调用状态</td>
+                <td><code>PENDING</code> → <code>ASKING</code> → <code>ALLOWED</code> → <code>SUBMITTED</code> → <code>FINISHED</code>，<code>ASKING</code> 就是「等你批」</td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+              <tr>
+                <td><code>ToolResultState</code></td>
+                <td>结果状态</td>
+                <td><code>SUCCESS</code> / <code>ERROR</code> / <code>INTERRUPTED</code> / <code>DENIED</code> / <code>RUNNING</code></td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>GenerateReason</code> <span class="tag-star">★</span></td>
+                <td>结束原因</td>
+                <td>这一轮为什么停下来，12 个枚举值；<strong>判断是否暂停只能看它</strong></td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td>metadata</td>
+                <td>元数据</td>
+                <td>挂在消息上的字典；HITL 的 <code>ConfirmResult</code> 就藏在 <code>Msg.METADATA_CONFIRM_RESULTS</code> 这个 key 下</td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          <code>MsgRole</code> 只有 4 个值：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/message/MsgRole.java:35">MsgRole.java:35</span>；<code>GenerateReason</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/message/GenerateReason.java:36">GenerateReason.java:36</span>；<code>ToolCallState</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/message/ToolCallState.java:20">ToolCallState.java:20</span>；<code>ToolResultState</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/message/ToolResultState.java:20">ToolResultState.java:20</span>；思考块不回传：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/formatter/AbstractBaseFormatter.java:121">AbstractBaseFormatter.java:121</span>
+        </p>
+        <details>
+          <summary><code>GenerateReason</code> 的 12 个值，一次看全</summary>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>值</th><th>含义</th><th>你该做什么</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><code>MODEL_STOP</code></td><td>模型正常说完</td><td>结束，读文本</td></tr>
+                <tr><td><code>TOOL_CALLS</code></td><td>模型给了工具调用，框架继续跑</td><td>通常不会作为最终结果出现</td></tr>
+                <tr><td><code>STRUCTURED_OUTPUT</code></td><td>结构化输出完成</td><td>从 metadata 取结构化数据</td></tr>
+                <tr><td><code>TOOL_SUSPENDED</code></td><td>工具主动挂起，等外部结果</td><td>按 <code>ExternalExecutionResultEvent</code> 的约定回填</td></tr>
+                <tr><td><code>REASONING_STOP_REQUESTED</code></td><td>Hook 在推理阶段叫停</td><td>看自己的 Hook 逻辑</td></tr>
+                <tr><td><code>ACTING_STOP_REQUESTED</code></td><td>Hook 在行动阶段叫停</td><td>看自己的 Hook 逻辑</td></tr>
+                <tr><td><code>PERMISSION_ASKING</code></td><td>权限引擎要你确认</td><td>收集 <code>ASKING</code> 工具，回传 <code>ConfirmResult</code></td></tr>
+                <tr><td><code>MIDDLEWARE_STOP_REQUESTED</code></td><td>中间件请求暂停</td><td>无参数再调一次 <code>call()</code> 继续</td></tr>
+                <tr><td><code>ALL_TOOLS_DENIED</code></td><td>这轮工具全被拒，且 Hook 叫停</td><td>换策略或换提示词</td></tr>
+                <tr><td><code>INTERRUPTED</code></td><td>被 <code>interrupt()</code> 打断</td><td>决定重试还是放弃</td></tr>
+                <tr><td><code>MAX_ITERATIONS</code></td><td>撞到 <code>maxIters</code></td><td>框架会多做一次摘要调用；调大上限或简化任务</td></tr>
+                <tr><td><code>TOOL_RETURN_DIRECT</code></td><td>工具结果直接当最终答案</td><td>不用再等模型说话</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+
+        <h2 id="model">模型层</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>术语</th><th>中文</th><th>一句话直觉</th><th>章</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>Model</code> <span class="tag-star">★</span></td>
+                <td>模型接口</td>
+                <td>框架对 LLM 的唯一抽象：收一串 <code>Msg</code>，回一个 <code>ChatResponse</code></td>
+                <td><a href="../chapters/05-model.html">05</a></td>
+              </tr>
+              <tr>
+                <td><code>ChatModelBase</code></td>
+                <td>模型基类</td>
+                <td>各家 provider 的公共底座：超时、重试、流式拼装都在这里</td>
+                <td><a href="../chapters/05-model.html">05</a></td>
+              </tr>
+              <tr>
+                <td><code>ModelRegistry</code> <span class="tag-star">★</span></td>
+                <td>模型注册表</td>
+                <td>把 <code>"dashscope:qwen-plus"</code> 解析成实例；解析不了就抛 <code>Cannot resolve model</code></td>
+                <td><a href="../chapters/05-model.html">05</a></td>
+              </tr>
+              <tr>
+                <td><code>ModelProvider</code></td>
+                <td>模型提供者</td>
+                <td>SPI 接口：扩展模块实现它，就能让某个前缀的 id 被解析</td>
+                <td><a href="../chapters/05-model.html">05</a></td>
+              </tr>
+              <tr>
+                <td><code>GenerateOptions</code></td>
+                <td>生成参数</td>
+                <td>温度、topP、maxTokens、<code>responseFormat</code> 这些「不是模型 id 的东西」</td>
+                <td><a href="../chapters/05-model.html">05</a></td>
+              </tr>
+              <tr>
+                <td><code>ToolChoice</code></td>
+                <td>工具选择</td>
+                <td>强制调工具 / 禁止调工具 / 交给模型自己决定</td>
+                <td><a href="../chapters/05-model.html">05</a></td>
+              </tr>
+              <tr>
+                <td><code>ToolSchema</code></td>
+                <td>工具说明书</td>
+                <td>发给模型的 JSON Schema，决定了它「会不会用、会不会填错参数」</td>
+                <td><a href="../chapters/06-tool.html">06</a></td>
+              </tr>
+              <tr>
+                <td><code>ChatUsage</code></td>
+                <td>token 用量</td>
+                <td>输入 / 输出 token 统计，算钱用</td>
+                <td><a href="../chapters/05-model.html">05</a></td>
+              </tr>
+              <tr>
+                <td><code>ExecutionConfig</code></td>
+                <td>执行配置</td>
+                <td>超时与重试：模型默认 5 分钟 / 3 次，工具默认 5 分钟 / 1 次</td>
+                <td><a href="../chapters/05-model.html">05</a></td>
+              </tr>
+              <tr>
+                <td><code>fallbackModel</code></td>
+                <td>备用模型</td>
+                <td>主模型挂了切过去；两套 key 都要在环境变量里</td>
+                <td><a href="../chapters/05-model.html">05</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="tool">工具系统</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>术语</th><th>中文</th><th>一句话直觉</th><th>章</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>Toolkit</code> <span class="tag-star">★</span></td>
+                <td>工具集</td>
+                <td>注册表 + schema 生成 + 执行入口；<code>registerTool</code> 收对象，<code>getToolNames</code> 能自查</td>
+                <td><a href="../chapters/06-tool.html">06</a></td>
+              </tr>
+              <tr>
+                <td><code>@Tool</code></td>
+                <td>工具注解</td>
+                <td>把普通方法变成工具；常用属性 <code>name</code> / <code>description</code> / <code>readOnly</code> / <code>returnDirect</code></td>
+                <td><a href="../chapters/06-tool.html">06</a></td>
+              </tr>
+              <tr>
+                <td><code>@ToolParam</code></td>
+                <td>参数注解</td>
+                <td>描述一个参数：<code>name</code> / <code>description</code> / <code>required</code>（默认 true）</td>
+                <td><a href="../chapters/06-tool.html">06</a></td>
+              </tr>
+              <tr>
+                <td><code>ToolGroup</code></td>
+                <td>工具分组</td>
+                <td>按组激活：一次只把用得上的工具发给模型，省 token 也少误调</td>
+                <td><a href="../chapters/06-tool.html">06</a></td>
+              </tr>
+              <tr>
+                <td><code>ToolExecutor</code></td>
+                <td>工具执行器</td>
+                <td>真正反射调用方法、把返回值转成 <code>ToolResultBlock</code> 的那层</td>
+                <td><a href="../chapters/06-tool.html">06</a></td>
+              </tr>
+              <tr>
+                <td><code>ToolSuspendException</code></td>
+                <td>工具挂起</td>
+                <td>工具主动说「我还没完，等我」；对应 <code>TOOL_SUSPENDED</code></td>
+                <td><a href="../chapters/06-tool.html">06</a></td>
+              </tr>
+              <tr>
+                <td><code>returnDirect</code></td>
+                <td>直接返回</td>
+                <td>工具结果直接作为最终回答，不再回模型加工</td>
+                <td><a href="../chapters/06-tool.html">06</a></td>
+              </tr>
+              <tr>
+                <td><code>AgentTool</code></td>
+                <td>Agent 即工具</td>
+                <td>把一个 agent 暴露成工具给另一个 agent 用，是「agent 协作」最朴素的做法</td>
+                <td><a href="../chapters/06-tool.html">06</a></td>
+              </tr>
+              <tr>
+                <td><code>MCP</code></td>
+                <td>外部工具协议</td>
+                <td>Model Context Protocol：工具不在本进程里时，用它接进来</td>
+                <td><a href="../chapters/06-tool.html">06</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          <code>@Tool</code> 的 10 个属性：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Tool.java:70">Tool.java:70</span>；<code>Toolkit</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:70">Toolkit.java:70</span>
+        </p>
+
+        <h2 id="state">状态与记忆</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>术语</th><th>中文</th><th>一句话直觉</th><th>章</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>AgentState</code> <span class="tag-star">★</span></td>
+                <td>智能体状态</td>
+                <td>一份会话的全部可持久化内容：消息上下文、权限上下文、工具上下文、任务列表……</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+              <tr>
+                <td><code>AgentStateStore</code> <span class="tag-star">★</span></td>
+                <td>状态存储</td>
+                <td>按 <code>(userId, sessionId, key)</code> 读写；实现可换文件 / 内存 / Redis / MySQL</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+              <tr>
+                <td><code>State</code></td>
+                <td>可存状态</td>
+                <td>能被 store 序列化的标记接口；不是所有对象都能往里塞</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+              <tr>
+                <td><code>JsonFileAgentStateStore</code></td>
+                <td>文件状态存储</td>
+                <td>落盘到 <code>&lt;root&gt;/&lt;userId&gt;/&lt;sessionId&gt;/</code>，一个 JSON + 一个 JSONL</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+              <tr>
+                <td><code>InMemoryAgentStateStore</code></td>
+                <td>内存状态存储</td>
+                <td>进程内 Map，支持 CAS；测试和单次脚本首选</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+              <tr>
+                <td><code>saveIfVersion</code></td>
+                <td>带版本写入</td>
+                <td>乐观锁：版本对得上才写，对不上返回 <code>UNVERSIONED</code> 且不写</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+              <tr>
+                <td><code>ConflictPolicy</code></td>
+                <td>冲突策略</td>
+                <td><code>OVERWRITE</code> 后者覆盖 / <code>FAIL</code> 直接失败 / <code>APPEND_MERGE</code> 只追加新消息再重试</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+              <tr>
+                <td><code>Memory</code></td>
+                <td>短期记忆</td>
+                <td>「进上下文的那串消息」；<code>StateBackedMemory</code> 把它接到 store 上</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+              <tr>
+                <td><code>LongTermMemory</code></td>
+                <td>长期记忆</td>
+                <td>跨会话的检索式记忆，<strong>不是</strong>消息列表；写入与召回都要自己设计</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+              <tr>
+                <td><code>LongTermMemoryMode</code></td>
+                <td>长期记忆模式</td>
+                <td><code>AGENT_CONTROL</code> 模型自己存取 / <code>STATIC_CONTROL</code> 框架按 Hook 存取 / <code>BOTH</code> 两者都要</td>
+                <td><a href="../chapters/07-memory-context.html">07</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          <code>AgentState</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:57">AgentState.java:57</span>；<code>AgentStateStore</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:61">AgentStateStore.java:61</span>；<code>ConflictPolicy</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/ConflictPolicy.java:34">ConflictPolicy.java:34</span>；<code>LongTermMemoryMode</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemoryMode.java:54">LongTermMemoryMode.java:54</span>
+        </p>
+
+        <h2 id="permission">权限与 HITL</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>术语</th><th>中文</th><th>一句话直觉</th><th>章</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>HITL <span class="tag-star">★</span></td>
+                <td>人在回路</td>
+                <td>Human-in-the-loop：执行前停下来等人批，批完接着跑</td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+              <tr>
+                <td><code>PermissionMode</code> <span class="tag-star">★</span></td>
+                <td>权限模式</td>
+                <td><code>DEFAULT</code> / <code>ACCEPT_EDITS</code> / <code>EXPLORE</code> / <code>BYPASS</code> / <code>DONT_ASK</code></td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+              <tr>
+                <td><code>PermissionBehavior</code> <span class="tag-star">★</span></td>
+                <td>权限动作</td>
+                <td><code>ALLOW</code> / <code>DENY</code> / <code>ASK</code> / <code>PASSTHROUGH</code>（交给下层继续判断）</td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+              <tr>
+                <td><code>PermissionRule</code></td>
+                <td>权限规则</td>
+                <td>四元组：工具名 + 参数模式 + 动作 + 作用域标签</td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+              <tr>
+                <td><code>PermissionContextState</code></td>
+                <td>权限上下文</td>
+                <td>模式 + 规则表；存在 <code>AgentState</code> 里，所以换 session 就重置</td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+              <tr>
+                <td><code>PermissionEngine</code></td>
+                <td>权限引擎</td>
+                <td>每次工具调用前算一次决策；规则全落空就走模式的默认行为</td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+              <tr>
+                <td><code>PermissionDecision</code></td>
+                <td>权限决策</td>
+                <td>引擎的结论：行为 + 给用户看的消息 + 理由 + 可改写的参数 + 建议规则</td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+              <tr>
+                <td><code>ConfirmResult</code> <span class="tag-star">★</span></td>
+                <td>确认结果</td>
+                <td>用户对某次 <code>ASKING</code> 的回答：同意/拒绝 + 理由 + 可顺带加入的规则</td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+              <tr>
+                <td><code>RequireUserConfirmEvent</code></td>
+                <td>请求确认事件</td>
+                <td>暂停时发出，<code>getToolCalls()</code> 给你要问的那批工具的<strong>原件</strong></td>
+                <td><a href="../chapters/11-capstone.html#line-by-line">11</a></td>
+              </tr>
+              <tr>
+                <td><code>PERMISSION_ASKING</code></td>
+                <td>等待批准</td>
+                <td>一种<strong>正常</strong>的结束原因，不是异常；下一轮带上 <code>ConfirmResult</code> 再调即可</td>
+                <td><a href="../chapters/08-permission-hitl.html">08</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          <code>PermissionMode</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionMode.java:33">PermissionMode.java:33</span>；<code>PermissionBehavior</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionBehavior.java:32">PermissionBehavior.java:32</span>；<code>PermissionEngine</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionEngine.java:47">PermissionEngine.java:47</span>
+        </p>
+
+        <h2 id="event">事件、Hook 与中间件</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>术语</th><th>中文</th><th>一句话直觉</th><th>章</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>AgentEvent</code> <span class="tag-star">★</span></td>
+                <td>智能体事件</td>
+                <td>事件流里的最小单位，每个都带 <code>replyId</code>；2.0.4 里有 31 种类型</td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>replyId</code></td>
+                <td>回复 id</td>
+                <td>一次调用内所有事件的关联键；并发调用时靠它分组</td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td>start / delta / end</td>
+                <td>三段式</td>
+                <td>文本、思考、数据、工具调用、工具结果都是「开始 → 增量 → 结束」三件套</td>
+                <td><a href="../chapters/04-message-and-event.html">04</a></td>
+              </tr>
+              <tr>
+                <td><code>AgentResultEvent</code></td>
+                <td>结果事件</td>
+                <td>生命周期<strong>正常结束</strong>时发，携带最终 <code>Msg</code>；暂停也算正常结束</td>
+                <td><a href="../chapters/11-capstone.html#line-by-line">11</a></td>
+              </tr>
+              <tr>
+                <td><code>AgentEndEvent</code></td>
+                <td>结束事件</td>
+                <td><code>doFinally</code> 里必发，无论是成功、失败还是取消</td>
+                <td><a href="../chapters/11-capstone.html#cheatsheet">11</a></td>
+              </tr>
+              <tr>
+                <td><code>Hook</code> <span class="tag-star">★</span></td>
+                <td>钩子</td>
+                <td>在固定切点被回调；能读能改事件，也能 <code>stopAgent()</code></td>
+                <td><a href="../chapters/09-middleware-hook.html">09</a></td>
+              </tr>
+              <tr>
+                <td><code>HookEvent</code></td>
+                <td>钩子事件</td>
+                <td>Hook 收到的对象：<code>PreCall</code> / <code>PostReasoning</code> / <code>PreActing</code>…… 与 <code>AgentEvent</code> 不是一套</td>
+                <td><a href="../chapters/09-middleware-hook.html">09</a></td>
+              </tr>
+              <tr>
+                <td><code>MiddlewareBase</code></td>
+                <td>中间件</td>
+                <td>包住「模型调用 / 推理 / 行动」三段，能替换这一段怎么做，而不只是旁观</td>
+                <td><a href="../chapters/09-middleware-hook.html">09</a></td>
+              </tr>
+              <tr>
+                <td><code>MiddlewareChain</code></td>
+                <td>中间件链</td>
+                <td>多个中间件的执行顺序；顺序错了，后面的看不到前面的改动</td>
+                <td><a href="../chapters/09-middleware-hook.html">09</a></td>
+              </tr>
+              <tr>
+                <td><code>stopAgent()</code></td>
+                <td>主动叫停</td>
+                <td>Hook 在某个切点结束本轮，对应 <code>*_STOP_REQUESTED</code> 系列 reason</td>
+                <td><a href="../chapters/09-middleware-hook.html">09</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          <code>AgentEventType</code> 共 31 个值：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentEventType.java:40">AgentEventType.java:40</span>；<code>Hook</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/hook/Hook.java:122">Hook.java:122</span>；<code>MiddlewareBase</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareBase.java:59">MiddlewareBase.java:59</span>
+        </p>
+
+        <h2 id="harness">Harness 专有名词</h2>
+        <p>
+          这些词只在 <code>agentscope-harness</code> 里出现。第 10 章给过全景，第 12–18 章逐项展开；这里只做名词解释，右侧「章」列可以直接跳到对应小节。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>术语</th><th>中文</th><th>一句话直觉</th><th>章</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>workspace</td><td>工作区</td><td>文件工具和 Shell 的根目录；不配就落到默认目录</td><td><a href="../chapters/12-workspace-filesystem.html#resolve">12</a></td></tr>
+              <tr><td>filesystem</td><td>文件系统抽象</td><td><code>AbstractFilesystem</code> + Local / Remote / Sandbox 三种 spec，决定文件到底存在哪</td><td><a href="../chapters/12-workspace-filesystem.html#family">12</a></td></tr>
+              <tr><td>sandbox</td><td>沙箱</td><td>把 Shell / 文件操作关进受限环境里跑</td><td><a href="../chapters/13-sandbox.html#acquire">13</a></td></tr>
+              <tr><td>subagent</td><td>子智能体</td><td>把子任务交给另一个 agent；声明式写法是 <code>SubagentDeclaration</code></td><td><a href="../chapters/14-subagent-team.html#sources">14</a></td></tr>
+              <tr><td>skill</td><td>技能</td><td>可复用的能力包（通常一个 <code>SKILL.md</code> + 资源），按需加载</td><td><a href="../chapters/16-skill.html#format">16</a></td></tr>
+              <tr><td>plan mode</td><td>计划模式</td><td>先产出计划再执行；执行前只放开只读工具</td><td><a href="../chapters/17-plan-mode-tools.html#tools">17</a></td></tr>
+              <tr><td>compaction</td><td>上下文压缩</td><td>消息太长时摘要压掉旧内容，<code>CompactionConfig</code> 可调</td><td><a href="../chapters/15-compaction-memory.html#compact">15</a></td></tr>
+              <tr><td>transcript</td><td>会话记录</td><td>完整流水（含被压缩掉的部分），由 <code>TranscriptStore</code> 负责</td><td><a href="../chapters/15-compaction-memory.html#transcript">15</a></td></tr>
+              <tr><td>message bus</td><td>消息总线</td><td>跨轮次投递：inbox 队列、唤醒队列、会话事件回放</td><td><a href="../chapters/18-gateway-channel-bus.html#bus">18</a></td></tr>
+              <tr><td>gateway</td><td>网关</td><td>会话键 → 稳定 <code>sessionId</code>，并保证同一会话串行；<code>HarnessGateway</code></td><td><a href="../chapters/18-gateway-channel-bus.html#gateway">18</a></td></tr>
+              <tr><td>channel</td><td>渠道</td><td>把平台消息规范化成 <code>InboundMessage</code>，再把回复投回去</td><td><a href="../chapters/18-gateway-channel-bus.html#channel">18</a></td></tr>
+              <tr><td>DmScope</td><td>私聊粒度</td><td>决定同一句「你好」在 DM 里落成几个会话；四取一，默认 <code>MAIN</code></td><td><a href="../chapters/18-gateway-channel-bus.html#dmscope">18</a></td></tr>
+              <tr><td>turn gate</td><td>会话闸门</td><td>同一会话同时只跑一轮；本地实现是公平信号量排队</td><td><a href="../chapters/18-gateway-channel-bus.html#turngate">18</a></td></tr>
+              <tr><td>inbox</td><td>收件箱</td><td>后台结果先入队，下一个 reasoning step 开头被排空并注入成 hint</td><td><a href="../chapters/18-gateway-channel-bus.html#inbox">18</a></td></tr>
+              <tr><td>async tool</td><td>异步工具</td><td>工具超过阈值就先回占位结果，后台跑完再回灌；需显式开启</td><td><a href="../chapters/18-gateway-channel-bus.html#async">18</a></td></tr>
+              <tr><td>wakeup</td><td>唤醒</td><td><code>WakeupDispatcher</code> 把闲置会话叫起来跑一轮</td><td><a href="../chapters/18-gateway-channel-bus.html#wakeup">18</a></td></tr>
+              <tr><td>artifact</td><td>产物</td><td>agent 生成、需要交付给用户的文件</td><td><a href="../chapters/12-workspace-filesystem.html#tools">12</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="abbrev">缩写与约定</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>缩写</th><th>全称</th><th>在这里指什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>SPI</code></td><td>Service Provider Interface</td><td>JDK 的服务发现机制，<code>ModelProvider</code> / <code>AgentStateStore</code> 的扩展都靠它</td></tr>
+              <tr><td><code>CAS</code></td><td>Compare-And-Swap</td><td>乐观锁式的「版本对上才写」，对应 <code>saveIfVersion</code></td></tr>
+              <tr><td><code>HITL</code></td><td>Human-in-the-loop</td><td>执行前暂停、等人批</td></tr>
+              <tr><td><code>MCP</code></td><td>Model Context Protocol</td><td>外部工具/资源的接入协议</td></tr>
+              <tr><td><code>RAG</code></td><td>Retrieval-Augmented Generation</td><td>先检索再回答；core 里有 <code>Knowledge</code> 与检索工具</td></tr>
+              <tr><td><code>OTel</code></td><td>OpenTelemetry</td><td>链路追踪，<code>tracing</code> 包里的 <code>Tracer</code></td></tr>
+              <tr><td><code>JSONL</code></td><td>JSON Lines</td><td>一行一个 JSON；文件状态存储用它追加消息，避免整文件重写</td></tr>
+              <tr><td><code>JDK</code></td><td>Java Development Kit</td><td>2.0.4 的 class 文件是 17，编译目标最低 17</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          术语混脸熟之后，遇到具体报错去 <a href="errors.html">附录 B 报错速查</a>；要查某个 builder 方法去
+          <a href="api-cheatsheet.html">附录 C API 速查</a>；想知道某段逻辑在哪个包，去
+          <a href="source-map.html">附录 D 源码地图</a>。
+        </p>
+        <div class="callout tip">
+          <span class="ct">背不下来是正常的</span>
+          <p>
+            这张表的作用是<strong>查</strong>，不是背。真正需要肌肉记忆的只有八个：<code>Msg</code>、
+            <code>ContentBlock</code>、<code>ToolUseBlock</code>、<code>GenerateReason</code>、<code>Toolkit</code>、
+            <code>AgentState</code>、<code>AgentStateStore</code>、<code>ConfirmResult</code>。其余用到再查。
+          </p>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

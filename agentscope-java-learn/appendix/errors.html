@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="这份表只收真的会挡住你的错：每一条都能在 2.0.4 源码里找到抛出点，错误文本和源码逐字一致。顺序按「从写代码到跑起来」排：构建 → 权限 → 工具 → 状态 → 响应式 → 模型 HTTP。最后给一套三步定位法，遇到表里没有的错也能自己查。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="附录 B 报错速查：看到什么错，改什么地方 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="这份表只收真的会挡住你的错：每一条都能在 2.0.4 源码里找到抛出点，错误文本和源码逐字一致。顺序按「从写代码到跑起来」排：构建 → 权限 → 工具 → 状态 → 响应式 → 模型 HTTP。最后给一套三步定位法，遇到表里没有的错也能自己查。" />
+    <title>附录 B 报错速查：看到什么错，改什么地方 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="errors" data-root="..">
+    <main>
+      <article class="article">
+        <h1>附录 B · 报错速查：看到什么错，改什么地方</h1>
+        <p class="lede">
+          这份表只收<strong>真的会挡住你</strong>的错：每一条都能在 2.0.4 源码里找到抛出点，错误文本和源码逐字一致。
+          顺序按「从写代码到跑起来」排：构建 → 权限 → 工具 → 状态 → 响应式 → 模型 HTTP。最后给一套三步定位法，
+          遇到表里没有的错也能自己查。
+        </p>
+
+        <h2 id="how">怎么用这一页</h2>
+        <ul class="goals">
+          <li>先在页面里搜<strong>报错文本的前半句</strong>（比如 <code>Agent is paused for</code>），别搜整行——里面的 id 每次都不一样</li>
+          <li>每张卡的结构固定：<strong>你会看到 → 因为 → 改成</strong>。先看「因为」，再看「改成」，否则容易照着改但没改到根因</li>
+          <li>卡底的「<strong>相关章节</strong>」指向真正讲这件事的小节（带源码行号）；想弄懂机制而不是背结论，顺着点过去</li>
+          <li>Java 的异常是套娃的：<strong>先看最下面那个 <code>Caused by</code></strong>，那才是真正的抛出点</li>
+          <li>表里标 <span class="tag">很常见</span> 的是新手第一周几乎一定会撞上的</li>
+          <li>每张卡右上角的 <code>#</code> 是<strong>这一条自己的链接</strong>，复制给别人会直接落到这条错上</li>
+        </ul>
+        <div class="callout tip">
+          <span class="ct">一个反直觉的前提：很多「报错」其实是正常结束</span>
+          <p>
+            <code>PERMISSION_ASKING</code>、<code>MAX_ITERATIONS</code>、<code>TOOL_SUSPENDED</code> 这些
+            <strong>不是异常</strong>，它们是 <code>GenerateReason</code>。框架只是把「停下来等你」当成一种正常结果返回，
+            真正会抛异常的，是你的代码违反了某个约定（id 对不上、状态没配、线程里 block）。
+          </p>
+        </div>
+
+        <h2 id="build">构建与启动</h2>
+        <div class="pitfall" id="err-unsupported-class-version">
+          <div class="pf-h">1. <span class="tag">很常见</span> <code>UnsupportedClassVersionError</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>java.lang.UnsupportedClassVersionError: io/agentscope/core/ReActAgent has been compiled by a more recent version of the Java Runtime (class file version 61.0), this version ... recognizes ... 52.0</code></dd>
+            <dt>因为</dt>
+            <dd>2.0.4 的 class 文件是 Java 17（61.0），你用的是 Java 8（52.0）或 11（55.0）在跑。</dd>
+            <dt>改成</dt>
+            <dd>把 <code>maven.compiler.release</code> 设成 <code>17</code>，并确认 IDEA 的 <em>Project SDK</em> 和 <em>Run</em> 配置里的 JRE 都是 17+。用 JDK 21 编译、release 定 17 也没问题。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/01-setup.html#pitfalls">01 环境与依赖 · 陷阱与窍门（JDK 17）</a></div>
+        </div>
+        <div class="pitfall" id="err-model-not-found">
+          <div class="pf-h">2. <span class="tag">很常见</span> <code>Cannot resolve model: "qwen-plus"</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>后面还跟着一段 <code>Possible causes:</code>，列出命名模型、SPI provider、各家扩展模块和环境变量。</dd>
+            <dt>因为</dt>
+            <dd>模型 id 的格式是 <code>&lt;provider&gt;:&lt;model-name&gt;</code>。只写 <code>qwen-plus</code> 没有前缀，<code>ModelRegistry</code> 不知道找谁；或者写了前缀但 <code>pom.xml</code> 里没引对应扩展。</dd>
+            <dt>改成</dt>
+            <dd>补前缀：<code>.model("dashscope:qwen-plus")</code>；同时确认依赖里有 <code>agentscope-extensions-model-dashscope</code>（OpenAI / Gemini / Anthropic / Ollama 同理，换对应扩展）。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/05-model.html#resolve">05 模型层 · 一个字符串怎么变成模型对象</a></div>
+        </div>
+        <div class="pitfall" id="err-api-key-env">
+          <div class="pf-h">3. <code>Environment variable DASHSCOPE_API_KEY is required to auto-create model: dashscope:qwen-plus</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>构建 agent 或第一次调用时直接抛 <code>IllegalStateException</code>，不是 HTTP 401。</dd>
+            <dt>因为</dt>
+            <dd>provider 是用 <code>System.getenv</code> 读的。IDEA 从桌面图标启动时<strong>继承不到</strong>你刚在 PowerShell 里 <code>setx</code> 的变量；改完环境变量不重启 IDE 也读不到。</dd>
+            <dt>改成</dt>
+            <dd>三条路任选：① 在 IDEA 的 Run Configuration → Environment variables 里显式加；② 完全退出 IDEA 再启动；③ 不走字符串 id，直接 <code>ModelRegistry.register("my-model", 自己 new 的实例)</code> 或 <code>.model(Model)</code> 传实例。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/02-first-agent.html#step-api-key">02 第一个 Agent · 第 2 步：设一个 API Key</a></div>
+        </div>
+        <div class="pitfall" id="err-model-id-blank">
+          <div class="pf-h">4. <code>IllegalArgumentException: modelId must not be blank</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>构建阶段就失败，堆栈里是 <code>ModelRegistry.resolve</code>。</dd>
+            <dt>因为</dt>
+            <dd><code>.model("")</code>、<code>.model("   ")</code>，或者把 null 传进了 <code>.model(String)</code> 的重载。</dd>
+            <dt>改成</dt>
+            <dd>要么给一个合法的 id，要么干脆不写 <code>.model(...)</code>——但那样 <code>build()</code> 会因为缺少模型而失败，所以本质上必须给一个。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/05-model.html#resolve">05 模型层 · 一个字符串怎么变成模型对象</a></div>
+        </div>
+
+        <h2 id="hitl">权限与 HITL</h2>
+        <p>
+          这一组的共同点：<strong>它们都在你「第二次调用」的时候才炸</strong>。第一次调用是正常返回的，reason 是
+          <code>PERMISSION_ASKING</code>；你没接这个信号，拿同一份状态又调了一次，于是撞上校验。
+        </p>
+        <div class="pitfall" id="err-paused-without-confirm">
+          <div class="pf-h">5. <span class="tag">很常见</span> 一长串 <code>Agent is paused for human-in-the-loop confirmation</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>
+              <pre data-lang="text" data-file="控制台">java.lang.IllegalStateException: Agent is paused for human-in-the-loop confirmation: the following
+ tool call(s) are in ASKING state and need your approval before the agent can continue:
+ [delete_note (id=call_abc123)]. This call supplied no confirmation, so it cannot proceed.
+To resume, send a follow-up message that carries a List&lt;ConfirmResult&gt; under the metadata
+key "agentscope_confirm_results", e.g.:
+    UserMessage.builder()
+        .metadata(Map.of(Msg.METADATA_CONFIRM_RESULTS,
+            List.of(new ConfirmResult(true, toolCall))))
+        .build();
+Tip: capture the ToolUseBlocks from the RequireUserConfirmEvent emitted when the agent paused.</pre>
+            </dd>
+            <dt>因为</dt>
+            <dd>上一次调用停在了 <code>ASKING</code>，而这一次你送进去的消息<strong>没有携带 <code>ConfirmResult</code></strong>。
+            常见三种触发：① 用 <code>for</code> 循环无脑重试；② 把 <code>UserMessage(input)</code> 当新输入又发了一遍；
+            ③ 换了个进程/重启后，同一个 <code>(userId, sessionId)</code> 从磁盘读回了「等待中」的状态。</dd>
+            <dt>改成</dt>
+            <dd>
+              按错误里的提示做：从 <code>RequireUserConfirmEvent.getToolCalls()</code> 拿<strong>原件</strong>，包成
+              <code>ConfirmResult</code> 塞进下一条消息的 <code>Msg.METADATA_CONFIRM_RESULTS</code>。
+              如果是「上次没答完，这次想重新开始」，清掉该 session 的状态或换 <code>sessionId</code>（第 11 章的
+              <code>/new</code> 就是干这个的）。
+            </dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/08-permission-hitl.html#event-flow">08 权限与人机交互 · 事件流版本</a><span class="sep">·</span><a href="../chapters/11-capstone.html#permission-asking">11 综合案例 · PERMISSION_ASKING 是结局</a></div>
+        </div>
+        <div class="pitfall" id="err-confirm-id-mismatch">
+          <div class="pf-h">6. <code>ConfirmResult references non-ASKING tool call ID: xxx. Expected: [yyy]</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>后半句的 <code>Expected</code> 里列出当前真正挂起的 id，通常只有一个，且和你传的不一样。</dd>
+            <dt>因为</dt>
+            <dd>恢复是靠 <code>id</code> 精确匹配的。你很可能<strong>新造了一个 <code>ToolUseBlock</code></strong>
+            （工具名、参数都一样也没用），或者手里拿的是上一次会话留下的旧 id。</dd>
+            <dt>改成</dt>
+            <dd>只用事件或结果消息里筛出来的 <code>ASKING</code> 原件。要改参数，用
+            <code>ToolUseBlock.builder().id(原 id).name(...).input(新参数).build()</code> 重建并保留 id。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/11-capstone.html#confirm-original">11 综合案例 · ConfirmResult 必须拿原件</a><span class="sep">·</span><a href="../chapters/08-permission-hitl.html#confirm-result-fields">08 · ConfirmResult 的四个字段</a></div>
+        </div>
+        <div class="pitfall" id="err-confirm-duplicate">
+          <div class="pf-h">7. <code>Duplicate ConfirmResult for tool call ID: xxx</code> / <code>ConfirmResult.toolCall.id must not be empty.</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>同一个 id 被回传了两次，或者 <code>id</code> 是空串。</dd>
+            <dt>因为</dt>
+            <dd>前者常常是把「结果消息里的 ASKING 工具」和「事件里的工具」<strong>合在一起</strong>传了；
+            后者是自己 <code>new ToolUseBlock(...)</code> 时没填 id。</dd>
+            <dt>改成</dt>
+            <dd>每个挂起的 id 只回一条 <code>ConfirmResult</code>；去重后再发。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/08-permission-hitl.html#confirm-result-fields">08 权限与人机交互 · ConfirmResult 的四个字段</a></div>
+        </div>
+        <div class="pitfall" id="err-pending-tool-results">
+          <div class="pf-h">8. <code>Pending tool calls exist without results. Enable enablePendingToolRecovery or provide tool results. Pending IDs: [...]</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>没有 <code>ASKING</code> 字样，只有 pending id。</dd>
+            <dt>因为</dt>
+            <dd>这是「外部工具」那条路：模型调了 <code>externalTool = true</code> 的工具（或 <code>SchemaOnlyTool</code>），
+            框架不执行、把调用挂起，等你自己跑完再回填；而你把 <code>enablePendingToolRecovery</code> 关掉了。</dd>
+            <dt>改成</dt>
+            <dd>要么打开 pending 恢复，要么按 <code>RequireExternalExecutionEvent</code> 的约定把
+            <code>ExternalExecutionResult</code> 回填进去。别在「外部工具」状态下手动再发一条普通用户消息。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/10-react-vs-harness.html#pitfalls">10 两种入口 · 陷阱 3：中断后同 session 重试</a></div>
+        </div>
+        <div class="pitfall" id="err-reject-retry-loop">
+          <div class="pf-h">9. 被拒绝后模型反复重试</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>你回了 <code>n</code>，模型换个说法又调一次 <code>delete_note</code>，来回好几轮。</dd>
+            <dt>因为</dt>
+            <dd>拒绝时没写 <code>reason</code>，模型只看到默认文案「Permission denied by user」，不知道你是误操作还是永久禁止，
+            只能换个说法再试一次。顺带纠正一个常见误解：<code>stopOnReject</code> 在 2.0.4 里只被赋进 <code>ReactConfig</code>，
+            主循环<strong>没有任何读取点</strong>，写了也不会「一拒就停」。</dd>
+            <dt>改成</dt>
+            <dd>用 <code>new ConfirmResult(false, call, null, "用户拒绝，请不要重试")</code> 把意图写清楚；
+            真要「全拒就停」，用中间件：<code>onActing</code> 里识别 <code>AllToolsDeniedEvent</code>，再在流尾接一个
+            <code>RequestStopEvent</code>（第 09 章的「我想…」表里就是这一行）。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/08-permission-hitl.html#after-reject">08 · 拒绝之后模型看到什么</a><span class="sep">·</span><a href="../chapters/08-permission-hitl.html#unwired-stop-on-reject">stopOnReject 设了没人读</a></div>
+        </div>
+
+        <h2 id="tool">工具</h2>
+        <div class="pitfall" id="err-tool-not-found">
+          <div class="pf-h">10. <code>IllegalArgumentException: Tool not found: xxx</code>（自己抛的）</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>堆栈指向 <code>Toolkit.addToolToGroup</code> 或 <code>Toolkit.updateToolPresetParameters</code>。</dd>
+            <dt>因为</dt>
+            <dd>这是<strong>配置错误</strong>，不是模型乱调工具：你往一个分组里加工具、或改预设参数时，那个工具还没注册 / 名字拼错。</dd>
+            <dt>改成</dt>
+            <dd>先 <code>toolkit.getToolNames()</code> 把真实名字打出来核对。工具名以 <code>@Tool(name = "...")</code> 为准，没写 name 才用方法名。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/06-tool.html#group-create">06 工具系统 · 建组、归组、开 meta tool</a></div>
+        </div>
+        <div class="pitfall" id="err-tool-not-found-by-model">
+          <div class="pf-h">11. <span class="tag">很常见</span> 模型调了一个不存在的工具</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>事件流里出现 <code>[tool] get_weather -&gt; ERROR</code>，结果内容是第一行 <code>Tool not found: get_weather</code>。<strong>不会抛异常。</strong></dd>
+            <dt>因为</dt>
+            <dd>框架把它当成一次「工具执行失败」写回上下文，让模型有机会换方案。真正的根因通常是：工具没注册、被工具分组隐藏了、或者名字和 schema 不一致。</dd>
+            <dt>改成</dt>
+            <dd>对照 <code>getToolNames()</code> 和当前激活的分组（<code>getActiveGroups()</code>）。注意：<strong>同名工具后注册的会静默覆盖前面的</strong>，不报错——两个类都写了 <code>@Tool(name = "search")</code> 时，只有一个生效。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/06-tool.html#execute">06 工具系统 · 一次工具调用的 9 件事</a></div>
+        </div>
+        <div class="pitfall" id="err-tool-converter">
+          <div class="pf-h">12. <code>IllegalStateException: Failed to create converter from @Tool annotation</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>堆栈里带着 <code>Caused by</code>，通常指向你的方法签名。</dd>
+            <dt>因为</dt>
+            <dd>返回值类型没有可用的转换器：传了泛型擦除后信息不全的类型、返回了一个既不是 String 也不是可序列化 POJO 的对象，或者参数类型不支持生成 JSON Schema。</dd>
+            <dt>改成</dt>
+            <dd>先用 <code>String</code> 返回人话（这也是第 11 章 <code>NotesTools</code> 的做法），确实要结构化就返回简单 POJO / <code>Map</code>。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/06-tool.html#tool-return">06 工具系统 · 返回值怎么变成 ToolResultBlock</a></div>
+        </div>
+        <div class="pitfall" id="err-tool-invocation-wrapped">
+          <div class="pf-h">13. 工具抛异常，模型收到一串 <code>InvocationTargetException</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>ToolResultState.ERROR</code>，结果文本里是反射包装后的异常，模型看不懂、也无法自救。</dd>
+            <dt>因为</dt>
+            <dd>工具方法声明了 <code>throws</code> 并真的抛了受检异常，框架用反射调用后包装了一层。</dd>
+            <dt>改成</dt>
+            <dd>在工具内部 <code>try/catch</code>，把失败翻译成一句人和模型都能懂的话返回：
+            <code>return "写入失败：" + e.getMessage();</code>。这样模型还有机会换方案。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/06-tool.html#execute">06 工具系统 · 兜底：异常变 error 结果</a></div>
+        </div>
+
+        <h2 id="state">状态与存储</h2>
+        <div class="pitfall" id="err-session-id-blank">
+          <div class="pf-h">14. <code>IllegalArgumentException: sessionId must not be blank</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>堆栈指向 <code>JsonFileAgentStateStore</code> 或 <code>InMemoryAgentStateStore</code>。</dd>
+            <dt>因为</dt>
+            <dd>调用时既没给 <code>RuntimeContext</code> 的 <code>sessionId</code>，builder 里也没配 <code>defaultSessionId</code>。
+            注意 <code>stateStore</code> 一定要有会话坐标才存得下去。</dd>
+            <dt>改成</dt>
+            <dd>给一个稳定的 id：<code>RuntimeContext.builder().userId("local").sessionId("cli").build()</code>，
+            或者在 builder 上 <code>.defaultSessionId("cli")</code>。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/07-memory-context.html#store-kinds">07 记忆与上下文 · 不传 sessionId 会怎样</a><span class="sep">·</span><a href="../chapters/02-first-agent.html#runtime-context">02 · RuntimeContext 与 sessionId</a></div>
+        </div>
+        <div class="pitfall" id="err-session-conflict">
+          <div class="pf-h">15. <code>ConcurrentSessionModificationException: Concurrent modification of session state (userId=..., sessionId=..., key=agent_state, expectedVersion=...)</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>另一个副本/进程刚好也在写同一个会话，其中一个成功，另一个拿到这个异常。</dd>
+            <dt>因为</dt>
+            <dd>你把 <code>conflictPolicy</code> 设成了 <code>FAIL</code>，而乐观锁版本对不上。<code>APPEND_MERGE</code> 也可能在合并重试后失败。</dd>
+            <dt>改成</dt>
+            <dd>先问自己「同一个 session 会不会被两个实例同时写」。会：要么在网关层按 session 粘性路由，要么接受 <code>OVERWRITE</code>（后写覆盖），
+            要么用 <code>APPEND_MERGE</code> 并确保压缩/摘要轮次不走这条路——它<strong>不适合会重写历史的轮次</strong>。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/07-memory-context.html#isolation">07 记忆与上下文 · 并发与隔离（ConflictPolicy）</a></div>
+        </div>
+        <div class="pitfall" id="err-forget-on-restart">
+          <div class="pf-h">16. 不报错，但「重启就失忆」</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>进程内聊得很好，重启后模型完全不记得刚才说过什么。没有任何异常。</dd>
+            <dt>因为</dt>
+            <dd>两种情况：① 没配 <code>stateStore</code>，状态只在内存；② 每次都新建不同的 <code>sessionId</code>（比如拿时间戳当 id），
+            每次都是新会话。</dd>
+            <dt>改成</dt>
+            <dd>配 <code>JsonFileAgentStateStore</code>（或 Redis / MySQL），并把 <code>(userId, sessionId)</code> 固定下来。
+            验证方法：退出重进，问「我刚才让你记了什么」。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/07-memory-context.html#persistence">07 记忆与上下文 · 一次 call 从加载到落盘</a></div>
+        </div>
+        <div class="pitfall" id="err-state-dir-base64">
+          <div class="pf-h">17. 状态目录里出现看不懂的目录名</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>state/5L2g5aW9/...</code> 这样的路径，而不是你的 <code>userId</code> 原文。</dd>
+            <dt>因为</dt>
+            <dd><code>JsonFileAgentStateStore</code> 会把带特殊字符的 <code>userId</code> / <code>sessionId</code> 做 Base64-URL 安全编码，
+            避免路径穿越和非法字符。</dd>
+            <dt>改成</dt>
+            <dd>不用改。想肉眼可读就用纯 ASCII 的 id；<code>~/.notes-agent/state/local/cli/</code> 这种就能原样保留。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/07-memory-context.html#store-kinds">07 记忆与上下文 · 目录布局与 Base64 编码</a></div>
+        </div>
+
+        <h2 id="reactor">Reactor 与响应式</h2>
+        <div class="pitfall" id="err-block-in-reactor-thread">
+          <div class="pf-h">18. <span class="tag">很常见</span> <code>block()/blockFirst()/blockLast() are blocking, which is not supported in thread reactor-http-nio-2</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>一到 <code>.block()</code> 或 <code>.blockLast()</code> 就炸，堆栈里全是 Reactor 的调度器。</dd>
+            <dt>因为</dt>
+            <dd>你正跑在 Reactor 的<strong>非阻塞线程</strong>上（WebFlux controller、SSE handler、某个 <code>publishOn</code> 之后），
+            而 block 会占住这个只能容纳少量线程的线程池。</dd>
+            <dt>改成</dt>
+            <dd>① 返回 <code>Mono</code> / <code>Flux</code> 让框架订阅，不要在中间 block；② 真必须同步，就
+            <code>.subscribeOn(Schedulers.boundedElastic())</code> 挪到弹性线程池；③ 命令行程序里在 <code>main</code> 线程 block 是安全的。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/03-reactor-essentials.html#pitfalls">03 响应式必修 · 陷阱 2：doOnNext 里 block()</a></div>
+        </div>
+        <div class="pitfall" id="err-model-observe-timeout">
+          <div class="pf-h">19. <code>TimeoutException: Did not observe any item or terminal signal within 300000ms</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>一次调用卡 5 分钟后失败，重试 3 次还是一样。</dd>
+            <dt>因为</dt>
+            <dd>模型默认的 <code>ExecutionConfig</code> 是「5 分钟超时 + 3 次尝试」，工具是「5 分钟 + 1 次」。超时被算作可重试错误，所以你会看到三次。</dd>
+            <dt>改成</dt>
+            <dd>长回答 / 慢模型用 <code>.modelExecutionConfig(ExecutionConfig.builder().timeout(Duration.ofMinutes(2)).maxAttempts(2).build())</code> 明确写出来；
+            先确认不是网络代理拦住了请求。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/05-model.html#failure">05 模型层 · 重试与降级（5 分钟超时）</a></div>
+        </div>
+        <div class="pitfall" id="err-reactive-wrapped">
+          <div class="pf-h">20. 异常被包成 <code>reactor.core.Exceptions$ReactiveException</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>真正的错误信息躲在 <code>getCause()</code> 里，日志看起来像框架乱抛。</dd>
+            <dt>因为</dt>
+            <dd>Reactor 会把回调里的受检异常包装一层再往下传。</dd>
+            <dt>改成</dt>
+            <dd>用 <code>reactor.core.Exceptions.unwrap(e)</code> 拆开再判断类型；打印日志时打 <code>unwrap</code> 之后的结果。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/03-reactor-essentials.html#pitfalls">03 响应式必修 · 陷阱与窍门（异常处理）</a></div>
+        </div>
+        <div class="pitfall" id="err-cold-stream">
+          <div class="pf-h">21. 什么都没发生：不报错、也不输出</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>agent.call("...")</code> 这一行执行完了，但模型没被调用。</dd>
+            <dt>因为</dt>
+            <dd><code>Mono</code> / <code>Flux</code> 是<strong>冷流</strong>：不订阅就不执行。忘记 <code>.block()</code>、
+            <code>.subscribe()</code> 或返回给框架，就什么都不会发生。</dd>
+            <dt>改成</dt>
+            <dd>同步场景 <code>.block()</code>；异步场景 <code>.subscribe(...)</code> 并把返回的 <code>Disposable</code> 管好；Web 场景直接返回 <code>Mono</code>。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/03-reactor-essentials.html#line-by-line">03 响应式必修 · 冷流不订阅就不执行</a></div>
+        </div>
+
+        <h2 id="model">模型 HTTP 与参数</h2>
+        <div class="pitfall" id="err-http-401">
+          <div class="pf-h">22. HTTP 401 / <code>AuthenticationException</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>消息里带 <code>401</code> 和响应体片段，例如 <code>Incorrect API key provided</code>。</dd>
+            <dt>因为</dt>
+            <dd>key 错、过期，或者读的是另一个环境变量名（OpenAI 是 <code>OPENAI_API_KEY</code>，DashScope 是 <code>DASHSCOPE_API_KEY</code>）。</dd>
+            <dt>改成</dt>
+            <dd>换 key 后<strong>重启进程</strong>；别把 key 写进代码或提交到仓库。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/02-first-agent.html#step-api-key">02 第一个 Agent · 设一个 API Key</a></div>
+        </div>
+        <div class="pitfall" id="err-http-429">
+          <div class="pf-h">23. HTTP 429 或 5xx</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>重试 3 次后失败，错误里带状态码；日志里能看到退避间隔从 2 秒涨到 30 秒。</dd>
+            <dt>因为</dt>
+            <dd>限流或服务端抖动，都属于<strong>可重试</strong>错误。</dd>
+            <dt>改成</dt>
+            <dd>降并发、加长 <code>maxBackoff</code>，或者换 <code>fallbackModel</code>。别把 <code>maxAttempts</code> 调到很大——重试也是有成本的。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/05-model.html#failure">05 模型层 · 哪些错误才会重试</a></div>
+        </div>
+        <div class="pitfall" id="err-http-400-tools">
+          <div class="pf-h">24. HTTP 400：模型不支持 tools / response_format</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>400</code>，消息里提到 <code>tools</code>、<code>tool_choice</code> 或 <code>response_format</code> 不支持。</dd>
+            <dt>因为</dt>
+            <dd>你用的模型不支持工具调用，或 provider 不支持原生结构化输出。结构化输出会先试原生路径，失败后回退到「合成工具」路径——但工具本身不支持就没救了。</dd>
+            <dt>改成</dt>
+            <dd>换支持 tools 的模型；结构化输出遇到这类 400 时，框架已经会自动回退，不要去手动关掉。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/05-model.html#structured">05 模型层 · 结构化输出与合成工具回退</a></div>
+        </div>
+
+        <h2 id="hook">Hook、中间件与 Harness</h2>
+        <div class="pitfall" id="err-hook-system-inject">
+          <div class="pf-h">25. <code>Hooks must not inject SYSTEM messages into PreCallEvent.inputMessages. Use event.setSystemMessage() ...</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>在 <code>onEvent(PreCallEvent)</code> 里往消息列表塞了 <code>SystemMessage</code> 之后抛这个。</dd>
+            <dt>因为</dt>
+            <dd>消息列表的「尾巴」会被持久化进记忆，SYSTEM 消息一旦进去就会越积越多。</dd>
+            <dt>改成</dt>
+            <dd>改用 <code>event.setSystemMessage(...)</code> 或 <code>event.appendSystemContent(...)</code>，让框架把它放在正确的位置。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/09-middleware-hook.html#hook">09 Middleware 与 Hook · Hook 整包废弃</a></div>
+        </div>
+        <div class="pitfall" id="err-null-message">
+          <div class="pf-h">26. <code>Agent returned null message</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>调用结束时报这个错，堆栈在 <code>AgentBase.notifyPostCall</code>。</dd>
+            <dt>因为</dt>
+            <dd>某个 Hook 在 <code>PostCallEvent</code> 里把最终消息改成了 null，或者你的 <code>doCall</code> 返回了空流。</dd>
+            <dt>改成</dt>
+            <dd>Hook 里只做「修改」不做「清空」；自定义 agent 时确保最终有一个 <code>Msg</code>。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/09-middleware-hook.html#hook">09 Middleware 与 Hook · PostCall 能改最终 Msg</a></div>
+        </div>
+        <div class="pitfall" id="err-workspace-blank">
+          <div class="pf-h">27. <code>IllegalArgumentException: workspace path must not be blank</code>（Harness）</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>构建 <code>HarnessAgent</code> 时抛，指向 <code>HarnessAgent.Builder.workspace</code>。</dd>
+            <dt>因为</dt>
+            <dd><code>.workspace("")</code> 或 <code>.workspace("   ")</code>。</dd>
+            <dt>改成</dt>
+            <dd>给一个真实目录，优先绝对路径：<code>.workspace(home.resolve("workspace"))</code>。相对路径会按进程工作目录解析，IDEA 里和命令行里可能不是同一个地方。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/12-workspace-filesystem.html#pitfalls">12 工作区与文件系统 · workspace 不能空白</a></div>
+        </div>
+        <div class="pitfall" id="err-max-iters-retries">
+          <div class="pf-h">28. <code>IllegalArgumentException: maxIters must be &gt; 0</code> / <code>maxRetries must be &gt; 0</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>构建阶段直接失败，不用等到调用。</dd>
+            <dt>因为</dt>
+            <dd>把上层配置（比如 yml 里的 <code>0</code> 或负数）原样传了进来。</dd>
+            <dt>改成</dt>
+            <dd>做一次兜底：<code>Math.max(1, configured)</code>；同时检查是不是把「不限制」误写成了 0——框架里没有「0 表示无限」的约定。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/10-react-vs-harness.html#maxiters">10 两种入口 · 触顶：多调一次模型写总结</a><span class="sep">·</span><a href="../chapters/05-model.html#max-retries">05 模型层 · maxRetries 不是「重试 3 次」</a></div>
+        </div>
+
+        <div class="pitfall" id="err-gateway-no-agent">
+          <div class="pf-h">29. <code>IllegalStateException: At least one agent must be registered via agent(...)</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>GatewayBootstrap.builder().build()</code> 时直接抛，堆栈停在 <code>build()</code>。</dd>
+            <dt>因为</dt>
+            <dd>只写了 <code>.channel(...)</code> 或 <code>.distributedStore(...)</code>，一个 agent 都没注册。</dd>
+            <dt>改成</dt>
+            <dd>至少加一个 <code>.agent("main", agent)</code>（或 lambda 版 <code>.agent("main", b -&gt; ...)</code>）。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/18-gateway-channel-bus.html#bootstrap">18 网关、渠道与异步 · GatewayBootstrap 装配</a></div>
+        </div>
+        <div class="pitfall" id="err-main-agent-missing">
+          <div class="pf-h">30. <code>IllegalStateException: mainAgent('sales') not found in registered agents</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>同上，在 <code>build()</code> 阶段抛出，括号里就是你写的那串名字。</dd>
+            <dt>因为</dt>
+            <dd><code>.mainAgent("sales")</code> 用的是注册时的 <strong>key</strong>（<code>agent(String, ...)</code> 的第一个参数），而注册表里没有这个 key。</dd>
+            <dt>改成</dt>
+            <dd>核对 key 的拼写与大小写——<code>agent(...)</code> 只有「key + 实例」与「key + lambda」两种重载，没有单参实例版；不写 <code>.mainAgent(...)</code> 时取第一个注册的（按插入顺序），不会报错但可能指错 agent。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/18-gateway-channel-bus.html#bootstrap">18 网关、渠道与异步 · mainAgent 的 key</a></div>
+        </div>
+        <div class="pitfall" id="err-chatui-no-gateway">
+          <div class="pf-h">31. <code>IllegalStateException: ChatUiChannel has no gateway. Use GatewayBootstrap.chatUiChannel(), or construct with ChatUiChannel.create(gateway).</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>调 <code>send(...)</code> / <code>sendToSubagent(...)</code> 时抛，而构造对象本身不报错。</dd>
+            <dt>因为</dt>
+            <dd><code>ChatUiChannel</code> 的 gateway 字段必须由外部注入；<code>resolveGateway()</code> 发现为 null 就抛。</dd>
+            <dt>改成</dt>
+            <dd>走 <code>gw.chatUiChannel(config)</code> 或 <code>ChatUiChannel.create(gateway)</code>；单 agent 场景直接用 <code>agent.channel(ChatUiChannel.perPeer())</code>。</dd>
+          </dl>
+          <div class="pf-more">相关章节：<a href="../chapters/18-gateway-channel-bus.html#chatui">18 网关、渠道与异步 · ChatUiChannel 两种发送姿势</a></div>
+        </div>
+
+        <h2 id="debug">三步定位法：表里没有的错怎么办</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">第一步：先确定它属于「异常」还是「结束原因」</span>
+            <div>
+              把结果消息的 <code>getGenerateReason()</code> 打出来。是 <code>PERMISSION_ASKING</code> / <code>MAX_ITERATIONS</code> /
+              <code>TOOL_SUSPENDED</code> 就不是 bug，是流程问题；真的是异常，再往下走。
+            </div>
+          </li>
+          <li>
+            <span class="sh">第二步：把事件流打开，看它停在哪一类事件</span>
+            <div>
+              <code>streamEvents(...).doOnNext(ev -&gt; System.out.println(ev.getType()))</code>，先看最后一条事件是
+              <code>MODEL_CALL_*</code>、<code>TOOL_*</code> 还是 <code>REQUIRE_USER_CONFIRM</code>。
+              停在不同家族，排查方向完全不同（模型/网络 vs 工具/参数 vs 权限）。
+            </div>
+          </li>
+          <li>
+            <span class="sh">第三步：解包 + 最小复现</span>
+            <div>
+              用 <code>Exceptions.unwrap(e)</code> 找到真正的异常类，再按类名回源码搜 <code>throw new 该类</code>，直接看到抛出的那一行和它的判断条件。
+              然后把上下文缩到「一个工具 + 一句输入 + 内存存储」，能复现就基本定位了。
+            </div>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <span class="ct">两个不花钱的调试开关</span>
+          <p>
+            ① 把日志级别开到 <code>DEBUG</code>，框架里大量关键分支都有 <code>logger.debug/info</code>（比如工具注册、CAS 冲突、确认恢复）；
+            ② 先换成 <code>InMemoryAgentStateStore</code> 再试——如果换了就不报错，问题几乎一定在「持久化状态和新代码不匹配」上。
+          </p>
+        </div>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          报错解决之后，如果想知道某个类到底在哪、为什么这么设计，去 <a href="source-map.html">附录 D 源码地图</a>；
+          如果只是忘了某个方法叫什么，去 <a href="api-cheatsheet.html">附录 C API 速查</a>；
+          如果概念本身还没搞清楚，回 <a href="glossary.html">附录 A 术语表</a>。
+        </p>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

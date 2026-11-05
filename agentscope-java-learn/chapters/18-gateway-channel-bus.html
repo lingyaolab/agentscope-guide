@@ -1,0 +1,1069 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="前面七章讲的是「一个 agent 怎么变强」。这一章讲「它怎么变成服务」：一条来自用户的消息，怎么找到正确的 agent、落到正确的会话、在同一会话里排队，然后——如果某个工具太慢——怎么先回一句话、事后再把结果塞回对话。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="18 网关、渠道与异步：把 Harness 装成一个服务 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="前面七章讲的是「一个 agent 怎么变强」。这一章讲「它怎么变成服务」：一条来自用户的消息，怎么找到正确的 agent、落到正确的会话、在同一会话里排队，然后——如果某个工具太慢——怎么先回一句话、事后再把结果塞回对话。" />
+    <title>18 网关、渠道与异步：把 Harness 装成一个服务 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="18-gateway-channel-bus" data-root="..">
+    <main>
+      <article class="article">
+        <h1>18 · 网关、渠道与异步：把 Harness 装成一个服务</h1>
+        <p class="lede">
+          前面七章讲的是「一个 agent 怎么变强」。这一章讲「它怎么变成服务」：一条来自用户的消息，怎么<strong>找到正确的 agent</strong>、落到<strong>正确的会话</strong>、在<strong>同一会话里排队</strong>，然后——如果某个工具太慢——怎么<strong>先回一句话、事后再把结果塞回对话</strong>。这中间有五层：<code>Channel</code>、<code>ChannelRouter</code>、<code>Gateway</code>、<code>MessageBus</code>、<code>WakeupDispatcher</code>。和官方 <code>channel.md</code> 的分歧也集中在这里：文档只写了前三层，<strong>后两层（消息总线与唤醒）一个字都没提</strong>，而它们才是「后台任务结果怎么回来」的全部机制。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 <code>agent.channel(...)</code> 和 <code>GatewayBootstrap</code> 两条路各自替你做了什么、<strong>各自漏了什么</strong></li>
+          <li>把 <code>MsgContext.canonicalKey()</code> 的拼接规则背下来，并解释为什么「往 <code>extra</code> 里塞业务属性」会把用户历史聊没</li>
+          <li>推出任意一条消息最终落到哪个 <code>gw-…</code> 会话，以及四种 <code>DmScope</code> 下同一句「你好」会分裂成几个会话</li>
+          <li>写出 <code>ChannelRouter</code> 的九级优先级（1 层显式 + 7 层 binding + 2 层兜底），并说明 tier 内按什么顺序取</li>
+          <li>解释 <code>LocalSessionTurnGate</code> 为什么是「排队」而分布式 gate 可能是「静默丢弃」</li>
+          <li>画出异步工具的三段式：超时 → 占位结果 → 后台完成后进 inbox + enqueue wakeup</li>
+          <li>说清 <code>WakeupDispatcher</code> 的三条脆弱点（丢弃、死订阅、跑错 agent），以及暴露子 agent 的四种解析路径</li>
+        </ul>
+
+        <h2 id="why">先说为什么：一条用户消息要穿过五层</h2>
+        <p>
+          先把全景摆出来。下面这五层各有明确分工，混在一起就会写出「消息丢了不知道在哪丢」的服务：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>层</th><th>类型</th><th>只负责一件事</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>渠道适配</td>
+                <td><code>Channel</code> / <code>ChatUiChannel</code></td>
+                <td>把平台消息<strong>规范化</strong>成 <code>InboundMessage</code>：谁发的、在哪个会话、是不是线程回复</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/InboundMessage.java:63-74">InboundMessage.java:63-74</span></td>
+              </tr>
+              <tr>
+                <td>路由</td>
+                <td><code>ChannelRouter</code></td>
+                <td>决定 <strong>哪个 agent</strong> 接、<strong>哪个会话键</strong>、<strong>回复投到哪</strong>（三样一起出）</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:82-118">ChannelRouter.java:82-118</span></td>
+              </tr>
+              <tr>
+                <td>网关</td>
+                <td><code>HarnessGateway</code></td>
+                <td>把会话键换成<strong>稳定 sessionId</strong>、<strong>同会话串行</strong>、合并 <code>RuntimeContext</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:203-231">HarnessGateway.java:203-231</span></td>
+              </tr>
+              <tr>
+                <td>总线</td>
+                <td><code>MessageBus</code></td>
+                <td>跨轮次投递：inbox 队列、唤醒队列、会话事件回放</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/bus/MessageBus.java:45-146">MessageBus.java:45-146</span></td>
+              </tr>
+              <tr>
+                <td>唤醒</td>
+                <td><code>WakeupDispatcher</code></td>
+                <td>把「闲着的会话」叫起来跑一轮：<code>drain</code> → 判忙 → <code>runWakeup</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/WakeupDispatcher.java:130-180">WakeupDispatcher.java:130-180</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          关键认识：<strong>前三层解决「这一轮」，后两层解决「下一轮」</strong>。用户发一句话，走前三层就够了；但后台任务跑完之后没有人再说话，就必须靠后两层把 agent 主动叫醒。很多「异步任务永远没结果」的问题，根因不在异步逻辑，而在于后两层压根没接上——这正是官方文档没讲的部分。
+        </p>
+        <div class="callout tip">
+          <span class="ct">一个必须先分清的区分：会话 id 有两套</span>
+          <p>
+            路由层产出的是 <code>MsgContext.canonicalKey()</code>（人类可读的字符串，如 <code>chatui|r:u_1</code>），网关再把它哈希成 <code>gw-xxxxxxxxxxxx</code>（12 位十六进制）。前者是<strong>稳定性来源</strong>，后者是<strong>存储键</strong>。同一份 <code>canonicalKey</code> 在任何机器上都得到同一个 <code>gw-…</code>，这是「重启后记忆还在」的前提<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/SessionIdUtils.java:42-51">SessionIdUtils.java:42-51</span>。
+          </p>
+        </div>
+
+        <h2 id="minimal">最小可跑：两条路，两种完整度</h2>
+        <p>
+          单 agent 场景，一个方法就能接上渠道：
+        </p>
+        <pre data-lang="java" data-file="单 agent：agent.channel(...)">HarnessAgent agent = HarnessAgent.builder()
+        .name("assistant")
+        .model(model)
+        .build();
+
+// 每个 peerId 一个会话；也可以 ChatUiChannel.create()（所有对话共用一个会话）
+ChatUiChannel chat = agent.channel(ChatUiChannel.perPeer());
+
+Msg reply = chat.send("user-1", "你好").block();          // 走路由
+Msg again = chat.send(SendOptions.userId("user-1"), "在吗").block();  // 直给会话键</pre>
+        <p>
+          <code>agent.channel(...)</code> 做的事只有两件：懒创建一个内部网关、把它注入 channel<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:646-650">HarnessAgent.java:646-650</span>。而那个网关是这样造的：
+        </p>
+        <pre data-lang="java" data-file="HarnessAgent.ensureGateway() 的关键三行">HarnessGateway gw = HarnessGateway.create();   // 注意：没有 ChannelManager，没有 MessageBus
+gw.bindMainAgent(this);
+// 之后才按需补：subagent bridge / materializer / 分布式 registry / turn gate</pre>
+        <p>
+          这就决定了它的能力边界：<strong>路由与会话串行都可用</strong>，<strong>主动投递不可用</strong>（没有 <code>ChannelManager</code>，<code>deliverToSession</code> 直接返回 <code>false</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:335-346">HarnessGateway.java:335-346</span>），<strong>网关侧唤醒不可用</strong>（没有 <code>MessageBus</code>，<code>runWakeup</code> 只剩「跑一轮」而没有事件回放）。想更完整，用第二个入口。
+        </p>
+        <p>
+          多 agent + 外部渠道，用 <code>GatewayBootstrap</code>：
+        </p>
+        <pre data-lang="java" data-file="多 agent：GatewayBootstrap">GatewayBootstrap gw = GatewayBootstrap.builder()
+        .agent("sales", salesAgent)                 // 已构建的实例
+        .agent("support", b -&gt; b.name("support")     // 也可以给构建 lambda
+                .model(model).sysPrompt("你是客服。"))
+        .mainAgent("sales")                          // 不写就取第一个注册的
+        .channel(mySlackChannel)                     // 外部渠道
+        .distributedStore(redisStore)                // 可选：跨节点暴露子 agent
+        .build();
+
+ChatUiChannel chat = gw.chatUiChannel(
+        ChannelConfig.builder("chatui")
+                .dmScope(DmScope.PER_PEER)
+                .binding(ChannelBinding.forPeer("direct:vip-1", "support"))
+                .build());
+
+gw.start();   // initAll + startAll —— build() 不会启动渠道
+// ...
+gw.stop();    // stopAll</pre>
+        <div class="callout warn">
+          <span class="ct"><code>build()</code> 不启动渠道，也不建消息总线</span>
+          <p>
+            <code>GatewayBootstrap.build()</code> 只做：校验 agent 非空、建 <code>ChannelManager</code>、<code>HarnessGateway.create(cm)</code>（<strong>仍然没有 bus</strong>）、注册 agent、按需装 materializer 与分布式子 agent registry<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/GatewayBootstrap.java:264-329">GatewayBootstrap.java:264-329</span>。渠道要你显式 <code>start()</code>；<code>WakeupDispatcher</code> 要你自己 <code>new</code> 出来再 <code>start()</code>。
+          </p>
+        </div>
+
+        <h2 id="gateway">Gateway：一个入口方法，五个重载，三件默认不做的事</h2>
+        <p>
+          接口本身很小。<code>run</code> 的五个重载是层层委托的，最终都落到参数最全的那个；<code>runStream</code>、<code>runSubagent</code>、<code>runSubagentStream</code> 的<strong>默认实现都是返回错误流</strong>，不是「回退成非流式」：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>默认行为</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>run(ctx, msgs)</code></td>
+                <td>抽象方法</td>
+                <td>唯一必须实现的入口<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/Gateway.java:54-55">Gateway.java:54-55</span></td>
+              </tr>
+              <tr>
+                <td><code>run(ctx, msgs, outbound)</code></td>
+                <td>委托到四参</td>
+                <td>多一个「回复投到哪」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/Gateway.java:66-68">:66-68</span></td>
+              </tr>
+              <tr>
+                <td><code>run(ctx, msgs, outbound, callerCtx)</code></td>
+                <td>委托到五参</td>
+                <td>多一份调用方的 <code>RuntimeContext</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/Gateway.java:82-88">:82-88</span></td>
+              </tr>
+              <tr>
+                <td><code>run(..., inboundMessage)</code></td>
+                <td>回退到二参 <code>run(ctx, msgs)</code></td>
+                <td>多一份原始信封，只给 <code>ChannelRuntimeContextResolver</code> 用<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/Gateway.java:96-103">:96-103</span></td>
+              </tr>
+              <tr>
+                <td><code>runStream(...)</code></td>
+                <td><code>Flux.error(UnsupportedOperationException("Streaming not supported"))</code></td>
+                <td>自定义 Gateway 不实现就没有流式<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/Gateway.java:138-145">:138-145</span></td>
+              </tr>
+              <tr>
+                <td><code>runSubagent(...)</code></td>
+                <td><code>Mono.error("Subagent routing not supported")</code></td>
+                <td>暴露子 agent 是可选能力<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/Gateway.java:155-162">:155-162</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          默认实现 <code>HarnessGateway.run</code> 的骨架值得逐行看，因为它把所有「隐式约定」都摆在这里：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">会话键</span>
+            <div>
+              <code>gateKey = ctx.canonicalKey()</code>；<code>ctx</code> 为 null 时用 <code>MsgContext.defaultContext()</code>（即 <code>"default"</code>）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:209-210">HarnessGateway.java:209-210</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">选 agent：看 <code>extra["agentId"]</code></span>
+            <div>
+              唯一的路由依据是 <code>MsgContext.extra()</code> 里那个 key 为 <code>"agentId"</code> 的值，<strong>不是</strong>方法参数<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:212-213">:212-213</span>。这就是为什么 <code>ChannelRouter</code> 一定要把解析结果塞进 <code>extra</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">换 sessionId</span>
+            <div>
+              <code>resolveSessionId(gateKey)</code>：<code>"gw-" + SHA-256(gateKey)</code> 的前 12 位十六进制<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:535-537">:535-537</span>，同时登记 <code>sessionId → gateKey</code> 反查表。
+            </div>
+          </li>
+          <li>
+            <span class="sh">记路由</span>
+            <div>
+              有 <code>outboundAddress</code> 就写进 <code>lastRouteBySession</code>（可选再写 <code>BaseStore</code> 的 <code>gateway/routes</code>），供日后主动投递<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:222-224">:222-224</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">合上下文</span>
+            <div>
+              <code>buildRuntimeContext(...)</code> 造出这一轮的 <code>RuntimeContext</code>：<code>sessionId</code> + <code>msgContext</code> + <code>gateKey</code> + <code>outboundAddress</code> + <code>userId</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">上锁执行</span>
+            <div>
+              <code>withGatedTurn(gateKey, () -&gt; ha.call(msgs, rtc))</code>——注意传的是 <code>ha.call</code>，不是 <code>delegate</code>，所以 <code>HarnessAgent</code> 自己的会话默认值、包裹逻辑都会生效。
+            </div>
+          </li>
+        </ol>
+        <div class="callout warn">
+          <span class="ct">陷阱一：路由到不存在的 agentId 不会报错</span>
+          <p>
+            <code>resolveAgent</code> 的顺序是「注册表命中 → 主 agent → <code>defaultAgentId</code>」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:519-528">HarnessGateway.java:519-528</span>。所以 binding 里写错一个 agent 名字，请求<strong>静默落到主 agent</strong>，不抛异常、不打 warn。排查「为什么 VIP 用户没有走到 support agent」时，先打印 <code>RouteResult.matchedBy()</code> 和 <code>agentId()</code>。
+          </p>
+        </div>
+        <div class="callout warn">
+          <span class="ct">陷阱二：主 agent 的路由 id 不是 <code>.agent("别名", ...)</code> 的键</span>
+          <p>
+            <code>bindMainAgent</code> 用 <code>agent.getAgentId()</code>（为空才退成 <code>"main"</code>）作为注册名<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:159-165">:159-165</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:530-533">:530-533</span>；只有<strong>非主</strong> agent 才用你给的 key 注册<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/GatewayBootstrap.java:289-296">GatewayBootstrap.java:289-296</span>。所以 <code>.mainAgent("sales")</code> 时，binding 写 <code>"sales"</code> 能否命中，取决于 <code>salesAgent.getAgentId()</code> 是不是 <code>"sales"</code>；否则又会静默落回主 agent（恰好就是它，所以看起来「对」了，但换名字就错）。
+          </p>
+        </div>
+
+        <h2 id="session">会话 id：从 <code>canonicalKey</code> 到 <code>gw-…</code></h2>
+        <p>
+          <code>MsgContext</code> 只有六个语义字段（外加 <code>userId</code>），但拼接规则决定了会话边界。源码是顺序 <code>append</code>，空值跳过<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/MsgContext.java:77-103">MsgContext.java:77-103</span>：
+        </p>
+        <pre data-lang="text" data-file="canonicalKey() 的拼接顺序">channel
+  + "|g:"  + group       （群 / 团队 / 账号）
+  + "|r:"  + room        （房间 / peer）
+  + "|t:"  + threadId    （线程）
+  + "|ts:" + threadTs    （平台时间戳锚点）
+  + "|x:"  + key + "=" + value   （extra，按 key 字典序，逐个拼）</pre>
+        <p>
+          举几个真实产出：<code>chatui</code>（MAIN 下的所有私聊）、<code>chatui|r:u_1</code>（PER_PEER）、<code>slack|g:T123|r:C456|t:1699.1</code>（guild 里的线程）、<code>chatui|r:u_1|x:agentId=support</code>（指定 agent 的私聊）。
+        </p>
+        <div class="callout warn">
+          <span class="ct">最容易踩的一条：<code>extra</code> 参与会话键</span>
+          <p>
+            因为 <code>extra</code> 被拼进了 <code>canonicalKey</code>，而 <code>ChannelRouter</code> 每次都会往里放 <code>{"agentId": …}</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:181">ChannelRouter.java:181</span>，所以<strong>换一个 agent 就是换一个会话</strong>——这是刻意的。但如果你顺手把 <code>tenant</code>、<code>traceId</code>、<code>requestId</code> 也塞进 <code>extra</code>，那么每个请求都会得到新会话，用户上一轮说的话全部「失忆」。官方文档也提醒过这一点<span class="src" data-src="docs/v2/zh/docs/harness/channel.md:112">channel.md:112</span>，但没说后果有多严重。<strong>业务属性请放 <code>RuntimeContext</code>，不要放 <code>MsgContext.extra</code>。</strong>
+          </p>
+        </div>
+        <p>
+          <code>sessionId</code> 则是纯函数：同样输入永远同样输出，与 JVM、机器无关（2^48 空间，实际不会撞）。所以「同一会话」在存储层就是同一个 <code>gw-…</code> 目录/键；重启、换节点、水平扩容都不会丢。若挂了 <code>BaseStore</code>，网关还会把 <code>sessionId → gateKey</code> 与 <code>sessionId → outboundAddress</code> 写穿到 <code>gateway/sessions</code>、<code>gateway/routes</code> 两个命名空间，缓存未命中时回查<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:754-816">HarnessGateway.java:754-816</span>。
+        </p>
+
+        <h2 id="turngate">同会话串行：一个公平信号量，和一种「静默丢弃」</h2>
+        <p>
+          <code>SessionTurnGate</code> 只有两个方法：<code>acquire(key)</code> 拿租约、<code>isRunning(key)</code> 探忙<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/SessionTurnGate.java:26-47">SessionTurnGate.java:26-47</span>。默认实现是进程内的：
+        </p>
+        <pre data-lang="java" data-file="LocalSessionTurnGate">private final ConcurrentHashMap&lt;String, Semaphore&gt; gates = new ConcurrentHashMap&lt;&gt;();
+
+public TurnLease acquire(String key) throws InterruptedException {
+    Semaphore semaphore = gates.computeIfAbsent(key, k -&gt; new Semaphore(1, true)); // 公平
+    semaphore.acquire();          // 阻塞等待，永不抛 TurnBusyException
+    return semaphore::release;    // 租约就是一个 Runnable
+}
+
+public boolean isRunning(String key) {
+    Semaphore s = gates.get(key);
+    return s != null &amp;&amp; s.availablePermits() == 0;   // 看许可数，不看线程
+}</pre>
+        <p>
+          注意两个细节：<strong>公平</strong>（<code>new Semaphore(1, true)</code>，先到先得，不会饿死），以及<strong>它永远不抛 <code>TurnBusyException</code></strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/LocalSessionTurnGate.java:21-42">LocalSessionTurnGate.java:21-42</span>。所以本地部署下「同一用户连发两条」是<strong>排队</strong>，第二条会等第一条跑完。
+        </p>
+        <p>
+          但网关的包裹逻辑对「忙」的处理是另一种画风：
+        </p>
+        <pre data-lang="java" data-file="HarnessGateway.withGatedTurn 的 catch">try {
+    leaseRef.set(sessionTurnGate.acquire(gateKey));
+} catch (TurnBusyException e) {
+    log.debug("Skipping turn for {}: gate busy ({})", gateKey, e.getMessage());
+    return Mono.empty();          // 整轮消失：不报错、不排队、不重试
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt();
+    return Mono.error(new IllegalStateException(e));
+}</pre>
+        <p>
+          <code>Mono.empty()</code> 意味着调用方拿到的流<strong>正常结束但没有结果</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:694-720">HarnessGateway.java:694-720</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/TurnBusyException.java:18-23">TurnBusyException.java:18-23</span>。本地默认实现不会走到这个分支，所以本地测不出来；一旦换成控制面托管的分布式锁（<code>DistributedStore.sessionTurnGate()</code>），这条路径就活了——表现是「高峰期偶发消息没回复」，日志里只有一行 debug。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>gate 类型</th><th>并发同会话时</th><th>调用方观感</th><th>代价</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>LocalSessionTurnGate</code>（默认）</td><td>阻塞排队</td><td>慢，但有回复</td><td>占用 <code>boundedElastic</code> 线程，线程池打满会拖垮其他会话</td></tr>
+              <tr><td>分布式 gate（短超时）</td><td>抛 <code>TurnBusyException</code></td><td>空结果</td><td>需要客户端区分「空」与「忙」，否则表现为丢消息</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          另外，整个执行都 <code>subscribeOn(Schedulers.boundedElastic())</code>、租约在 <code>doFinally</code> 里释放，所以异常、取消都不会漏锁。用分布式 gate 时官方建议把 <code>ReActAgent</code> 的 <code>conflictPolicy</code> 设为 <code>FAIL</code>，让并发写状态直接报错而不是互相覆盖<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/SessionTurnGate.java:20-24">SessionTurnGate.java:20-24</span>。
+        </p>
+
+        <h2 id="router">ChannelRouter：1 层显式 + 7 层 binding + 2 层兜底</h2>
+        <p>
+          路由是这个包里最容易背错的地方。真实顺序写死在 <code>TIERS</code> 常量里<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:124-125">ChannelRouter.java:124-125</span>，<code>resolveRoute</code> 在其前面加了显式短路口、后面加了两级默认：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>#</th><th>层级</th><th>命中条件</th><th><code>matchedBy</code></th></tr>
+            </thead>
+            <tbody>
+              <tr><td>0</td><td>explicit</td><td><code>InboundMessage.preferredAgentId()</code> 非空白</td><td><code>"explicit"</code></td></tr>
+              <tr><td>1</td><td>peer</td><td><code>binding.peer == peer.key()</code>，如 <code>direct:u_42</code></td><td><code>"peer"</code></td></tr>
+              <tr><td>2</td><td>parentPeer</td><td>线程消息且 <code>binding.parentPeer == parentPeer.key()</code></td><td><code>"parentPeer"</code></td></tr>
+              <tr><td>3</td><td>guild + roles</td><td>guild 相同<strong>且</strong> roles 非空<strong>且</strong> 与消息 roles 有交集</td><td><code>"guild+roles"</code></td></tr>
+              <tr><td>4</td><td>guild</td><td>guild 相同<strong>且</strong> roles 为空</td><td><code>"guild"</code></td></tr>
+              <tr><td>5</td><td>team</td><td><code>binding.team == msg.team</code></td><td><code>"team"</code></td></tr>
+              <tr><td>6</td><td>account</td><td><code>binding.account == msg.accountId</code></td><td><code>"account"</code></td></tr>
+              <tr><td>7</td><td>channel</td><td><code>binding.channel == msg.channelId</code></td><td><code>"channel"</code></td></tr>
+              <tr><td>8</td><td>channel-default</td><td><code>ChannelConfig.defaultAgentId()</code> 非空</td><td><code>"channel-default"</code></td></tr>
+              <tr><td>9</td><td>global-default</td><td>兜底；构造参数为 null 时是 <code>"main"</code></td><td><code>"global-default"</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          tier 内的规则是「<strong>按 <code>bindings()</code> 列表顺序，第一个命中的赢</strong>」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:144-152">ChannelRouter.java:144-152</span>。所以同一 tier 里写两条重叠的规则，前面的会遮住后面的。
+        </p>
+        <p>
+          <code>ChannelBinding</code> 是 9 字段 record，但<strong>一条 binding 只属于一个 tier</strong>：「最具体的那个非空字段」决定它落在哪层<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelBinding.java:21-40">ChannelBinding.java:21-40</span>。因此 <code>forPeer</code> 造出来的 binding 永远不会因为 guild 匹配而生效——它只看 peer。七个静态工厂分别对应七个 tier：
+        </p>
+        <pre data-lang="java" data-file="七个工厂（roles 默认空集）">ChannelBinding.forPeer(peerKey, agentId)            // "direct:u_42"
+ChannelBinding.forParentPeer(parentPeerKey, agentId)
+ChannelBinding.forGuild(guild, agentId)             // roles 为空 → guild tier
+ChannelBinding.forGuildRoles(guild, roles, agentId) // roles 非空 → guild+roles tier
+ChannelBinding.forTeam(team, agentId)
+ChannelBinding.forAccount(account, agentId)
+ChannelBinding.forChannel(channel, agentId)
+// 附加：binding.withSessionScope(DmScope.PER_PEER) 覆盖该条的会话粒度</pre>
+        <div class="callout tip">
+          <span class="ct">显式指定 agent 时，binding 仍然会被查一次</span>
+          <p>
+            代码里 <code>findMatchedBinding</code> 在显式判断<strong>之前</strong>就执行了<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:89">ChannelRouter.java:89</span>，因为即使 agent 由调用方指定，<code>sessionScope</code> 仍要沿用命中的 binding<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:105-108">:105-108</span>。换句话说：<strong>显式只覆盖 agent，不覆盖会话粒度</strong>。
+          </p>
+        </div>
+
+        <h2 id="dmscope">DmScope：同一句「你好」会分裂成几个会话</h2>
+        <p>
+          DM 的会话粒度由 <code>DmScope</code> 决定，默认 <code>MAIN</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/DmScope.java:31-40">DmScope.java:31-40</span>。四种取值在 <code>buildDmContext</code> 里各造一个 <code>MsgContext</code>：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>scope</th><th>构造出的 MsgContext</th><th>canonicalKey 形态</th><th>u_1 与 u_2 两个用户</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>MAIN</code>（默认）</td>
+                <td><code>(channel, null, null, null, null)</code></td>
+                <td><code>chatui</code></td>
+                <td><strong>共用一个会话</strong>（适合单用户/共享助手）</td>
+              </tr>
+              <tr>
+                <td><code>PER_PEER</code></td>
+                <td><code>(channel, null, peerId, null, null)</code></td>
+                <td><code>chatui|r:u_1</code> / <code>chatui|r:u_2</code></td>
+                <td>两个会话</td>
+              </tr>
+              <tr>
+                <td><code>PER_CHANNEL_PEER</code></td>
+                <td><code>(channel, null, peerId, null, null)</code></td>
+                <td><code>chatui|r:u_1</code> / <code>chatui|r:u_2</code></td>
+                <td>两个会话（与上一行<strong>完全相同</strong>）</td>
+              </tr>
+              <tr>
+                <td><code>PER_ACCOUNT_CHANNEL_PEER</code></td>
+                <td><code>(channel, accountId, peerId, null, null)</code></td>
+                <td><code>slack|g:A1|r:u_1</code></td>
+                <td>两个会话，且多账号再分一层</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          看第三行：<code>PER_PEER</code> 与 <code>PER_CHANNEL_PEER</code> 在源码里是<strong>两个完全相同的分支</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:204-210">ChannelRouter.java:204-210</span>。原因不神秘：<code>canonicalKey</code> 的第一个片段<strong>永远是 channel</strong>，所以「把 channel 编进 key」对所有 scope 都自动成立。名字不同，行为一样——别指望靠切到 <code>PER_CHANNEL_PEER</code> 去解决跨渠道同名用户的问题，那件事本来就已解决。
+        </p>
+        <p>
+          非 DM 的三条分支也一并记住：
+        </p>
+        <ul>
+          <li><strong>线程</strong>：<code>room = parentPeer.id</code>、<code>threadId = peer.id</code>，即「同一父消息下的所有回复共用一个会话，不同线程彼此分开」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:186-188">:186-188</span>。</li>
+          <li><strong>频道 / 群</strong>：<code>room = peer.id</code>、<code>group = guild</code>，同一频道内所有人共用一个会话<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:191-192">:191-192</span>。</li>
+          <li><strong>userId</strong>：取 <code>senderId</code>，为空且是 DM 时退回 <code>peer.id</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:110-113">:110-113</span>。它<strong>不进</strong> <code>canonicalKey</code>，只影响 <code>AgentState</code> 的 <code>(userId, sessionId)</code> 槽位——所以「群聊里同一个会话、每个人各有一份记忆」是靠 userId 实现的，不是靠 sessionId。</li>
+        </ul>
+        <div class="callout warn">
+          <span class="ct">群聊的默认语义容易反直觉</span>
+          <p>
+            群聊无论 <code>DmScope</code> 设成什么都<strong>只有一个会话</strong>（<code>room = peer.id</code>），DmScope 只管 DM。想让「群里每个人各自一条私密记忆」，靠的是 <code>userId</code> 隔离，不是换 scope。
+          </p>
+        </div>
+
+        <h2 id="channel">Channel：三个必须实现，六个已有默认</h2>
+        <p>
+          接口一共九个方法，只有 <code>channelId()</code>、<code>config()</code>、<code>dispatch()</code> 是抽象的；其余都有默认实现，且默认值都倾向「什么都不做」或「明确不支持」：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>默认</th><th>什么时候要覆盖</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>channelId()</code></td><td>抽象</td><td>必须与 <code>ChannelConfig.channelId()</code> 一致</td></tr>
+              <tr><td><code>config()</code></td><td>抽象</td><td>路由配置的唯一来源</td></tr>
+              <tr><td><code>init(Gateway)</code></td><td>空</td><td>构造时拿不到 gateway 的渠道</td></tr>
+              <tr><td><code>start()</code> / <code>stop()</code></td><td>空</td><td>需要接 webhook / 长轮询 / WebSocket</td></tr>
+              <tr><td><code>dispatch(InboundMessage)</code></td><td>抽象</td><td>标准三步：<code>resolveRoute</code> → <code>gateway.run</code> → 回投</td></tr>
+              <tr><td><code>dispatchStream(...)</code></td><td><code>Flux.error("Streaming dispatch not supported")</code></td><td>要做流式（SSE）就必须自己实现，或照抄 <code>ChatUiChannel</code></td></tr>
+              <tr><td><code>deliver(address, msgs)</code></td><td>空</td><td>支持服务端主动推送（如子 agent 播报）</td></tr>
+              <tr><td><code>deliverWithReceipt(...)</code></td><td><code>Mono.error("Provider receipts are not supported")</code></td><td>需要平台回执（消息 id）来做「至少一次」投递</td></tr>
+              <tr><td><code>applyRoutingConfig(...)</code></td><td><code>false</code>（需要重启）</td><td>想把 binding 热更新而不重建 transport</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          出处：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/Channel.java:56-147">Channel.java:56-147</span>。
+        </p>
+        <p>
+          <code>ChannelManager</code> 是管理这些实例的小容器：<code>register</code> 同 id 覆盖、<code>unregister</code> 会先 <code>stop</code>、<code>initAll</code> / <code>startAll</code> / <code>stopAll</code> 逐个调用且<strong>吞掉单个渠道的异常</strong>（只打日志，不影响其他渠道）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/ChannelManager.java:60-148">ChannelManager.java:60-148</span>。主动投递时找不到渠道只 warn 一句就丢弃<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/ChannelManager.java:163-185">:163-185</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">「批量启动成功」不等于「每个都起来了」</span>
+          <p>
+            <code>initAll</code> / <code>startAll</code> 里每个 <code>channelId</code> 的异常都被 catch 成日志<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/ChannelManager.java:113-135">ChannelManager.java:113-135</span>。生产上要自己核对：<code>gw.start()</code> 之后逐个查 <code>channelManager().getChannel(id)</code> 的健康状态（或你自己的探针），不要只看 <code>start()</code> 没抛异常。
+          </p>
+        </div>
+
+       <h2 id="chatui">ChatUiChannel：两种发送姿势，走两条完全不同的路</h2>
+        <p>
+          它是内核里唯一的开箱渠道实现，也是最好的「怎么写 Channel」范本。但它有两套发送 API，语义差别很大，混用就会出现「binding 明明配了却不生效」：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>写法</th><th>内部路径</th><th>会查 binding 吗</th><th>会话粒度由谁决定</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>send(peerId, text)</code></td>
+                <td><code>ChatUiRequest.withPeer</code> → <code>InboundMessage.dm</code> → <code>dispatch</code> → 路由</td>
+                <td><strong>会</strong></td>
+                <td><code>ChannelConfig.dmScope</code> + binding 的 <code>sessionScope</code></td>
+              </tr>
+              <tr>
+                <td><code>send(text)</code></td>
+                <td>同上，但 peer 固定为 <code>"__anonymous__"</code></td>
+                <td><strong>会</strong>（只是 peer 恒定）</td>
+                <td><code>dmScope</code>；默认 MAIN 下就是唯一会话</td>
+              </tr>
+              <tr>
+                <td><code>send(SendOptions, text)</code></td>
+                <td><code>dispatchWithOptions</code> → 直接造 <code>MsgContext</code> → <code>gateway.run</code></td>
+                <td><strong>不会</strong></td>
+                <td><code>SendOptions.effectiveSessionKey()</code>（<code>sessionId</code> 优先，否则 <code>userId</code>）</td>
+              </tr>
+              <tr>
+                <td><code>sendToSubagent(id, text)</code></td>
+                <td><code>gateway.runSubagent</code></td>
+                <td>不会（<strong>绕开全部路由</strong>）</td>
+                <td>子 agent 自己的 <code>sessionId</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          第三行值得展开。<code>SendOptions</code> 路径完全不经过 <code>ChannelRouter</code>，它自己拼上下文：
+        </p>
+        <pre data-lang="java" data-file="ChatUiChannel.buildContextFromOptions">String room = options.effectiveSessionKey();      // sessionId ?: userId
+String agentId = options.agentId();
+if (agentId == null) agentId = config.defaultAgentId();   // 只回退到渠道默认，不看 binding
+Map&lt;String, String&gt; extra = agentId != null ? Map.of("agentId", agentId) : Map.of();
+return new MsgContext(CHANNEL_ID, null, room, null, null, extra)
+        .withUserId(options.userId());</pre>
+        <p>
+          出处 <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/chatui/ChatUiChannel.java:444-457">ChatUiChannel.java:444-457</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/chatui/SendOptions.java:118-121">SendOptions.java:118-121</span>。所以 <code>SendOptions</code> 是「我自己知道该给谁、该落哪个会话」的低层后门；要做「按角色/群组自动分派」，还是得走 <code>InboundMessage</code> + binding。
+        </p>
+        <p>
+          其它几个实用方法：<code>previewRoute(message)</code> 只算路由不发送（前端可以先用它拿会话键）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/chatui/ChatUiChannel.java:161-168">:161-168</span>；<code>pollOutbound()</code> 把主动投递的消息从内存队列里取走（<code>deliver</code> 只是入队，不会真的推送）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/chatui/ChatUiChannel.java:170-193">:170-193</span>；<code>applyRoutingConfig</code> 在 <code>channelId</code> 一致时直接换 <code>volatile</code> 引用即可热更新<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/chatui/ChatUiChannel.java:138-146">:138-146</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">忘了注入 gateway 的报错是明确的</span>
+          <p>
+            <code>ChatUiChannel.create()</code> 造出来时 <code>gateway</code> 为 null；直接 <code>send</code> 会抛 <code>IllegalStateException("ChatUiChannel has no gateway. Use GatewayBootstrap.chatUiChannel(), or construct with ChatUiChannel.create(gateway).")</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/chatui/ChatUiChannel.java:459-467">ChatUiChannel.java:459-467</span>。要么 <code>agent.channel(ch)</code>，要么 <code>gw.chatUiChannel()</code>，别 <code>new</code> 完就用。完整条目：<a href="../appendix/errors.html#err-chatui-no-gateway">附录 B · ChatUiChannel has no gateway</a>。
+          </p>
+        </div>
+
+        <h2 id="bootstrap">GatewayBootstrap：装配顺序，以及它会替你做的三件事</h2>
+        <p>
+          <code>build()</code> 的步骤是固定的，顺序本身有意义<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/GatewayBootstrap.java:264-329">GatewayBootstrap.java:264-329</span>：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">校验 agent</span>
+            <div>
+              一个都没有 → <code>IllegalStateException("At least one agent must be registered via agent(...)")</code>；<code>mainAgent</code> 不在列表里 → <code>IllegalStateException("mainAgent('x') not found in registered agents")</code>。不写 <code>mainAgent</code> 时取 <strong><code>LinkedHashMap</code> 的第一个</strong>，也就是第一个 <code>.agent(...)</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">建容器</span>
+            <div>
+              <code>new ChannelManager()</code> → 逐个 <code>register(ch)</code> → <code>HarnessGateway.create(cm)</code>。注意此处<strong>不建 MessageBus</strong>，也没有 <code>WakeupDispatcher</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">绑主 agent + 注册其余</span>
+            <div>
+              <code>bindMainAgent(mainHa)</code> 先做，其余按 key <code>registerAgent(key, agent)</code>。这一步决定了「主 agent 的路由 id 是它自己的 <code>getAgentId()</code>，其他 agent 的路由 id 是你给的 key」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">装子 agent 恢复链</span>
+            <div>
+              收集每个 agent 的 <code>DefaultAgentManager</code>，合成一个「挨个试」的 <code>SubagentMaterializer</code>；若有 <code>distributedStore</code>（或主 agent 自带的），换成 <code>StoreBackedSubagentRegistry</code>。没有 store 就停在 <code>InMemorySubagentRegistry</code>，暴露关系只在当前进程有效。
+            </div>
+          </li>
+        </ol>
+        <div class="callout warn">
+          <span class="ct"><code>configureAllAgents</code> 只管 lambda 那一种</span>
+          <p>
+            它的 javadoc 说得很清楚：只作用于「通过 <code>agent(String, Consumer)</code> 创建的构建器」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/GatewayBootstrap.java:228-235">GatewayBootstrap.java:228-235</span>。你要是先 <code>HarnessAgent.builder()...build()</code> 再 <code>.agent("sales", instance)</code>，那些全局配置<strong>一个都不会应用</strong>。两种注册方式可以混用，但别指望后者补上前者。
+          </p>
+        </div>
+
+        <h2 id="bus">MessageBus：三种消费模型，四组域助手</h2>
+        <p>
+          接口只定义原语，语义分三类<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/bus/MessageBus.java:24-45">MessageBus.java:24-45</span>：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模型</th><th>方法</th><th>语义</th><th>谁在用</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>A · 排空队列</td>
+                <td><code>queuePush</code> / <code>queueDrain</code> / <code>queueDelete</code> / <code>queuePeek</code></td>
+                <td>单消费者、<strong>读到即删</strong>（ack-on-read）。读过一次就没了</td>
+                <td>inbox、唤醒队列</td>
+              </tr>
+              <tr>
+                <td>C · 回放日志</td>
+                <td><code>logAppend</code> / <code>logRead</code> / <code>logTrim</code></td>
+                <td>多消费者、各自游标、按 <code>maxLen</code> 截断。<strong>非破坏性</strong></td>
+                <td>会话事件回放（SSE 断线重连）</td>
+              </tr>
+              <tr>
+                <td>D · 瞬时广播</td>
+                <td><code>publish</code> / <code>subscribe</code></td>
+                <td>发完就忘，只发给<strong>当前已订阅</strong>者，不保留历史</td>
+                <td>唤醒信号</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          在它们之上有一层「域助手」，把业务概念映射成固定的 key 约定（默认方法，不用自己实现）：
+        </p>
+        <pre data-lang="text" data-file="MessageBus 的固定 key">inbox        agentscope:inbox:&lt;sessionId&gt;            queuePush / queueDrain
+唤醒队列      agentscope:wakeups                        queuePush / queueDrain
+唤醒信号      agentscope:wakeup_signal                  publish / subscribe
+会话事件      agentscope:session:events:&lt;sessionId&gt;     logAppend(maxLen=1000) + publish</pre>
+        <p>
+          <code>enqueueWakeup(userId, sessionId, agentId)</code> 是「先入队、再广播一个空信号」两件事<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/bus/MessageBus.java:180-188">MessageBus.java:180-188</span>；<code>sessionPublishEvent</code> 是「写日志 + 广播（活的副本多一个 <code>_entry_id</code> 当游标）」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/bus/MessageBus.java:220-229">:220-229</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">模型 A 没有 ack，消费方崩了就是丢消息</span>
+          <p>
+            <code>queueDrain</code> 的契约是「返回的一定被删掉」。如果消费方拿到之后、处理之前进程崩了，这些条目再也回不来。异步结果依赖这条路径，所以「进程崩溃」在语义上等价于「结果丢失」——代码只能靠 <code>AsyncToolRegistry</code> 的 stale 检测事后补偿，而那是<strong>另一条</strong>链路（见下一节）。
+          </p>
+        </div>
+
+        <h2 id="busimpl">WorkspaceMessageBus：文件布局、3 秒轮询，和「publish 是空实现」</h2>
+        <p>
+          默认实现把总线落在文件系统上，所以它<strong>天然跟着 workspace 走</strong>：
+        </p>
+        <pre data-lang="text" data-file="WorkspaceMessageBus 的磁盘布局">{busRoot}/
+  queues/{sanitizedKey}_{hash}/00000000000000000001.json   ← 模型 A，每条一个文件
+  logs/{sanitizedKey}_{hash}/00000000000000000002.json     ← 模型 C，追加、按 maxLen 删旧</pre>
+        <p>
+          入口 id 是 <code>String.format("%020d", seq.incrementAndGet())</code>，<code>seq</code> 用 <code>System.nanoTime()</code> 初始化<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/bus/WorkspaceMessageBus.java:233-235">WorkspaceMessageBus.java:233-235</span>。因为定长补零、目录内按路径排序，<strong>字典序就是产生顺序</strong>；重启后从 <code>nanoTime</code> 重新起算，所以「跨进程严格单调」并不成立——这也是官方说它「单进程」的原因之一。
+        </p>
+        <p>
+          <code>queueDrain</code> 的容错分两种，值得记住：
+        </p>
+        <ul>
+          <li><strong>读失败</strong>（并发被别的 drain 删了、I/O 抖动）→ <code>continue</code>，<strong>不删</strong>，留给下次重试<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/bus/WorkspaceMessageBus.java:100-108">:100-108</span>。</li>
+          <li><strong>JSON 坏了</strong> → 删掉，否则每次 drain 都会卡在同一条坏数据上<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/bus/WorkspaceMessageBus.java:115-125">:115-125</span>。</li>
+        </ul>
+        <div class="callout warn">
+          <span class="ct">模型 D 在这里是「假的」</span>
+          <p>
+            <code>publish</code> 是 <code>Mono.empty()</code>，<code>subscribe</code> 只是每 3 秒吐一个空 <code>Map</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/bus/WorkspaceMessageBus.java:210-221">WorkspaceMessageBus.java:210-221</span>。所以唤醒信号在这套实现里退化成<strong>轮询</strong>：延迟最多 3 秒，且与有多少节点无关（每个节点都自己 tick、自己 drain，抢到的先处理）。真正需要「毫秒级推送」时，要换 Redis/控制面实现（<code>DistributedStore.messageBus()</code>）。
+          </p>
+        </div>
+
+        <h2 id="inbox">InboxMiddleware：每个 reasoning step 开头排一次水</h2>
+        <p>
+          它是<strong>唯一的 inbox 消费者</strong>。挂在 <code>onReasoning</code> 上，每轮推理之前做两件并行的事，然后 <code>zip</code> 起来<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/InboxMiddleware.java:82-140">InboxMiddleware.java:82-140</span>：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">排空 inbox</span>
+            <div>
+              <code>inboxDrain(sessionId, maxDrainCount)</code>，把每条 <code>payload</code> 还原成 <code>HintBlock</code>（必须有 <code>hint</code> 字段，否则丢弃）。默认上限 <strong>100</strong> 条。
+            </div>
+          </li>
+          <li>
+            <span class="sh">扫一遍僵尸异步任务</span>
+            <div>
+              <code>asyncToolRegistry.findStale(sessionId, ttl)</code>：状态还是 <code>RUNNING</code> 且创建时间早于 <code>now - ttl</code> 的记录，逐条 <code>markTimeout</code>，并合成一条 hint：「工具 'x' 没跑完（进程崩溃或超时），你可以重试或直接继续」。默认 TTL <strong>10 分钟</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/InboxMiddleware.java:56">:56</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/InboxMiddleware.java:109-137">:109-137</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">塞进上下文 + 发事件</span>
+            <div>
+              有 hint 就写进 <code>state.contextMutable()</code>：如果最后一条是<strong>同名 assistant 消息</strong>就追加 <code>content</code>，否则新造一条 assistant 消息<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/InboxMiddleware.java:186-209">:186-209</span>；同时为每条发一个 <code>HintBlockEvent</code>（前端可以实时渲染），最后 <code>concatWith(next)</code> 继续推理<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/InboxMiddleware.java:163-178">:163-178</span>。
+            </div>
+          </li>
+        </ol>
+        <p>
+          注册时机：只要 <code>messageBus != null</code> 就装，参数是 <code>(bus, 100, asyncToolRegistry, null)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2614-2616">HarnessAgent.java:2614-2616</span>。而 <code>messageBus</code> 在「没显式设置、但有文件系统」时会自动退化成 <code>WorkspaceMessageBus(filesystem, ".agentscope/bus")</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2504-2516">:2504-2516</span>，而文件系统永远不为 null（默认 <code>LocalFilesystemSpec</code>）。结论：<strong>InboxMiddleware 默认就是开着的</strong>，你没配任何东西它也已经在排空气了。
+        </p>
+        <div class="callout tip">
+          <span class="ct">僵尸检测是「懒」的</span>
+          <p>
+            <code>findStale</code> 只在<strong>有推理步骤发生时</strong>才被调用。如果会话从此再没有人说话、也没有 wakeup，那些 <code>RUNNING</code> 记录会一直躺着，不会自愈。所以「进程崩了之后重启，用户不发消息就永远看不到失败通知」是预期行为，不是 bug。
+          </p>
+        </div>
+
+        <h2 id="async">AsyncToolMiddleware：超时 → 占位结果 → 后台跑完回灌</h2>
+        <p>
+          默认<strong>不装</strong>。<code>asyncToolTimeout</code> 字段没有初始值<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1294-1296">HarnessAgent.java:1294-1296</span>，只有你显式 <code>.asyncToolTimeout(Duration)</code> 且 <code>messageBus != null</code> 时才注册<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2666-2669">:2666-2669</span>。
+        </p>
+        <pre data-lang="java" data-file="开启异步工具卸载">HarnessAgent agent = HarnessAgent.builder()
+        .name("worker").model(model)
+        .asyncToolTimeout(Duration.ofSeconds(30))   // 关键：不设就永远同步
+        .build();</pre>
+        <p>
+          它的核心不是「多线程跑工具」，而是<strong>把一次 acting 阶段切成两段</strong>：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">计时的是整个 acting 阶段</span>
+            <div>
+              定时器在 <code>onActing</code> 入口就起，等的是 <code>next.apply(input)</code> <strong>整条流</strong>结束，不是单个工具<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AsyncToolMiddleware.java:150-169">AsyncToolMiddleware.java:150-169</span>。所以「同一轮里有 3 个工具，其中 1 个慢」→ 三个工具<strong>都会</strong>拿到占位结果，而不是只处理慢的那个。
+            </div>
+          </li>
+          <li>
+            <span class="sh">超时瞬间：登记 + 占位 + 收尾</span>
+            <div>
+              对 <code>input.toolCalls()</code> 里每个调用：往 <code>AsyncToolRegistry</code> 写一条 <code>RUNNING</code>（id 就用 <code>toolCall.getId()</code>）、把占位 <code>ToolResultBlock</code> 写进 <code>state.contextMutable()</code>、发 <code>ToolResultStart/TextDelta/End</code> 三个事件，最后 <code>sink.complete()</code> 让这一轮先结束<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AsyncToolMiddleware.java:182-235">:182-235</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">后台<strong>不取消</strong></span>
+            <div>
+              <code>onDispose</code> 里只有「没超时」才 <code>sub.dispose()</code>；超时后订阅继续跑，事件先进 <code>backgroundBuffer</code> 缓存而不是丢掉<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AsyncToolMiddleware.java:105-114">:105-114</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AsyncToolMiddleware.java:171-177">:171-177</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">跑完：进 inbox + 唤醒</span>
+            <div>
+              完成回调里把所有 <code>ToolResultTextDeltaEvent</code> 的 <code>delta</code> 拼成文本，包成 <code>HintBlock</code>（<code>source="tool_output"</code>）推进 inbox，再 <code>enqueueWakeup(userId, sessionId, agentId)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AsyncToolMiddleware.java:237-294">:237-294</span>。
+            </div>
+          </li>
+        </ol>
+        <p>
+          占位文案本身也是一段提示工程：明确告诉模型「在后台跑（id=…），完成会自动通知，<strong>不要轮询、不要查询、不要等</strong>」，并给两条出路：去干别的独立任务，或者干脆回一句文本<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AsyncToolMiddleware.java:69-75">:69-75</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">三条失败路径，只有一条会通知到模型</span>
+          <p>
+            ① <strong>后台执行抛异常</strong>：只写 <code>registry.fail(...)</code> + 一条 warn 日志，<strong>不推 inbox、不唤醒</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AsyncToolMiddleware.java:115-135">:115-135</span>——模型永远等不到结果，这是最坑的一条。<br />
+            ② <strong>进程崩溃</strong>：记录停在 <code>RUNNING</code>，等下一次推理时被 stale 扫描捞出来（≥10 分钟）。<br />
+            ③ <strong>没有 sessionId</strong>：<code>deliverBackgroundResult</code> 直接 warn 返回，结果被丢弃<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AsyncToolMiddleware.java:239-243">:239-243</span>。裸调 <code>agent.call(...)</code> 不带 session 时就会这样。
+          </p>
+        </div>
+        <p>
+          另外两个细节：结果只从 <code>ToolResultTextDeltaEvent</code> 里取，所以<strong>不产生文本增量的工具</strong>（只返回结构化块）回灌内容是 <code>"(no output)"</code>；<code>WorkspaceAsyncToolRegistry.complete(id, result)</code> 与 <code>fail(id, error)</code> 都<strong>忽略第二个参数</strong>，只改状态，不存内容<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/bus/WorkspaceAsyncToolRegistry.java:81-94">WorkspaceAsyncToolRegistry.java:81-94</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/bus/WorkspaceAsyncToolRegistry.java:125-147">:125-147</span>。
+        </p>
+
+        <h2 id="wakeup">WakeupDispatcher：drain → 判忙 → runWakeup</h2>
+        <p>
+          它是「无事发生也要让 agent 说话」的唯一执行者。四个作用场景写在类注释里：后台子 agent 完成、异步工具结果、团队消息、定时任务触发<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/WakeupDispatcher.java:35-42">WakeupDispatcher.java:35-42</span>。
+        </p>
+        <pre data-lang="java" data-file="启动与关闭">MessageBus bus = new WorkspaceMessageBus(filesystem, "/bus");
+HarnessGateway gw = HarnessGateway.create(channelManager, bus);   // 注意第二个参数
+WakeupDispatcher dispatcher = new WakeupDispatcher(bus, gw);
+dispatcher.start();   // 先补一轮历史，再订阅信号
+dispatcher.close();   // 只 dispose 订阅，不停 bus</pre>
+        <p>
+          <code>start()</code> 先 <code>drainAndDispatch()</code> 一次（把停机期间积压的处理掉），再 <code>subscribeWakeup()</code> 订阅<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/WakeupDispatcher.java:101-118">WakeupDispatcher.java:101-118</span>。每次触发时：一次最多 drain <strong>64</strong> 条，逐条 <code>dispatch</code>，每条都是「判忙 → <code>runWakeup(...).subscribe()</code>」的点火即走<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/WakeupDispatcher.java:130-180">:130-180</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>脆弱点</th><th>代码事实</th><th>后果</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>忙就丢</td>
+                <td>条目 <strong>先 drain 出来</strong>，再判 <code>isSessionRunning</code>；忙则直接 <code>return</code>，<strong>不重新入队</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/WakeupDispatcher.java:156-162">:156-162</span></td>
+                <td>依赖「正在跑的那一轮会在下一步排空 inbox」这个假设；如果那一轮已经走到最后一步，本次唤醒就消失了</td>
+              </tr>
+              <tr>
+                <td>订阅死一次就死</td>
+                <td><code>onError</code> 只打日志「dispatcher is dead」，<strong>不重订阅</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/WakeupDispatcher.java:112-116">:112-116</span></td>
+                <td>总线一次抖动后，整个进程再也不处理唤醒，直到重启</td>
+              </tr>
+              <tr>
+                <td>唤醒总跑主 agent</td>
+                <td><code>runWakeup</code> 里是 <code>resolveAgent(null)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:647">HarnessGateway.java:647</span></td>
+                <td>多 agent 下，被 support 会话触发的唤醒<strong>由主 agent 执行</strong>，加载的也是主 agent 的状态槽</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>runWakeup</code> 本身还有一层分支：<strong>有 bus 时</strong>走 <code>streamEvents</code>，把每个事件都 <code>publish</code> 到 <code>agentscope:session:events:&lt;sessionId&gt;</code>，最后只取 <code>AgentResultEvent</code> 的 <code>result</code>；<strong>没有 bus 时</strong>退化成 <code>ha.call(List.of(), rtc)</code>——注意入参是空列表，靠 <code>InboxMiddleware</code> 把内容注入<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:640-674">HarnessGateway.java:640-674</span>。这解释了为什么「唤醒必须配合 Inbox 才有意义」：没有 hint，模型会面对一个空的用户输入。
+        </p>
+
+        <h2 id="expose">暴露子 agent：一个句柄，四条解析路径</h2>
+        <p>
+          <code>agent_spawn(expose_to_user=true)</code> 会调到 <code>exposeSubagent</code>，生成一个用户可寻址的句柄：<code>"sub-" + UUID 前 8 位</code>，同时写活缓存与（可选的）持久registry<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:369-389">HarnessGateway.java:369-389</span>。之后用户可以直接和这个子 agent 对话，完全绕过父 agent。
+        </p>
+        <p>
+          <code>runSubagent</code> 找目标时按顺序试四条路<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:447-482">HarnessGateway.java:447-482</span>：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>顺序</th><th>来源</th><th>命中条件</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>1</td><td><code>exposedSessions</code> 活缓存</td><td>本进程、本次生命周期内暴露过</td></tr>
+              <tr><td>2</td><td><code>subagentMaterializer == null</code></td><td>直接返回 null（不尝试恢复）</td></tr>
+              <tr><td>3</td><td><code>SubagentRegistry.find(id)</code></td><td>持久记录存在且未过期（过期会被顺手 revoke）</td></tr>
+              <tr><td>4</td><td><code>materializer.materialize(agentId, rtc)</code></td><td>按 agent 类型重建实例，<code>sessionId</code>/<code>userId</code> 带上以加载历史</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          重建成功后 <code>putIfAbsent</code> 回缓存（并发下只留一个），然后以 <code>gateKey = "subagent:" + id</code> 上锁执行；如果当初记录了 <code>replyTo</code> 且网关有 <code>ChannelManager</code>，回复还会被主动投递出去<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:484-513">:484-513</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">两处「看起来有、其实没有」</span>
+          <p>
+            ① <code>exposeSubagent</code> 写记录时 <code>parentSessionId</code> 传的是 <code>null</code>、<code>expiresAt</code> 也是 <code>null</code>，所以 <code>revokeByParentSession</code> <strong>永远匹配不到</strong>这些记录，也不会自动过期。② <code>agent.channel(...)</code> 造的是无 <code>ChannelManager</code> 的网关，<code>replyTo</code> 投递这一步会静默跳过。跨节点恢复与主动播报，都只有 <code>GatewayBootstrap</code> + <code>distributedStore</code> 那条路才完整。
+          </p>
+        </div>
+
+        <h2 id="runtime">RuntimeContext 合并：调用方 → resolver → 网关身份字段</h2>
+        <p>
+          三层，后一层覆盖前一层，顺序不能颠倒<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:279-329">HarnessGateway.java:279-329</span>：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">起点：callerContext</span>
+            <div>
+              来自 <code>SendOptions.runtimeContext()</code> 或 <code>InboundMessage.runtimeContext()</code>，可以为 null。
+            </div>
+          </li>
+          <li>
+            <span class="sh">替换：resolver</span>
+            <div>
+              配了 <code>ChannelRuntimeContextResolver</code> 且返回非 null，就<strong>整体替换</strong>上一步的 base（不是合并）。请求对象里带着 <code>channelId</code>、原始 <code>InboundMessage</code>、已解析的 <code>MsgContext</code>、<code>OutboundAddress</code>、<code>callerContext</code>，够你查租户/鉴权/工具依赖<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRuntimeContextRequest.java:35-40">ChannelRuntimeContextRequest.java:35-40</span>。返回 null 表示「不改」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">覆盖：网关身份字段</span>
+            <div>
+              <code>sessionId</code>、<code>msgContext</code>、<code>gateKey</code>、<code>outboundAddress</code> 强制写入；<code>userId</code> 只在非空白时写。冲突一律以网关为准——这是刻意的，否则调用方可以把 <code>sessionId</code> 改成别人的。
+            </div>
+          </li>
+        </ol>
+        <p>
+          实践上分清楚两个入口：<strong>业务属性</strong>（租户、trace、工具依赖）放 <code>RuntimeContext</code>；<strong>会话身份</strong>（channel/group/room/thread）放 <code>MsgContext</code>。反过来放，前者会把会话打散，后者会让业务属性污染会话键。
+        </p>
+
+        <h2 id="assemble">端到端：一条消息的完整时序</h2>
+        <p>
+          把本章所有零件串起来。假设一个异步工具跑了 3 分钟，用户早已离开页面：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">① 渠道收消息</span>
+            <div>
+              适配器把平台事件规范化成 <code>InboundMessage</code>：<code>channelId</code>、<code>peer</code>、<code>senderId</code>、<code>guild</code>、<code>parentPeer</code>、<code>messages</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">② 路由</span>
+            <div>
+              <code>router.resolveRoute(config, msg)</code> 产出 <code>RouteResult{agentId, context, matchedBy, outboundAddress}</code>——三样东西一起定下来：谁接、落哪个会话、回复投哪。
+            </div>
+          </li>
+          <li>
+            <span class="sh">③ 网关换 id + 上锁</span>
+            <div>
+              <code>gateKey → gw-…</code>、记 <code>lastRoute</code>、合 <code>RuntimeContext</code>、<code>acquire(gateKey)</code>。同会话的第二条消息在本地实现下会在这里排队。
+            </div>
+          </li>
+          <li>
+            <span class="sh">④ agent 跑一轮</span>
+            <div>
+              <code>ha.call(msgs, rtc)</code> → 中间件链 → 模型 → 工具。每次 <code>onReasoning</code> 开头，<code>InboxMiddleware</code> 都会排一次 inbox。
+            </div>
+          </li>
+          <li>
+            <span class="sh">⑤ 工具超时</span>
+            <div>
+              <code>AsyncToolMiddleware</code> 写占位结果、登记 <code>RUNNING</code>、结束本轮。用户马上收到一句「正在后台处理」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">⑥ 后台完成</span>
+            <div>
+              结果拼成 <code>HintBlock</code> 推 inbox；<code>enqueueWakeup</code> 写唤醒队列 + 发信号。
+            </div>
+          </li>
+          <li>
+            <span class="sh">⑦ 唤醒</span>
+            <div>
+              某个节点的 <code>WakeupDispatcher</code>（文件总线实现下最多 3 秒后）drain 到这条，判忙通过 → <code>runWakeup(userId, sessionId)</code> → 空输入跑一轮 → <code>InboxMiddleware</code> 把 hint 注入 → 模型看到结果，决定回一句话。
+            </div>
+          </li>
+          <li>
+            <span class="sh">⑧ 主动投递</span>
+            <div>
+              <code>ChannelManager.deliver(lastRoute, [reply])</code> → 渠道的 <code>deliver</code> 把消息推给平台。这一步要求网关<strong>有</strong> <code>ChannelManager</code> 且会话<strong>记过</strong> <code>outboundAddress</code>。
+            </div>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <span class="ct">断在哪一环，症状是什么</span>
+          <p>
+            没有 bus → ⑤ 之后彻底没有 ⑥⑦，用户只看到「正在处理」。有 bus 没 dispatcher → ⑥ 写进去了没人读，结果永远躺在队列里。有 dispatcher 没 <code>InboxMiddleware</code> → ⑦ 跑了但模型收到空输入。没有 <code>ChannelManager</code> → ⑦ 产出了回复但没人投递。<strong>四个环节，缺一个都表现为「异步没效果」，但日志完全不同。</strong>
+          </p>
+        </div>
+
+        <h2 id="doc-gap">官方说了什么 vs 源码实际是什么</h2>
+        <p>
+          <code>channel.md</code> 只覆盖到「路由 + 会话」这一层，写得准的地方不少（比如 <code>RuntimeContext</code> 三步合并、<code>extra</code> 参与会话键），但下面七处要么缺失、要么会误导：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>#</th><th>文档的说法</th><th>源码实际</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1</td>
+                <td>「<code>agent.channel(...)</code> 会在后台自动完成所有接线」<span class="src" data-src="docs/v2/zh/docs/harness/channel.md:17">channel.md:17</span></td>
+                <td>它只建 <code>HarnessGateway.create()</code>（无 <code>ChannelManager</code>、无 <code>MessageBus</code>）。路由与串行可用，<strong>主动投递与网关侧唤醒不可用</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:661-667">HarnessAgent.java:661-667</span></td>
+              </tr>
+              <tr>
+                <td>2</td>
+                <td>「同一 session 的并发消息会公平排队」<span class="src" data-src="docs/v2/zh/docs/harness/channel.md:12">channel.md:12</span></td>
+                <td>只有默认的 <code>LocalSessionTurnGate</code> 是排队；换成抛 <code>TurnBusyException</code> 的分布式 gate，整轮变成 <code>Mono.empty()</code>，<strong>静默丢弃</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:694-720">HarnessGateway.java:694-720</span></td>
+              </tr>
+              <tr>
+                <td>3</td>
+                <td>全文未出现 <code>MessageBus</code> / <code>InboxMiddleware</code> / <code>AsyncToolMiddleware</code> / <code>WakeupDispatcher</code></td>
+                <td>这四样组成「后台结果怎么回到对话」的完整链路，缺一环就表现为「异步没效果」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AsyncToolMiddleware.java:237-294">AsyncToolMiddleware.java:237-294</span></td>
+              </tr>
+              <tr>
+                <td>4</td>
+                <td>「多 HarnessAgent 路由」示例里 <code>.agent("sales", salesAgent)</code> 隐含「<code>sales</code> 就是路由 id」</td>
+                <td>只有<strong>非主</strong> agent 用这个 key；主 agent 用 <code>agent.getAgentId()</code>，为空才退成 <code>"main"</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/HarnessGateway.java:159-165">HarnessGateway.java:159-165</span></td>
+              </tr>
+              <tr>
+                <td>5</td>
+                <td><code>DmScope</code> 的四个枚举值描述成四种不同粒度<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/DmScope.java:18-30">DmScope.java:18-30</span></td>
+                <td><code>PER_PEER</code> 与 <code>PER_CHANNEL_PEER</code> 生成<strong>完全相同</strong>的 key（channel 本就在第一段）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/ChannelRouter.java:204-210">ChannelRouter.java:204-210</span></td>
+              </tr>
+              <tr>
+                <td>6</td>
+                <td><code>dispatchStream</code> 被描述成「可选：流式分发」<span class="src" data-src="docs/v2/zh/docs/harness/channel.md:299-304">channel.md:299-304</span></td>
+                <td>默认实现是 <code>Flux.error("Streaming dispatch not supported")</code>，<strong>不会</strong>回退到 <code>dispatch</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/Channel.java:105-107">Channel.java:105-107</span></td>
+              </tr>
+              <tr>
+                <td>7</td>
+                <td>没提 <code>GatewayBootstrap</code> 与消息总线、唤醒器的关系</td>
+                <td><code>GatewayBootstrap.build()</code> 不建 bus；官方 <code>AsyncSubagentExample</code> 把 bus 只交给 dispatcher，而 agent 因未调 <code>.messageBus(...)</code> 会自动落到 <code>&lt;workspace&gt;/.agentscope/bus</code>——两边不是同一目录<span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/harness/async/AsyncSubagentExample.java:66-95">AsyncSubagentExample.java:66-95</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2504-2516">HarnessAgent.java:2504-2516</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">第 7 条怎么避开</span>
+          <p>
+            只需一行：把同一个 bus 实例<strong>显式</strong>交给两边——<code>HarnessAgent.builder().messageBus(bus)</code> 与 <code>new WakeupDispatcher(bus, gateway)</code>。不要依赖「它会自己找到同一个位置」，因为「位置」取决于 workspace 与 busRoot 两个变量。
+          </p>
+        </div>
+
+        <h2 id="cheatsheet">速查</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>你想要</th><th>写什么</th><th>默认值 / 坑</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>单 agent + 渠道</td><td><code>agent.channel(ChatUiChannel.perPeer())</code></td><td>无主动投递、无网关侧 bus</td></tr>
+              <tr><td>多 agent + 外部渠道</td><td><code>GatewayBootstrap.builder()…build().start()</code></td><td><code>build()</code> 不启动渠道</td></tr>
+              <tr><td>每个用户独立会话</td><td><code>ChannelConfig.builder(id).dmScope(PER_PEER)</code> 或 <code>SendOptions.userId(u)</code></td><td>默认 <code>MAIN</code>：所有人一个会话</td></tr>
+              <tr><td>按角色分派 agent</td><td><code>ChannelBinding.forGuildRoles(guild, roles, agentId)</code></td><td>roles 为空就退化成 guild tier</td></tr>
+              <tr><td>按人分派 agent</td><td><code>ChannelBinding.forPeer("direct:u_42", "support")</code></td><td>peer key 是 <code>kind:id</code></td></tr>
+              <tr><td>单条 binding 换会话粒度</td><td><code>binding.withSessionScope(DmScope.PER_PEER)</code></td><td>显式指定 agent 时也生效</td></tr>
+              <tr><td>开启异步工具卸载</td><td><code>.asyncToolTimeout(Duration)</code></td><td>不设 = 永远同步</td></tr>
+              <tr><td>接唤醒</td><td><code>new WakeupDispatcher(bus, gateway).start()</code></td><td>两侧必须同一个 bus</td></tr>
+              <tr><td>跨节点恢复暴露的子 agent</td><td><code>.distributedStore(store)</code></td><td>无 store 仅在当前进程有效</td></tr>
+              <tr><td>热更新路由</td><td><code>channel.applyRoutingConfig(cfg)</code></td><td>默认返回 <code>false</code>（需重启）</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <h3 id="trap-channel-broadcast">1. 以为 <code>agent.channel()</code> 就自带「主动播报」</h3>
+          <p>
+            它的网关没有 <code>ChannelManager</code>，<code>deliverToSession</code> 直接返回 <code>false</code>，子 agent 的 <code>replyTo</code> 投递也会被跳过。要主动播报，必须 <code>GatewayBootstrap</code>（它内部 <code>HarnessGateway.create(cm)</code>）。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h3 id="trap-msgcontext-extra">2. 往 <code>MsgContext.extra</code> 里塞 traceId / tenant</h3>
+          <p>
+            <code>extra</code> 会被拼进 <code>canonicalKey</code>，于是每个请求都是新会话，用户视角就是「聊两句就失忆」。业务属性用 <code>RuntimeContext</code>（<code>SendOptions.withAttribute</code> / resolver）。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h3 id="trap-dm-scope">3. 以为默认是「一人一会话」</h3>
+          <p>
+            <code>ChannelConfig.of(id)</code> 和 <code>ChatUiChannel.create()</code> 都是 <code>DmScope.MAIN</code>：所有私聊共用一个 <code>gw-…</code>。上线多用户前必须显式设 <code>PER_PEER</code>（或走 <code>SendOptions</code>）。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h3 id="trap-turn-gate-empty">4. 用分布式 turn gate 但没处理空结果</h3>
+          <p>
+            <code>TurnBusyException</code> 被转成 <code>Mono.empty()</code>：HTTP 层可能返回 200 + 空 body。要么客户端把空当「忙，请重试」，要么在网络层加幂等重试。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h3 id="trap-async-failure">5. 后台工具失败后，模型永远不知道</h3>
+          <p>
+            超时后如果执行抛错，代码只写 registry + 日志，不推 inbox、不唤醒。要补齐，得自己包一层工具（内部 catch 并返回文本），或监听 <code>AsyncToolRegistry</code> 做外部告警。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h3 id="trap-two-buses">6. 两条总线指向不同存储</h3>
+          <p>
+            现象：异步任务确实跑完了，但从没触发下一轮。根因几乎都是 agent 用 workspace 默认 bus、dispatcher 用手工 new 的 bus。把同一个实例显式注入两边即可。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h3 id="trap-wakeup-agent">7. 唤醒总在主 agent 上执行</h3>
+          <p>
+            <code>runWakeup</code> 用 <code>resolveAgent(null)</code>。多 agent、且各 agent 使用不同 <code>AgentStateStore</code> 时，被唤醒的那一轮加载的是主 agent 的会话历史，不是原 agent 的。需要严格隔离时，自己实现 <code>WakeupTarget</code>，按 <code>gateKey</code> 反查真正的 agent。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h3 id="trap-startup-ok">8. 把「启动无异常」当成「渠道都可用」</h3>
+          <p>
+            <code>initAll</code> / <code>startAll</code> 把单个渠道的异常吞成日志。启动后逐个确认关键渠道确实连上了，不要只看 <code>start()</code> 没抛。
+          </p>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>1. <code>ChannelConfig.builder("chatui").dmScope(PER_PEER)</code>，两个用户 u_1 / u_2 各发一句。它们的 <code>gateKey</code> 与 <code>sessionId</code> 分别是什么关系？</summary>
+          <p>
+            <code>gateKey</code> 分别为 <code>chatui|r:u_1</code> 与 <code>chatui|r:u_2</code>；<code>sessionId</code> 是 <code>"gw-" + SHA-256(gateKey)</code> 的前 12 位。两者不同，所以历史互不可见。如果把 scope 换成 <code>PER_CHANNEL_PEER</code>，结果<strong>完全一样</strong>（源码是同一个分支）；只有换成 <code>PER_ACCOUNT_CHANNEL_PEER</code> 才会多一段 <code>|g:accountId</code>。
+          </p>
+        </details>
+        <details>
+          <summary>2. 用户连发两条，第二条一直没回复，日志里只有一行 debug。最可能是什么？</summary>
+          <p>
+            命中了 <code>withGatedTurn</code> 的 <code>TurnBusyException</code> 分支，被转成 <code>Mono.empty()</code>。说明挂的是短超时的分布式 gate，而不是默认的 <code>LocalSessionTurnGate</code>（后者会阻塞排队）。排查方向：turn gate 实现 + 客户端对空结果的处理。
+          </p>
+        </details>
+        <details>
+          <summary>3. 异步工具超时后，用户收到了「正在后台处理」，然后什么都没有。按顺序检查哪四件事？</summary>
+          <p>
+            ① <code>asyncToolTimeout</code> 设了吗（否则压根不卸载）；② <code>messageBus</code> 两侧是不是同一个（否则结果写进 A、没人读 B）；③ 有 <code>WakeupDispatcher.start()</code> 吗（否则队列没人消费）；④ 网关有没有 <code>ChannelManager</code> 且该会话记过 <code>outboundAddress</code>（否则回话没人投递）。若这四件都对，再看后台是否抛异常——那条路不会进 inbox。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">看一次会话键</span>
+            <div>
+              用 <code>ChatUiChannel</code> + <code>PER_PEER</code>，发送前调 <code>previewRoute(InboundMessage.dm("chatui", "u_1", msgs))</code>，打印 <code>context().canonicalKey()</code>、<code>agentId()</code>、<code>matchedBy()</code>。再故意把 binding 的 agentId 写成不存在的名字，确认仍是「有结果、但落到主 agent」，且 <code>matchedBy</code> 仍是 <code>peer</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">验证 <code>extra</code> 会打散会话</span>
+            <div>
+              同一用户连续两轮，第二轮在 <code>MsgContext.extra</code> 里加一个 <code>traceId</code>。观察第二轮是否「失忆」（模型看不到上一轮）。再把 <code>traceId</code> 改放到 <code>RuntimeContext</code>，确认记忆恢复正常。
+            </div>
+          </li>
+          <li>
+            <span class="sh">跑通一条异步链路</span>
+            <div>
+              造一个「睡 3 秒」的工具，<code>.asyncToolTimeout(Duration.ofSeconds(1))</code>，并把<strong>同一个</strong> <code>WorkspaceMessageBus</code> 显式交给 agent 与 <code>WakeupDispatcher</code>。预期：第一轮立刻收到占位结果；约 3~4 秒后（文件总线 3 秒轮询）agent 自动发起第二轮，事件流里出现一条 <code>HintBlockEvent</code>，且其 <code>hintSource</code> 为 <code>tool_output</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">把异步失败那条路照亮</span>
+            <div>
+              让同一个工具在 2 秒后 <code>throw new RuntimeException("boom")</code>。观察：占位结果照旧；之后<strong>没有</strong> HintBlock、没有唤醒，只有一条 warn 日志「Background tool execution failed after timeout」。这正好印证陷阱 5。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">完成这一章之后</h2>
+        <p>
+          到这里，「Harness 工程能力」七章就闭环了：工作区与文件系统（12）、沙箱（13）、子 agent 与团队（14）、上下文压缩与记忆（15）、技能（16）、计划模式与工具装配（17），以及这一章的服务化外壳（18）。回看会发现它们共用同一条主线——<strong>所有能力都在 <code>build()</code> 里装配，在中间件里生效，在 <code>RuntimeContext</code> 里识别会话</strong>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="17-plan-mode-tools.html">17 计划模式、工具装配与 MCP</a></td><td><code>ToolFilter</code> 在 <code>build()</code> 的哪一步、与本章的工具注册顺序怎么咬合</td></tr>
+              <tr><td><a href="14-subagent-team.html">14 子 agent 与团队</a></td><td>本章的 <code>exposeSubagent</code> / <code>runSubagent</code> 是它的服务化延伸</td></tr>
+              <tr><td><a href="12-workspace-filesystem.html">12 工作区与文件系统</a></td><td><code>.agentscope/bus</code> 就在工作区里，隔离与 overlay 规则同源</td></tr>
+              <tr><td><a href="../appendix/glossary.html#harness">附录 A：Harness 专有名词</a></td><td>Gateway / Channel / DmScope / Wakeup 的术语对照</td></tr>
+              <tr><td><a href="../appendix/source-map.html#paths">附录 D：六条追踪路线</a></td><td>第六条就是「渠道消息没回复 / 后台结果不回来」，从 <code>dispatch</code> 一路跟到 <code>runWakeup</code></td></tr>
+              <tr><td>官方 <code>docs/v2/zh/docs/harness/channel.md</code></td><td>路由与会话部分可看；总线、异步、唤醒三处以本章为准</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">一句话记住这一章</span>
+          <p>
+            会话键是 <strong><code>channel|g|r|t|ts|x</code></strong>（<code>extra</code> 也算）、sessionId 是 <strong>前 12 位 hash</strong>、同会话靠<strong>公平信号量</strong>串行；路由是 <strong>1 显式 + 7 层 binding + 2 层兜底</strong>、tier 内按列表顺序；异步是 <strong>超时 → 占位 → inbox + wakeup</strong>；而「主动播报与跨节点恢复」只有 <code>GatewayBootstrap</code> + <code>ChannelManager</code> + <code>distributedStore</code> 这条完整链路才有。
+          </p>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

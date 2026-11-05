@@ -1,0 +1,889 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="30 行代码写一个「有记忆」的智能体：第一轮告诉它你叫什么，第二轮用同一个会话问「我叫什么」，它答得出来。本章把 HarnessAgent.builder() 上每个链式调用拆开，并告诉你跑完之后硬盘上多出来的两棵目录树各自是什么。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="02 第一个 Agent：HarnessAgent 逐参数拆解 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="30 行代码写一个「有记忆」的智能体：第一轮告诉它你叫什么，第二轮用同一个会话问「我叫什么」，它答得出来。本章把 HarnessAgent.builder() 上每个链式调用拆开，并告诉你跑完之后硬盘上多出来的两棵目录树各自是什么。" />
+    <title>02 第一个 Agent：HarnessAgent 逐参数拆解 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="02-first-agent" data-root="..">
+    <main>
+      <article class="article">
+        <h1>02 · 第一个 Agent</h1>
+        <p class="lede">
+          30 行代码写一个「有记忆」的智能体：第一轮告诉它你叫什么，第二轮用同一个会话问「我叫什么」，它答得出来。
+          本章把 <code>HarnessAgent.builder()</code> 上每个链式调用拆开，并告诉你跑完之后硬盘上多出来的两棵目录
+          树各自是什么。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>不看文档、自己写出一个能跑两轮且第二轮记得第一轮内容的 Java 程序</li>
+          <li>
+            说出 <code>name</code> / <code>sysPrompt</code> / <code>model</code> / <code>workspace</code> /
+            <code>compaction</code> 各自在哪一步生效，以及它们的<strong>默认值</strong>
+          </li>
+          <li>
+            解释 <code>RuntimeContext</code> 里的 <code>userId</code> 和 <code>sessionId</code>
+            是怎么变成磁盘路径的，从而能预判「换个 sessionId 会发生什么」
+          </li>
+        </ul>
+
+        <h2 id="why">先说为什么：第一个例子为什么不是 <code>ReActAgent</code></h2>
+        <p>
+          框架里有两个入口。<code>ReActAgent</code> 在 <code>agentscope-core</code>，是纯粹的「推理 → 调工具 →
+          观察 → 再推理」循环引擎；<code>HarnessAgent</code> 在 <code>agentscope-harness</code>，内部
+          <strong>包着一个</strong> <code>ReActAgent</code>，在外面套上工作区、会话持久化、长期记忆、对话压缩、子
+          agent、沙箱这些工程能力。
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">HarnessAgent</span>
+            <div class="ld">
+              工作区目录 + 人格文件 + 会话状态落盘 + 压缩 + 长期记忆 + 工具与技能装载。<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1196"
+                >HarnessAgent.java:1196</span
+              >
+              —— <code>Builder</code> 里第一个字段就是 <code>ReActAgent.Builder inner</code>，说明它是包装而非
+              平行实现。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">ReActAgent</span>
+            <div class="ld">推理循环本体：模型调用、工具执行、迭代控制</div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">Model / Toolkit / Memory / Permission / Middleware</span>
+            <div class="ld">循环每一步用到的零件，04 ~ 09 章逐个拆开</div>
+          </div>
+        </div>
+        <p>
+          官方文档同样把 <code>HarnessAgent</code> 定为推荐入口，理由很直接：<em>「把工作区、长期记忆、会话持久
+          化、子 agent、沙箱等工程能力打包在一个 builder 里」</em>。<span
+            class="src"
+            data-src="docs/v2/zh/docs/quickstart.md:13"
+            >quickstart.md:13</span
+          >
+        </p>
+        <div class="callout">
+          <span class="ct">那什么时候该从 <code>ReActAgent</code> 开始</span>
+          <p>
+            当你<strong>只</strong>需要「把消息发给模型、模型爱调哪个工具就调哪个工具」的 API，不需要工作区、不需
+            要跨进程恢复状态时，<code>agentscope-core</code> 就够了。<span
+              class="src"
+              data-src="docs/v2/zh/docs/quickstart.md:31"
+              >quickstart.md:31</span
+            >
+            第 10 章会把两者摆在一起做选型对比。本章先用 <code>HarnessAgent</code>，因为「第二轮记得第一轮」是
+            最容易让人一眼确认「框架真的在管状态」的现象。
+          </p>
+        </div>
+
+        <h2 id="minimal">最小可跑：30 行写完一个有记忆的 Agent</h2>
+
+        <h3 id="step-deps">第 1 步：两个依赖</h3>
+        <p>
+          <code>agentscope-harness</code> 会把核心 <code>agentscope-core</code> 一并拉进来<span
+            class="src"
+            data-src="agentscope-harness/pom.xml:36"
+            >agentscope-harness/pom.xml:36</span
+          >；但<strong>模型提供商不在里面</strong>，它是独立模块。
+        </p>
+        <pre data-lang="xml" data-file="pom.xml">&lt;dependencies&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;io.agentscope&lt;/groupId&gt;
+    &lt;artifactId&gt;agentscope-harness&lt;/artifactId&gt;
+    &lt;version&gt;2.0.4&lt;/version&gt;
+  &lt;/dependency&gt;
+
+  &lt;!-- 用哪家模型就加哪家的扩展模块；不加就解析不出 "dashscope:xxx" 这个 model id --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;io.agentscope&lt;/groupId&gt;
+    &lt;artifactId&gt;agentscope-extensions-model-dashscope&lt;/artifactId&gt;
+    &lt;version&gt;2.0.4&lt;/version&gt;
+  &lt;/dependency&gt;
+&lt;/dependencies&gt;
+
+&lt;properties&gt;
+  &lt;maven.compiler.source&gt;17&lt;/maven.compiler.source&gt;
+  &lt;maven.compiler.target&gt;17&lt;/maven.compiler.target&gt;
+&lt;/properties&gt;</pre>
+        <p class="src-line">
+          版本 2.0.4 的出处：<span class="src" data-src="pom.xml:30">pom.xml:30</span>；最低 JDK 17 的出处：<span
+            class="src"
+            data-src="pom.xml:33"
+            >pom.xml:33</span
+          >
+        </p>
+
+        <h3 id="step-api-key">第 2 步：设一个 API Key</h3>
+        <div class="tabs">
+          <pre data-lang="bash" data-file="PowerShell" class="tab-panel" data-label="PowerShell">$env:DASHSCOPE_API_KEY = "sk-你的key"
+
+# 永久生效（要重开终端才读得到）
+[Environment]::SetEnvironmentVariable("DASHSCOPE_API_KEY", "sk-你的key", "User")</pre>
+          <pre data-lang="bash" data-file="bash / zsh" class="tab-panel" data-label="bash / zsh">export DASHSCOPE_API_KEY=sk-你的key</pre>
+        </div>
+        <div class="callout tip">
+          <span class="ct">为什么框架要自己去读环境变量</span>
+          <p>
+            <code>.model("dashscope:qwen-plus")</code> 这个字符串由 <code>ModelRegistry</code> 解析，它会按
+            provider 名定位到对应扩展模块并<strong>自动读取该 provider 的 API key 环境变量</strong>。<span
+              class="src"
+              data-src="docs/v2/zh/docs/quickstart.md:47"
+              >quickstart.md:47</span
+            >
+            所以你在代码里看不到任何密钥 —— 这是刻意设计。要显式传 key、改 endpoint 或控超时，就用该提供商的
+            builder 造一个 <code>Model</code> 实例传给 <code>.model(Model)</code>，05 章细讲。
+          </p>
+        </div>
+
+        <h3 id="step-main">第 3 步：主程序</h3>
+        <p>
+          下面这份文件与官方 quickstart 的例子<strong>逐字一致</strong>（包括注释），复制即可编译：<span
+            class="src"
+            data-src="docs/v2/zh/docs/quickstart.md:49"
+            >quickstart.md:49</span
+          >
+        </p>
+        <pre data-lang="java" data-file="FirstAgent.java">import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.UserMessage;
+import io.agentscope.harness.agent.HarnessAgent;
+import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
+import java.nio.file.Paths;
+
+public class FirstAgent {
+    public static void main(String[] args) {
+        HarnessAgent agent = HarnessAgent.builder()
+                .name("note-taker")
+                .sysPrompt("你是一个帮助用户做笔记的助手。")
+                // 字符串形式由 ModelRegistry 解析 —— 自动读取 DASHSCOPE_API_KEY；
+                // 切换其他厂商时改用 "openai:gpt-5.5"、"anthropic:claude-sonnet-4-5"、
+                // "gemini:gemini-2.0-flash" 或 "ollama:llama3"。
+                .model("dashscope:qwen-plus")
+                .workspace(Paths.get(".agentscope/workspace"))
+                .compaction(CompactionConfig.builder()
+                        .triggerMessages(30)
+                        .keepMessages(10)
+                        .build())
+                .build();
+
+        RuntimeContext ctx = RuntimeContext.builder()
+                .sessionId("demo-session")
+                .userId("alice")
+                .build();
+
+        // 第一轮：自我介绍 + 当天的事
+        agent.call(new UserMessage("我叫天宇，今天准备一个关于 ReAct 的技术分享。"), ctx).block();
+
+        // 第二轮：同 sessionId，自动恢复上一轮状态后回答
+        agent.call(new UserMessage("我叫什么？我今天要干什么？"), ctx).block();
+    }
+}</pre>
+        <p>
+          官方例子<strong>不打印返回值</strong>，靠「第二轮能不能答对」来证明状态生效。想亲眼看输出，把第二轮那一行换成：
+        </p>
+        <pre data-lang="java" data-file="打印结果（只改第二轮）">var answer = agent.call(new UserMessage("我叫什么？我今天要干什么？"), ctx).block();
+System.out.println(answer.getTextContent());</pre>
+        <div class="callout tip">
+          <span class="ct">关于 <code>getTextContent()</code></span>
+          <p>
+            <code>Msg.getTextContent()</code> 会把消息里所有 <code>TextBlock</code> 的文本用换行拼接后返回（没
+            有文本块时返回空串）<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:544"
+              >Msg.java:544</span
+            >。工具调用、思考块这些内容它不会给你 —— 内容的完整结构在 04 章展开；要实时看过程请用下面的
+            <code>streamEvents()</code>。
+          </p>
+        </div>
+
+        <div class="callout">
+          <span class="ct">顺手能拿到的两个有用信息</span>
+          <p>
+            拿到返回值 <code>Msg</code> 之后，除了正文还可以读：<code>getGenerateReason()</code> 告诉你这一轮是<strong
+              >为什么停下</strong
+            >
+            的（取值包括 <code>MODEL_STOP</code>、<code>MAX_ITERATIONS</code>、<code>INTERRUPTED</code>、
+            <code>TOOL_SUSPENDED</code>、<code>ACTING_STOP_REQUESTED</code> 等）<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:639"
+              >Msg.java:639</span
+            >；<code>getChatUsage()</code> 给你 token 与耗时统计<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:579"
+              >Msg.java:579</span
+            >。「回了一句莫名其妙的话」很多时候就是 <code>MAX_ITERATIONS</code>，先读它再改代码。06 /
+            10 章会分别用到这两个。注意它们都是 <code>@Transient @JsonIgnore</code>，存在
+            <code>metadata</code> 里而不是序列化后的状态文件里。
+          </p>
+        </div>
+
+        <h3 id="step-run">第 4 步：跑起来，看两棵目录树</h3>
+        <pre data-lang="bash" data-file="运行命令"># 在项目根目录
+mvn -q compile exec:java -Dexec.mainClass=FirstAgent</pre>
+        <p>跑完之后，硬盘上会多出两棵目录树（这是本章最重要的观察点）：</p>
+        <div class="tree">&lt;项目目录&gt;/.agentscope/workspace/          ← 工作区：agent 的「内容」
+├── AGENTS.md                        ← 写一份就是 agent 的人格（不写也能跑）
+└── agents/note-taker/
+    └── sessions/                    ← 永不压缩的原始对话日志
+
+&lt;你的家目录&gt;/.agentscope/state/note-taker/   ← 状态存储：故意放在工作区<strong>外面</strong>
+└── alice/                           ← userId
+    └── demo-session/                ← sessionId
+        ├── agent_state.json         ← AgentState 自动写回 / 加载
+        ├── memory_messages.jsonl    ← 记忆消息（逐行 JSON）
+        └── memory_messages.hash     ← 用于判断是追加还是整体重写</div>
+        <p class="src-line">
+          工作区那棵树出自官方文档 <span class="src" data-src="docs/v2/zh/docs/quickstart.md:88">quickstart.md:88</span>；
+          状态目录的三个文件名与 <code>__anon__</code> 规则出自实现 <span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:44"
+            >JsonFileAgentStateStore.java:44</span
+          >
+        </p>
+        <div class="callout tip">
+          <span class="ct">Windows 上「家目录」是哪儿</span>
+          <p>
+            代码是 <code>System.getProperty("user.home")</code><span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:84"
+              >JsonFileAgentStateStore.java:84</span
+            >，Windows 下通常是 <code>C:\Users\你的用户名\.agentscope\state\...</code>，用
+            <code>explorer $env:USERPROFILE\.agentscope</code> 直接打开。想改根目录，设 JVM 系统属性
+            <code>-Dagentscope.state.home=D:\as-state</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1134"
+              >HarnessAgent.java:1134</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="line-by-line">逐行解读：只讲容易懵的行</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>这一行</th>
+                <th>容易懵的点</th>
+                <th>实际上</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>.name("note-taker")</code></td>
+                <td>只是个显示名？</td>
+                <td>
+                  没设 <code>agentId(...)</code> 时，它<strong>就是</strong> <code>agentId</code>，直接决定状态目
+                  录名。解析顺序：<code>agentId</code> &gt; <code>name</code> &gt; 兜底
+                  <code>"ReActAgent"</code><span
+                    class="src"
+                    data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2377"
+                    >HarnessAgent.java:2377</span
+                  >
+                </td>
+              </tr>
+              <tr>
+                <td><code>.sysPrompt("…")</code></td>
+                <td>和工作区里的 <code>AGENTS.md</code> 什么关系？</td>
+                <td>
+                  两个都会进 system prompt：<code>sysPrompt</code> 是代码里写死的部分，<code>AGENTS.md</code>
+                  由工作区上下文中间件在推理前拼进去。后者可被非开发角色修改，前者要重新发版。
+                </td>
+              </tr>
+              <tr>
+                <td><code>.model("dashscope:qwen-plus")</code></td>
+                <td>为什么能传字符串？</td>
+                <td>
+                  <code>model</code> 有两个重载：<code>model(Model)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1530">:1530</span>
+                  与 <code>model(String modelId)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1536">:1536</span>。
+                  字符串走 <code>ModelRegistry</code>，顺手把 API key 环境变量读了；需要控超时/endpoint 时改用它负
+                  载的那个 builder 版
+                </td>
+              </tr>
+              <tr>
+                <td><code>.workspace(Paths.get(".agentscope/workspace"))</code></td>
+                <td>不写会怎样？</td>
+                <td>
+                  会走默认解析顺序：<code>agentscope.workspace</code> 系统属性 →
+                  <code>AGENTSCOPE_WORKSPACE</code> 环境变量 → <code>${user.dir}/.agentscope/workspace</code><span
+                    class="src"
+                    data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1166"
+                    >HarnessAgent.java:1166</span
+                  >。注意是 <code>user.dir</code>（进程启动目录），不是你想象的「项目根」——IDE 里改过
+                  working directory 就会找错地方。
+                </td>
+              </tr>
+              <tr>
+                <td><code>.compaction(CompactionConfig.builder().triggerMessages(30).keepMessages(10).build())</code></td>
+                <td>阈值 30 / 10 是必须给的吗？</td>
+                <td>
+                  不是。默认已经是 <code>triggerMessages=50</code>、<code>keepMessages=20</code>、
+                  <code>triggerTokens=0</code>（动态模式：用模型上下文窗口减去 <code>reserved=20000</code> 计
+                  算）<span
+                    class="src"
+                    data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/CompactionConfig.java:273"
+                    >CompactionConfig.java:273</span
+                  >。例子里调小到 30/10 只是为了让你<strong>快点看到压缩发生</strong>。
+                </td>
+              </tr>
+              <tr>
+                <td><code>RuntimeContext ctx = RuntimeContext.builder().sessionId(...).userId(...).build()</code></td>
+                <td>为什么状态要 caller 每次传？</td>
+                <td>
+                  因为 agent 实例在调用之间是<strong>无状态</strong>的：同一个实例可以同时服务多个用户、多个会话，
+                  是谁的上下文由这次调用决定，而不是由实例决定。
+                </td>
+              </tr>
+              <tr>
+                <td><code>agent.call(msg, ctx).block()</code></td>
+                <td>这个 <code>.block()</code> 能删吗？</td>
+                <td>
+                  <code>call</code> 返回 <code>Mono&lt;Msg&gt;</code><span
+                    class="src"
+                    data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:732"
+                    >HarnessAgent.java:732</span
+                  >；<code>Mono</code> 是「惰性的一次计算」，不订阅就什么都不会发生。<code>main</code>
+                  里用 <code>.block()</code> 同步等结果最省心。响应式细节见 03 章，那里也讲了<strong>什么情况
+                  下 <code>.block()</code> 会把你的程序卡死</strong>。
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="params">Builder 参数逐个拆（含默认值）</h2>
+        <p>
+          <code>HarnessAgent.Builder</code> 一共有 <strong>86 个</strong>不同的方法名<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1194"
+            >HarnessAgent.java:1194</span
+          >，看起来吓人，但本章只碰 5 个，剩下按能力分组在附录 C 里给全。下面是「你现在就该知道的默认值」——它们
+          全部取自 Builder 字段声明，不是文档措辞：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>字段 / 方法</th>
+                <th>默认值</th>
+                <th>出处</th>
+                <th>什么时候要改</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>maxIters</code></td>
+                <td><code>10</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1209">HarnessAgent.java:1209</span></td>
+                <td>任务需要十几轮工具调用时调大；调小可以省钱</td>
+              </tr>
+              <tr>
+                <td><code>checkRunning</code></td>
+                <td><code>true</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1205">:1205</span></td>
+                <td>同一 session 正在跑时的保护，一般别关</td>
+              </tr>
+              <tr>
+                <td><code>enablePendingToolRecovery</code></td>
+                <td><code>false</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1206">:1206</span></td>
+                <td>做人机交互 / 外部工具执行时才打开（08 章）</td>
+              </tr>
+              <tr>
+                <td><code>toolkit</code></td>
+                <td>新建的空 <code>Toolkit</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1208">:1208</span></td>
+                <td>有自定义工具时传注册好的（06 章）</td>
+              </tr>
+              <tr>
+                <td><code>compactionConfig</code></td>
+                <td><code>CompactionConfig.builder().build()</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1227">:1227</span></td>
+                <td>即默认就启用压缩；<code>disableCompaction()</code> 可关</td>
+              </tr>
+              <tr>
+                <td><code>agentTracingLogEnabled</code></td>
+                <td><code>true</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1226">:1226</span></td>
+                <td>调试期很有用，嫌日志吵可用 <code>enableAgentTracingLog(false)</code></td>
+              </tr>
+              <tr>
+                <td><code>maxContextTokens</code></td>
+                <td><code>8000</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1240">:1240</span></td>
+                <td>工作区上下文注入 system prompt 的预算</td>
+              </tr>
+              <tr>
+                <td><code>environment</code></td>
+                <td><code>"prod"</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1269">:1269</span></td>
+                <td>技能可见性过滤用（技能章节，后续轮次）</td>
+              </tr>
+              <tr>
+                <td><code>filesystem</code></td>
+                <td>未指定 → 本机 + shell</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1833">:1833</span>（三个重载）</td>
+                <td>共享存储 / 沙箱模式时（后续轮次）</td>
+              </tr>
+              <tr>
+                <td><code>stateStore</code></td>
+                <td>未指定 → 本地文件实现，根目录 <code>~/.agentscope/state/&lt;agentId&gt;/</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2427">:2427</span></td>
+                <td>多副本部署必须换成分布式实现（07 章）</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="runtime-context"><code>RuntimeContext</code>：userId 与 sessionId 决定一切</h2>
+        <p>
+          这两个字符串不是装饰。它们直接拼成磁盘路径，而路径就是隔离边界：
+        </p>
+        <div class="flow">
+          <div class="node">
+            <span class="nt">RuntimeContext</span>
+            <span class="nd"><code>userId="alice"</code><br /><code>sessionId="demo-session"</code></span>
+          </div>
+          <div class="arrow">→</div>
+          <div class="node">
+            <span class="nt">命名空间化</span>
+            <span class="nd"><code>userId</code> 为 null 时落到哨兵目录 <code>__anon__</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:72">JsonFile…java:72</span></span>
+          </div>
+          <div class="arrow">→</div>
+          <div class="node hl">
+            <span class="nt">磁盘路径</span>
+            <span class="nd"><code>…/note-taker/alice/demo-session/agent_state.json</code></span>
+          </div>
+        </div>
+        <p>
+          文件系统对名字有脾气，所以框架做了转义：只有匹配 <code>^[a-zA-Z0-9_\-.]+$</code> 的 id
+          原样当目录名，否则做无填充的 Base64-URL 编码<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:75"
+            >JsonFileAgentStateStore.java:75</span
+          >。也就是说 <code>sessionId</code> 里带空格、斜杠、中文都能跑，但你在磁盘上看到的是编码后的怪名字。
+        </p>
+        <div class="callout">
+          <span class="ct">并发语义（很多人踩）</span>
+          <p>
+            同一 <code>(userId, sessionId)</code> 的请求会被<strong>自动串行化</strong>，不会并发写同一份状态；
+            不同 session 完全并行。<span class="src" data-src="docs/v2/zh/docs/quickstart.md:173">quickstart.md:173</span>
+            这就是为什么「一个 agent 实例 + 每个请求换 <code>RuntimeContext</code>」是正确用法，而「每个请求 new
+            一个 agent」是错的（工作区、模型连接都被白白重建）。
+          </p>
+        </div>
+
+        <h2 id="call-vs-stream"><code>call()</code> 与 <code>streamEvents()</code></h2>
+        <p>
+          同一件事的两种拿法。<code>call</code> 给你最终一条 <code>Msg</code>（<code>Mono&lt;Msg&gt;</code>），
+          <code>streamEvents</code> 给你全过程的事件流（<code>Flux&lt;AgentEvent&gt;</code>）<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:881"
+            >HarnessAgent.java:881</span
+          >。做 Web / CLI 界面一定要用后者，否则用户会盯着空白屏幕等 20 秒。
+        </p>
+        <pre data-lang="java" data-file="StreamDemo.java（接上文的 agent 与 ctx）">import io.agentscope.core.event.AgentEventType;
+import io.agentscope.core.event.TextBlockDeltaEvent;
+import io.agentscope.core.event.ToolCallStartEvent;
+import io.agentscope.core.message.UserMessage;
+
+agent.streamEvents(new UserMessage("帮我把今天的关键点列三条。"), ctx)
+        .doOnNext(event -&gt; {
+            if (event.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
+                // 模型流式返回的文本片段 —— 追加到界面或标准输出
+                System.out.print(((TextBlockDeltaEvent) event).getDelta());
+            } else if (event.getType() == AgentEventType.TOOL_CALL_START) {
+                // agent 即将调用某个工具 —— 展示调用信息
+                System.out.println("\n[tool] " + ((ToolCallStartEvent) event).getToolCallName());
+            }
+            // 其余事件（思考块、工具结果、回复结束……）04 章逐个讲
+        })
+        .blockLast();   // 等整个流跑完；GUI 程序里千万别这么写，见 03 章</pre>
+        <p>
+          仓库里的示例用的是 Java 16 的 <code>instanceof</code> 模式匹配写法<span
+            class="src"
+            data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/quickstart/BasicChatExample.java:89"
+            >BasicChatExample.java:89</span
+          >：
+        </p>
+        <pre data-lang="java" data-file="同样效果，写法更短">agent.streamEvents(userMsg)
+        .doOnNext(event -&gt; {
+            if (event instanceof TextBlockDeltaEvent e) {
+                System.out.print(e.getDelta());
+            }
+        })
+        .blockLast();</pre>
+        <div class="callout tip">
+          <span class="ct"><code>observe()</code>：只喂上下文，不要回答</span>
+          <p>
+            <code>HarnessAgent</code> 还有 <code>observe(Msg)</code> / <code>observe(List&lt;Msg&gt;)</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:927"
+              >HarnessAgent.java:927</span
+            >，把消息塞进记忆但不触发推理。适合「先把背景资料喂进去，等问题真正出现再让它说话」。
+          </p>
+        </div>
+
+        <h2 id="ondisk">端到端：一次运行到底发生了什么</h2>
+        <p>把上面那两行 <code>call()</code> 摊开成时间轴（第二轮的差别只有前面三步）：</p>
+        <ul class="timeline">
+          <li>
+            <div class="who">你的代码</div>
+            <div class="what"><code>new UserMessage("我叫天宇，…")</code> + <code>RuntimeContext(alice, demo-session)</code></div>
+          </li>
+          <li>
+            <div class="who">HarnessAgent</div>
+            <div class="what">
+              拿 <code>(alice, demo-session)</code> 去 <code>AgentStateStore</code> 找
+              <code>agent_state.json</code>；找到就恢复，找不到就从空白开始
+            </div>
+          </li>
+          <li>
+            <div class="who">工作区</div>
+            <div class="what">
+              工作区上下文中间件把 <code>AGENTS.md</code> / <code>MEMORY.md</code> 等按预算（默认
+              <code>maxContextTokens=8000</code>）拼进 system prompt
+            </div>
+          </li>
+          <li>
+            <div class="who">压缩检查</div>
+            <div class="what">
+              消息数或 token 超阈值？超了就先把老对话压成摘要，原始对话另存到 session 日志（<strong>原始日志永
+              不压缩</strong>）
+            </div>
+          </li>
+          <li>
+            <div class="who">ReAct 循环</div>
+            <div class="what">
+              <div class="loop">
+                <div class="lp model">推理<small>把 system prompt + 历史 + 工具 schema 发给模型</small></div>
+                <div class="lp-arrow">→</div>
+                <div class="lp tool">行动<small>模型要调工具就执行，结果作为内容块回填</small></div>
+                <div class="lp-arrow">→</div>
+                <div class="lp">观察<small>把工具结果并入上下文</small></div>
+                <div class="lp-arrow">↻</div>
+                <div class="lp stop">收敛<small>模型不再要求调工具 → 出最终答案；最多 10 轮</small></div>
+              </div>
+            </div>
+          </li>
+          <li>
+            <div class="who">事件流</div>
+            <div class="what">过程中每一点进展都变成 <code>AgentEvent</code> 推给订阅者（文本片段、工具调用开始/结束……）</div>
+          </li>
+          <li>
+            <div class="who">落盘</div>
+            <div class="what"><code>AgentState</code> 写回 <code>agent_state.json</code>，记忆消息追加到 <code>memory_messages.jsonl</code> 并更新 <code>.hash</code></div>
+          </li>
+          <li>
+            <div class="who">第二轮</div>
+            <div class="what">同 <code>(alice, demo-session)</code> → 读回同一份状态 → 它记得你叫什么</div>
+          </li>
+        </ul>
+        <div class="swim">
+          <div class="lane">
+            <div class="lh">内存里（这次调用期间）</div>
+            <div class="lb">
+              <ul>
+                <li>对话上下文：<code>Msg</code> 列表</li>
+                <li>待执行的工具调用与结果块</li>
+                <li>事件流：<code>Flux&lt;AgentEvent&gt;</code></li>
+              </ul>
+            </div>
+          </div>
+          <div class="lane">
+            <div class="lh">磁盘上（跨进程活着）</div>
+            <div class="lb">
+              <ul>
+                <li><code>agent_state.json</code>：恢复上下文的前提</li>
+                <li><code>memory_messages.jsonl</code> + <code>.hash</code>：追加或整体重写的判据</li>
+                <li><code>workspace/agents/&lt;name&gt;/sessions/</code>：未压缩原始对话日志</li>
+                <li><code>workspace/memory/YYYY-MM-DD.md</code> → 定期合并进 <code>MEMORY.md</code><span class="src" data-src="docs/v2/zh/docs/quickstart.md:109">quickstart.md:109</span></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+        <div class="callout">
+          <span class="ct">为什么状态故意不放在工作区里</span>
+          <p>
+            因为状态是<strong>恢复工作区的前提</strong>（比如沙箱被清空后，要先有状态才能重建工作区），两者不能互
+            相依赖。<span class="src" data-src="docs/v2/zh/docs/quickstart.md:99">quickstart.md:99</span>
+            这也解释了为什么 <code>stateStore(...)</code> 的默认根目录是 <code>~/.agentscope/state/&lt;agentId&gt;/</code>
+            而不是工作区子目录<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1134"
+              >HarnessAgent.java:1134</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="cheatsheet">API 速查表</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>你想干什么</th>
+                <th>写什么</th>
+                <th>出处</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>建一个 agent</td>
+                <td><code>HarnessAgent.builder()…build()</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1118">HarnessAgent.java:1118</span></td>
+              </tr>
+              <tr>
+                <td>问一次，拿最终消息</td>
+                <td><code>Mono&lt;Msg&gt; call(Msg, RuntimeContext)</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:732">:732</span></td>
+              </tr>
+              <tr>
+                <td>直接传字符串提问</td>
+                <td><code>call(String, RuntimeContext)</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:743">:743</span></td>
+              </tr>
+              <tr>
+                <td>一次喂多条消息</td>
+                <td><code>call(List&lt;Msg&gt;, RuntimeContext)</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:747">:747</span></td>
+              </tr>
+              <tr>
+                <td>要结构化输出的 call</td>
+                <td><code>call(List&lt;Msg&gt;, Class&lt;?&gt;)</code> / <code>call(List&lt;Msg&gt;, JsonNode)</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:718">:718</span> / <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:728">:728</span></td>
+              </tr>
+              <tr>
+                <td>看过程（流式）</td>
+                <td><code>Flux&lt;AgentEvent&gt; streamEvents(Msg, RuntimeContext)</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:881">:881</span></td>
+              </tr>
+              <tr>
+                <td>只喂料不回答</td>
+                <td><code>Mono&lt;Void&gt; observe(Msg)</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:927">:927</span></td>
+              </tr>
+              <tr>
+                <td>释放底层资源</td>
+                <td><code>agent.close()</code>（<code>HarnessAgent implements Agent, AutoCloseable</code>）</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:454">:454</span> / <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:169">:169</span></td>
+              </tr>
+              <tr>
+                <td>指定状态存储</td>
+                <td><code>builder.stateStore(AgentStateStore)</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1631">:1631</span></td>
+              </tr>
+              <tr>
+                <td>指定权限上下文</td>
+                <td><code>builder.permissionContext(PermissionContextState)</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1724">:1724</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+
+        <div class="pitfall">
+          <div class="pf-h">1. 换了 <code>sessionId</code>，agent「失忆」了</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>第二轮问「我叫什么」，它一脸茫然地反问。</dd>
+            <dt>因为</dt>
+            <dd>状态的隔离粒度就是 <code>(userId, sessionId)</code>。换 <code>sessionId</code> 等于开新会话，读的是另一个目录。</dd>
+            <dt>改成</dt>
+            <dd>同一轮对话请保持同一个 <code>sessionId</code>；想「清空记忆」才换。<code>userId</code> 为空时会落到 <code>__anon__</code> 目录，容易和别的匿名会话串在一起——正式一点就 always 显式给。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">2. 工作区跑到了奇怪的地方</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>AGENTS.md</code> 写了却没生效；或者项目里冒出一个 <code>.agentscope/</code>，不是你放的那个。</dd>
+            <dt>因为</dt>
+            <dd>没调 <code>workspace(...)</code> 时默认解析到 <code>${user.dir}/.agentscope/workspace</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1175">:1175</span>，而 IDE 的 working directory 常常是模块目录甚至项目根之外；此外系统属性和环境变量优先级更高，容器里注入过就会悄悄改路径。</dd>
+            <dt>改成</dt>
+            <dd>开发期显式写 <code>workspace(Paths.get(...))</code>；排查时打印 <code>System.getProperty("user.dir")</code>，并检查 <code>AGENTSCOPE_WORKSPACE</code> 是否被设过。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">3. <code>程序直接退出，什么都没打印</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>命令秒退，控制台一片空白，也没有报错。</dd>
+            <dt>因为</dt>
+            <dd>你写了 <code>agent.call(msg, ctx)</code> 但没订阅（没 <code>.block()</code>）。<code>Mono</code> 是惰性描述，不订阅就永远不会执行。</dd>
+            <dt>改成</dt>
+            <dd><code>main</code> 里 <code>.block()</code>；流式用 <code>.blockLast()</code>。想非阻塞就 <code>.subscribe()</code>，但要处理异常与线程。03 章把这三种写法的差异讲透。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">4. <code>Model id "dashscope:qwen-plus" 无法解析</code>（或类似）</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>启动就抛异常，提示找不到模型 / provider。</dd>
+            <dt>因为</dt>
+            <dd>模型提供商是<strong>独立模块</strong>，<code>agentscope-harness</code> 只带核心，不带任何厂商实现。字符串 model id 需要 <code>ModelRegistry</code> 找到对应扩展。</dd>
+            <dt>改成</dt>
+            <dd>加上 <code>agentscope-extensions-model-&lt;provider&gt;</code> 依赖（本章第 1 步第二个依赖）。切换厂商 = 换模块 + 换字符串 + 换环境变量，三件事一起做。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">5. 以为「等很久才会压缩」，于是压根没验证过压缩</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>聊十几轮，上下文一点没变短。</dd>
+            <dt>因为</dt>
+            <dd>默认阈值是 <code>triggerMessages=50</code>；另一种触发是动态 token 模式（<code>triggerTokens=0</code> 时用模型上下文窗口减 <code>reserved=20000</code> 计算，模型没上报窗口大小时兜底 <code>160000</code>）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/CompactionConfig.java:67">CompactionConfig.java:67</span>。</dd>
+            <dt>改成</dt>
+            <dd>学习期就照例子调成 <code>triggerMessages(30).keepMessages(10)</code>，多聊几轮就能看到事实落到 <code>workspace/memory/YYYY-MM-DD.md</code> 并被合并进 <code>MEMORY.md</code>。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">6. 集群里每个副本各自「记得」不同的事</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>本地好好的，多副本部署后同一个用户忽而有记忆忽而没有。</dd>
+            <dt>因为</dt>
+            <dd>默认的 <code>JsonFileAgentStateStore</code> 是<strong>本机文件</strong>，状态在各副本本地各写一份。</dd>
+            <dt>改成</dt>
+            <dd>换成分布式 <code>AgentStateStore</code>（例如 Redis 实现）或用 <code>distributedStore(...)</code>。框架对此还会主动拦截：配了 <code>filesystem(RemoteFilesystemSpec)</code> 却仍用本地状态存储时，<code>build()</code> 直接抛 <code>IllegalStateException</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431">HarnessAgent.java:2431</span>——把运行期的隐性错乱换成启动期的显性报错。07 章细讲。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>1. <code>.name("note-taker")</code> 改成 <code>.name("note-taker-v2")</code> 重跑，第二轮还记得吗？</summary>
+          <p>
+            <strong>不记得。</strong>没设 <code>agentId</code> 时 <code>name</code> 就是
+            <code>agentId</code>，而 <code>agentId</code> 是状态目录的一层<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2377"
+              >HarnessAgent.java:2377</span
+            >。改名等于换了一个 agent 的存储根，旧状态还在原目录里，只是不再被读到。
+          </p>
+        </details>
+        <details>
+          <summary>2. 一个 <code>HarnessAgent</code> 实例能同时服务 100 个用户吗？需要每个用户一个实例吗？</summary>
+          <p>
+            <strong>能，也不需要。</strong>实例在调用之间无状态，每次调用传不同的
+            <code>RuntimeContext</code> 就自动隔离上下文；同一 <code>(userId, sessionId)</code>
+            的请求会被串行化，不会互相踩状态<span class="src" data-src="docs/v2/zh/docs/quickstart.md:144">quickstart.md:144</span>。
+            要留意的是<strong>存储实现</strong>必须支持多副本共享，见陷阱 6。
+          </p>
+        </details>
+        <details>
+          <summary>3. 程序重启后，工作区删了，agent 还能恢复对话上下文吗？</summary>
+          <p>
+            能——这正是状态被放在<strong>工作区之外</strong>的原因<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1134"
+              >HarnessAgent.java:1134</span
+            >。<code>~/.agentscope/state/&lt;agentId&gt;/&lt;userId&gt;/&lt;sessionId&gt;/agent_state.json</code>
+            里带着恢复所需的上下文；但工作区里的 <code>AGENTS.md</code> /
+            <code>MEMORY.md</code> 这些人格与长期记忆文件没了，system prompt 的那部分内容也就没了。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">先证明「记忆」真的来自磁盘，不是内存</span>
+            <div>
+              跑完两轮后<strong>结束进程</strong>，再原样跑一次第三轮问「我叫什么」。因为
+              <code>sessionId</code> 没变、状态在文件里，它照样答得上来。如果你改成一个新的
+              <code>sessionId</code> 再跑，它就应该不知道——这一步能帮你确认隔离边界在哪。
+            </div>
+          </li>
+          <li>
+            <span class="sh">观察 system prompt 的来源</span>
+            <div>
+              在工作区里写一份 <code>AGENTS.md</code>（例如「你只能用中文回答，回答不超过 30
+              字」），重跑。行为变了 → 说明工作区文件确实参与拼装。
+            </div>
+          </li>
+          <li>
+            <span class="sh">把压缩逼出来</span>
+            <div>
+              保持 <code>triggerMessages(30).keepMessages(10)</code>，连发 35
+              条短消息，然后去工作区看 <code>memory/YYYY-MM-DD.md</code> 与
+              <code>MEMORY.md</code> 是否出现；再打开 <code>agent_state.json</code>
+              看上下文里是否只剩摘要 + 最近若干条。
+            </div>
+          </li>
+          <li>
+            <span class="sh">故意踩一次坑</span>
+            <div>
+              把 <code>.block()</code> 删掉再跑一次，确认「秒退且无输出」的现象；然后把 <code>call</code> 换成
+              <code>streamEvents</code>，观察事件打印顺序。这两次对照比读十遍文档都管用。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一步 / 关联源码</h2>
+        <p>
+          <strong>下一步：</strong>如果你被 <code>Mono</code> / <code>block()</code> /
+          <code>subscribe()</code> 绊住，先读 03 响应式必修；如果你想马上让它「会做事」，跳到 06
+          工具系统。想深挖本章的状态与存储细节，读 07。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>本章提到的东西</th>
+                <th>去哪儿看</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>HarnessAgent</code> 本体与 Builder</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:169">HarnessAgent.java:169</span>（类） / <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1194">:1194</span>（Builder）</td>
+              </tr>
+              <tr>
+                <td>本地文件状态存储的布局与命名规则</td>
+                <td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:44">JsonFileAgentStateStore.java:44</span></td>
+              </tr>
+              <tr>
+                <td>压缩配置的所有字段与默认值</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/CompactionConfig.java:273">CompactionConfig.java:273</span></td>
+              </tr>
+              <tr>
+                <td>官方原文（本章的对照对象）</td>
+                <td><span class="src" data-src="docs/v2/zh/docs/quickstart.md:1">docs/v2/zh/docs/quickstart.md</span></td>
+              </tr>
+              <tr>
+                <td>可编译的官方示例（含流式聊天完整文件）</td>
+                <td><span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/quickstart/BasicChatExample.java:1">BasicChatExample.java</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

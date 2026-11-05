@@ -1,0 +1,878 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="上一章讲「模型知道什么」，这一章讲「模型能碰什么」。三件事共用同一条时间线——都在 build() 里装配，都在每次工具调用前生效：计划模式把非只读调用换成 DENIED 结果；tools.json 用 allow/deny 裁剪工具面；MCP 在构建期把外部 server 的工具注册进同一个 Toolkit。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="17 计划模式、工具装配与 MCP · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="上一章讲「模型知道什么」，这一章讲「模型能碰什么」。三件事共用同一条时间线——都在 build() 里装配，都在每次工具调用前生效：计划模式把非只读调用换成 DENIED 结果；tools.json 用 allow/deny 裁剪工具面；MCP 在构建期把外部 server 的工具注册进同一个 Toolkit。" />
+    <title>17 计划模式、工具装配与 MCP · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="17-plan-mode-tools" data-root="..">
+    <main>
+      <article class="article">
+        <h1>17 · 计划模式、工具装配与 MCP</h1>
+        <p class="lede">
+          上一章讲「模型知道什么」，这一章讲「模型能碰什么」。三件事共用同一条时间线——都在 <code>build()</code> 里装配，都在每次工具调用前生效：<strong>计划模式</strong>用中间件把非只读调用换成一条 <code>DENIED</code> 结果；<strong><code>tools.json</code></strong> 用 allow/deny 在白名单层面裁剪工具面；<strong>MCP</strong> 在构建期把外部 server 的工具注册进同一个 <code>Toolkit</code>。三者叠在一起，才是「这个 agent 到底能做什么」。和官方文档的分歧集中在四处：<strong>白名单是 4 个还是 9 个名字</strong>、<strong><code>plan_exit</code> 的参数叫什么</strong>、<strong>子 agent 到底继不继承只读限制</strong>，以及<strong><code>ToolsConfig.builder()</code> 并不存在</strong>。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 <code>enablePlanMode()</code> 到底装了哪三样东西，以及三个默认值分别是什么</li>
+          <li>背下计划模式真正放行的两类调用：<strong>工具自带 <code>readOnly=true</code></strong> 与 <strong>9 个白名单名字</strong>，并能判断任意一个工具在 plan 阶段会不会被拒</li>
+          <li>解释拒绝是怎么发生的（<code>onActing</code> 分流 + 合成 <code>DENIED</code> 结果），以及为什么模型还会继续看到全部工具定义</li>
+          <li>画出 <code>plan_exit</code> 的两段式：先 <code>ASK</code>，批准后才执行 <code>exit</code>；并指出 <code>DONT_ASK</code> 下为什么会卡死</li>
+          <li>说清计划状态的两处存储：<code>AgentState.PlanModeContextState</code>（可持久化）与 <code>plans/PLAN.md</code>（走文件系统）</li>
+          <li>把 <code>tools.json</code> 的加载时机、字段、失败降级讲完整，并背下 <code>ToolFilter</code> 的三条语义</li>
+          <li>说出 MCP 三种 transport 的字段映射、注册的同步语义，以及 <code>required</code> 与「零工具」两种边界</li>
+        </ul>
+
+        <h2 id="why">先说为什么：三个开关，管的是「一次任务能碰什么」</h2>
+        <p>
+          这三个机制经常被混为一谈，其实它们作用在三个不同层面：
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">计划模式：运行期的阶段开关</span>
+            <div class="ld">
+              不改变工具清单，只在<strong>执行前</strong>按名字判断一次：这个调用现在能不能跑。被拒的调用不会执行，但会留下一条结果告诉模型「为什么被拒」<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:168-233"
+                >PlanModeMiddleware.java:168-233</span
+              >。它是<strong>动态</strong>的：同一份工具面，进来出去是两种权限。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">tools.json：构建期的白名单裁剪</span>
+            <div class="ld">
+              在 <code>build()</code> 的最后一步，把不符合 allow/deny 的工具从 <code>Toolkit</code> 里<strong>物理删掉</strong><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:86-140"
+                >ToolFilter.java:86-140</span
+              >。模型连工具定义都看不到，谈不上调用。它是<strong>静态</strong>的：改配置要重新 build。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">MCP：构建期的能力扩充</span>
+            <div class="ld">
+              同样是 <code>build()</code>，但方向相反：连上外部 server，把它们的工具<strong>加进来</strong><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:60-103"
+                >McpServerRegistrar.java:60-103</span
+              >。注册完还会被上面的 <code>ToolFilter</code> 再过一遍。
+            </div>
+          </div>
+        </div>
+        <p>
+          这个顺序很重要：<strong>先注册 MCP，再应用 allow/deny</strong>（<code>HarnessAgent:2766-2771</code> 对 <code>:2935-2937</code>）。所以 <code>tools.json</code> 的 <code>deny</code> 能一刀砍掉某个 MCP 工具；反过来，<code>allow</code> 非空时也可能把没列进去的 MCP 工具一起砍掉——哪怕那个 server 自己在 <code>enableTools</code> 里点了名。
+        </p>
+        <div class="callout tip">
+          <span class="ct">三者的优先级</span>
+          <p>
+            从「最不容易被绕过」到「最容易被绕过」：<code>tools.json</code> 删掉的工具 <strong>&gt;</strong> 计划模式拒绝的调用 <strong>&gt;</strong> 提示词里的建议。前两者是确定性的代码路径，第三条只是话术。所以真正想禁止某个动作，永远优先用前两个。
+          </p>
+        </div>
+
+        <h2 id="minimal">最小可跑：两种开启方式，三个默认值</h2>
+        <p>
+          计划模式是<strong>默认关闭</strong>的。打开它只要一个方法：
+        </p>
+        <pre data-lang="java" data-file="开启计划模式">HarnessAgent agent =
+        HarnessAgent.builder()
+                .name("planner")
+                .model(model)
+                .workspace(Path.of("./workspace"))
+                .filesystem(new LocalFilesystemSpec())   // 或 SandboxFilesystemSpec
+                .enablePlanMode()                        // 装三个工具 + 中间件
+                .planFileDirectory("plans")              // 可选，默认就是 "plans"
+                .allowShellInPlanMode()                  // 可选，默认不放行 execute
+                .enableTaskList()                        // 可选：注册 todo_write
+                .build();</pre>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Builder 方法</th><th>默认值</th><th>作用点</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>enablePlanMode()</code> / <code>enablePlanMode(boolean)</code></td>
+                <td><code>false</code></td>
+                <td>为假时<strong>既不注册工具也不装中间件</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1275">HarnessAgent.java:1275</span></td>
+              </tr>
+              <tr>
+                <td><code>planFileDirectory(String)</code></td>
+                <td><code>"plans"</code></td>
+                <td>只接受非空白字符串；空白值被忽略而不是清空<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1277">:1277</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2175-2180">:2175-2180</span></td>
+              </tr>
+              <tr>
+                <td><code>allowShellInPlanMode()</code></td>
+                <td><code>false</code></td>
+                <td>为真时把 <code>execute</code> 加入「额外放行」集合<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1276">:1276</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2743-2746">:2743-2746</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          注意最后一行：<code>allowShellInPlanMode()</code> 放行的名字是 <code>ShellExecuteTool.NAME</code>，也就是字面量 <code>"execute"</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:32">ShellExecuteTool.java:32</span>。如果你的 shell 工具被 <code>tools.json</code> 的 <code>deny</code> 删掉了，它即便在「额外放行」集合里也不存在——放行一个不存在的名字是没有意义的。
+        </p>
+
+        <h2 id="tools">三个计划工具：一个只读入口、一个专用写口、一个 ASK 出口</h2>
+        <p>
+          三个工具都注册在同一个 toolkit 上，共享一个 <code>PlanModeManager</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2736-2741">HarnessAgent.java:2736-2741</span>。它们都是 <code>readOnly(false)</code> + <code>concurrencySafe(false)</code>——所以它们能活下来，靠的不是「只读」豁免，而是白名单：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>工具</th><th>参数</th><th>做了什么</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>plan_enter</code></td>
+                <td>无（<code>{"type":"object","properties":{}}</code>）</td>
+                <td>幂等进入：置 <code>planActive=true</code>，若还没有计划文件路径就填默认值，返回该路径<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/PlanModeTools.java:86-101">PlanModeTools.java:86-101</span></td>
+              </tr>
+              <tr>
+                <td><code>plan_write</code></td>
+                <td><code>content</code>（必填，完整覆盖）</td>
+                <td>经 <code>WorkspaceManager.writeUtf8WorkspaceRelative</code> 写文件，并把路径记回 state<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/PlanModeTools.java:135-146">:135-146</span></td>
+              </tr>
+              <tr>
+                <td><code>plan_exit</code></td>
+                <td><code>summary</code>（可选）</td>
+                <td>先过权限 <code>ASK</code>；批准后才 <code>exit</code>，并提示用 <code>todo_write</code> 拆任务<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/PlanModeTools.java:180-209">:180-209</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          为什么单独造一个 <code>plan_write</code>，而不是把 <code>write_file</code> 放进白名单？看第二个参数就懂了：<code>plan_write</code> <strong>只写一个路径</strong>——当前计划文件。它不接受 <code>path</code>，模型无法借它去改 <code>src/main/java/...</code>。把通用 <code>write_file</code> 放进来，等于在 plan 阶段交出了整个工作区的写权限。
+        </p>
+        <div class="callout warn">
+          <span class="ct">文档里的 <code>rationale</code> 是错的</span>
+          <p>
+            官方 <code>plan-mode.md</code> 的工具表把 <code>plan_exit</code> 的参数写成 <code>rationale</code><span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:45">plan-mode.md:45</span>，而源码的 input schema 里只有一个 <code>summary</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/PlanModeTools.java:162-174">PlanModeTools.java:162-174</span>。按文档传 <code>rationale</code> 不会报错，只是被 schema 校验挡住或忽略——别在业务代码里依赖它。
+          </p>
+        </div>
+
+        <h2 id="intercept">拦截发生在 <code>onActing</code>：按名字分流，再合成一条 DENIED</h2>
+        <p>
+          计划模式的执行边界不在工具内部，而在中间件的 <code>onActing</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:168-233">PlanModeMiddleware.java:168-233</span>。逻辑可以拆成五步：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先看阶段</span>
+            <div>
+              从 <code>RuntimeContext</code> 解析出 <code>AgentState</code>；<code>planActive=false</code> 或这一轮没有工具调用，直接 <code>next.apply(input)</code> 放行——计划模式在 BUILD 阶段是<strong>零成本</strong>的。
+            </div>
+          </li>
+          <li>
+            <span class="sh">按名字分两堆</span>
+            <div>
+              每个 <code>ToolUseBlock</code> 走 <code>isPermitted(name)</code>，分别进 <code>allowed</code> 与 <code>denied</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:179-187">:179-187</span>。注意：判断依据只有<strong>名字</strong>，不看参数。
+            </div>
+          </li>
+          <li>
+            <span class="sh">给每个被拒的调用造一条结果</span>
+            <div>
+              <code>ToolResultBlock.text(DENY_MESSAGE)</code>，带上原调用的 <code>id</code>/<code>name</code>，状态设为 <code>ToolResultState.DENIED</code>，然后用 <code>ToolResultMessageBuilder</code> 包成一条 <code>Msg</code> 塞进 <code>state.contextMutable()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:200-209">:200-209</span>。这一步很关键：<strong>上下文里必须有这条 tool result</strong>，否则下一轮模型会看到「自己发了调用但没有结果」，直接触发协议错误。
+            </div>
+          </li>
+          <li>
+            <span class="sh">同时补三个流式事件</span>
+            <div>
+              <code>ToolResultStartEvent</code> → <code>ToolResultTextDeltaEvent</code>（正文就是拒绝文案）→ <code>ToolResultEndEvent</code>（状态 <code>DENIED</code>）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:210-224">:210-224</span>。所以前端看到的不是「没反应」，而是一次明确的失败结果。
+            </div>
+          </li>
+          <li>
+            <span class="sh">顺序：先拒绝，再执行</span>
+            <div>
+              <code>deniedFlux.concatWith(next.apply(new ActingInput(allowed)))</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:229-232">:229-232</span>。全部被拒时只返回拒绝流，不调 <code>next</code>。这是刻意的：模型先看到「这步不让做」，再看到允许的那几个跑完。
+            </div>
+          </li>
+        </ol>
+        <p>
+          拒绝文案不是一行短提示，而是一整段带指令的话：告诉模型「你在 PLAN 模式（只读）」「可以调查、跑只读工具、用 <code>plan_write</code> 记录、准备好后调 <code>plan_exit</code>」「在计划获批前不要改文件或跑变更命令」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:72-76">PlanModeMiddleware.java:72-76</span>。这就是它「不靠报错、靠话术」的纠偏方式。
+        </p>
+        <div class="callout warn">
+          <span class="ct">工具定义并不会被藏起来</span>
+          <p>
+            <code>PlanModeMiddleware</code> 只拦执行，<strong>不改 tool schema</strong>。所以模型在 plan 阶段依然看得到 <code>write_file</code>、<code>edit_file</code> 的完整定义，也依然可能去调——只是每次都会拿到 <code>DENIED</code>。想让它「看不见」，得用下一节的 <code>tools.json</code>。
+          </p>
+        </div>
+
+        <h2 id="allowed">到底放行了什么：两类调用，9 个名字</h2>
+        <p>
+          <code>isPermitted</code> 只有三个分支<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:235-242">PlanModeMiddleware.java:235-242</span>：命中 <code>ALWAYS_ALLOWED</code>、命中 <code>additionalAllowed</code>（就是 <code>allowShellInPlanMode</code> 那个）、或者 <code>readOnlyResolver</code> 返回真。
+        </p>
+        <p>
+          <code>readOnlyResolver</code> 是 build 时传进去的闭包：<code>roToolkit.getTool(name).isReadOnly()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2750-2753">HarnessAgent.java:2750-2753</span>。因为捕获的是 <code>Toolkit</code> 实例、每次调用才求值，所以<strong>后注册的工具也能被正确判定</strong>——包括 MCP 工具。而 <code>AgentTool.isReadOnly()</code> 默认返回 <code>false</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/AgentTool.java:111-113">AgentTool.java:111-113</span>，<code>@Tool(readOnly=...)</code> 的默认值也是 <code>false</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Tool.java:107">Tool.java:107</span>。所以「只读」不是猜出来的，是每个工具自己声明的。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>工具</th><th>plan 阶段</th><th>依据</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>read_file</code> / <code>grep_files</code> / <code>glob_files</code> / <code>list_files</code></td><td>放行</td><td>注解显式 <code>readOnly = true</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:110-116">FilesystemTool.java:110-116</span></td></tr>
+              <tr><td><code>web_fetch</code> / <code>web_search</code></td><td>放行</td><td>同样 <code>readOnly = true</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/WebTools.java:64-65">WebTools.java:64-65</span></td></tr>
+              <tr><td><code>write_file</code> / <code>edit_file</code></td><td><strong>拒绝</strong></td><td>注解未标只读，默认 <code>false</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:139-142">:139-142</span></td></tr>
+              <tr><td><code>execute</code></td><td>默认<strong>拒绝</strong></td><td>双用途，按名字无法判定；<code>allowShellInPlanMode()</code> 才放行</td></tr>
+              <tr><td><code>todo_write</code></td><td>放行</td><td>在白名单里，但注解是 <code>readOnly = false</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/builtin/TodoTools.java:92-96">TodoTools.java:92-96</span></td></tr>
+              <tr><td>MCP 工具</td><td><strong>看 server 声明</strong></td><td>注册时读 <code>readOnlyHint</code>：为 <code>true</code> 才放行，未声明/为假则默认拒绝<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/McpClientManager.java:300-325">McpClientManager.java:300-325</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          白名单的真实内容比文档多 5 个。源码是<strong>9 个名字</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:60-70">PlanModeMiddleware.java:60-70</span>：
+        </p>
+        <pre data-lang="java" data-file="ALWAYS_ALLOWED（逐字）">plan_enter, plan_write, plan_exit, todo_write,
+agent_spawn, agent_send, agent_list,
+task_output, task_list</pre>
+        <p>
+          为什么要把子 agent 与后台任务工具也放进来？因为「调查」这件事在长任务里经常要并发：主 agent 在 plan 阶段派几个只读的子 agent 去读不同模块，比串行读快得多。而 <code>task_output</code>/<code>task_list</code> 只是取结果，不改状态。反过来说——<strong>只要子 agent 自己没被限制，它就能替父 agent 干活</strong>。这一点下一节单独讲。
+        </p>
+        <div class="callout tip">
+          <span class="ct"><code>todo_write</code> 可能根本不存在</span>
+          <p>
+            <code>todo_write</code> 只有在 <code>enableTaskList()</code> 打开时才注册<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5557-5561">ReActAgent.java:5557-5561</span>，而 <code>HarnessAgent</code> 默认不装。白名单里写着它，只是「如果存在就允许」，不是「帮你装上」。
+          </p>
+        </div>
+
+        <h2 id="prompt">提示词侧的三段话：PLAN 横幅、额外工具、BUILD 回流</h2>
+        <p>
+          光有硬拦截不够——模型得<strong>知道</strong>自己处在哪个阶段，否则会一直撞墙。<code>onSystemPrompt</code> 负责补三段提示，都是追加在现有 prompt 末尾：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>时机</th><th>追加内容</th><th>要点</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>planActive=true</code></td>
+                <td><code>&lt;system-reminder&gt;PLAN MODE is active (read-only). Plan file: %s …</code></td>
+                <td>给出计划文件路径；明确「只调查不改状态」；要求「决定写就<strong>同一步</strong>调 <code>plan_write</code>，不要只说『我将写计划』」；信息不足时停下来问一个具体问题，而不是编计划<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:78-94">:78-94</span></td>
+              </tr>
+              <tr>
+                <td>同上且有额外放行</td>
+                <td><code>&lt;system-reminder&gt;The following tool(s) are additionally available during PLAN mode …</code></td>
+                <td>列出名字（如 <code>execute</code>），并要求只用于 <code>cat</code>/<code>ls</code>/<code>grep</code>/<code>git log/diff/show/status</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:104-109">:104-109</span></td>
+              </tr>
+              <tr>
+                <td><code>planActive=false</code> 且有历史计划文件</td>
+                <td><code>&lt;system-reminder&gt;You have switched from PLAN to BUILD mode …</code></td>
+                <td>把计划路径再告知一次，要求「读它、逐步执行、别写完计划就停」；有 todo 时保持恰好一个 <code>in_progress</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:96-102">:96-102</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          第三行是本章最容易被忽略的细节：<code>exit</code> 只把 <code>planActive</code> 置假，<strong>保留 <code>currentPlanFile</code></strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/plan/PlanModeManager.java:79-83">PlanModeManager.java:79-83</span>。于是之后每一轮系统提示都会带上「计划在 <code>plans/PLAN.md</code>」这句话——这是<strong>抗压缩</strong>设计：对话被压掉后，模型仍能从 prompt 里知道去哪找计划。
+        </p>
+
+        <h2 id="exit">退出：一次 ASK，两段执行</h2>
+        <p>
+          <code>plan_exit</code> 和其它工具最大的不同，是它重写了 <code>checkPermissions</code> 并且<strong>永远返回 <code>ASK</code></strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/PlanModeTools.java:185-192">PlanModeTools.java:185-192</span>：
+        </p>
+        <pre data-lang="java" data-file="PlanModeTools.PlanExitTool#checkPermissions">return Mono.just(
+        PermissionDecision.ask(
+                "The agent wants to finish planning and start executing. Approve to"
+                        + " continue in BUILD mode, or reject to keep planning."));</pre>
+        <p>
+          它不读规则、不看上下文，无条件问。原因写在 javadoc 里：这是一次「刻意的交接」，必须由人确认。批准之前 <code>callAsync</code> <strong>不会执行</strong>，所以 <code>manager.exit(state)</code> 也就不会发生——模型仍然停在 PLAN，可以继续改计划再问一次。
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">第一段：ASK</span>
+            <div class="ld">
+              权限引擎弹确认。用户的决定走的是父 agent 配置的 HITL 通道（控制台回调、HTTP 接口、前端按钮都行），和普通工具确认完全同一条路。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">第二段：callAsync</span>
+            <div>
+              批准后才跑：<code>manager.exit(state)</code> → 返回一段话，要求「现在开始执行」「用 <code>todo_write</code> 把计划拆成一条条」「保持恰好一个 <code>in_progress</code>」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/PlanModeTools.java:196-208">:196-208</span>。
+            </div>
+          </div>
+        </div>
+        <div class="callout warn">
+          <span class="ct"><code>DONT_ASK</code> 会让 <code>plan_exit</code> 永远批不下来</span>
+          <p>
+            <code>PermissionMode.DONT_ASK</code> 的语义是「ASK 一律降级为 DENY」<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionMode.java:34-38">PermissionMode.java:34-38</span>。而 <code>plan_exit</code> 只有 ASK 一条路，所以在无人值守模式下它会<strong>稳定地被拒</strong>，agent 永远出不了 PLAN。要么这类会话别开 plan 模式，要么用程序化 API 退出（下一节）。
+          </p>
+        </div>
+
+        <h2 id="persist">状态与文件：一个进 AgentState，一个进工作区</h2>
+        <p>
+          计划模式有两个「存储」，职责完全不同，别混：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th></th><th><code>PlanModeContextState</code></th><th><code>plans/PLAN.md</code></th></tr>
+            </thead>
+            <tbody>
+              <tr><td>存什么</td><td><code>planActive</code> + <code>currentPlanFile</code></td><td>计划正文（markdown）</td></tr>
+              <tr><td>存在哪</td><td><code>AgentState</code>，跟着 <code>AgentStateStore</code> 走<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/plan/PlanModeManager.java:24-38">PlanModeManager.java:24-38</span></td><td>工作区文件系统（本机 / 沙箱 / 远端都好）</td></tr>
+              <tr><td>谁写</td><td><code>PlanModeManager</code></td><td><code>plan_write</code> → <code>WorkspaceManager.writeUtf8WorkspaceRelative</code></td></tr>
+              <tr><td>跨节点</td><td>靠分布式 store 恢复</td><td>靠文件系统本身</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          路径规则很朴素：<code>planFileDirectory</code> 去掉首尾斜杠后拼 <code>/PLAN.md</code>；空值回落 <code>"plans"</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/plan/PlanModeManager.java:41-58">PlanModeManager.java:41-58</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/plan/PlanModeManager.java:112-114">:112-114</span>。注释里还有一句值得记住：所有隔离范围都用<strong>同一个逻辑路径</strong>，隔离由文件系统层面（store namespace / sandbox snapshot key）实现，而不是把 userId 编进路径<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/plan/PlanModeManager.java:33-37">:33-37</span>。
+        </p>
+        <div class="callout tip">
+          <span class="ct">为什么不用 <code>PermissionMode.EXPLORE</code></span>
+          <p>
+            类注释直说了：<code>EXPLORE</code> 在 <code>PermissionEngine</code> 构造时被<strong>不可变快照</strong>下来，运行期翻不动；而计划模式必须能随时开关，所以另起了一套中间件<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:43-57">PlanModeMiddleware.java:43-57</span>。这也解释了为什么二者不能互相替代：<code>EXPLORE</code> 适合「整个会话都只读」，plan 模式适合「一个阶段只读」。
+          </p>
+        </div>
+
+        <h2 id="api">程序化 API：一个入口，一个静默陷阱</h2>
+        <p>
+          不做模型驱动、而是由业务代码控制进出，用这三组方法（每组都有 <code>RuntimeContext</code> 与 <code>(userId, sessionId)</code> 两个重载）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:327-339">HarnessAgent.java:327-339</span>：
+        </p>
+        <pre data-lang="java" data-file="程序化进出">RuntimeContext ctx = RuntimeContext.builder().userId("alice").sessionId("s-1").build();
+
+agent.enterPlanMode(ctx);        // 立即写进 state 并持久化
+agent.isPlanModeActive(ctx);     // true
+agent.exitPlanMode(ctx);         // 直接退出，不经过 ASK</pre>
+        <div class="callout warn">
+          <span class="ct">没开 <code>enablePlanMode()</code> 时，这两个方法什么也不会发生</span>
+          <p>
+            看实现：<code>planModeManager != null</code> 才走 <code>manager.enter</code>，否则直接 <code>setPlanActive(true)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:400-408">HarnessAgent.java:400-408</span>。但中间件没装，就意味着<strong>没有横幅、没有拦截</strong>——状态位是真，防护是假。<code>isPlanModeActive()</code> 还会返回 <code>true</code>，特别容易让人误以为生效了。
+          </p>
+        </div>
+        <p>
+          另外两个语义差别值得记：程序化 <code>exitPlanMode</code> <strong>不触发 HITL</strong>（管理台按钮不该弹确认），而模型调 <code>plan_exit</code> 一定触发；两边都会持久化（<code>delegate.saveAgentState</code>），所以跨会话续跑时状态是一致的。
+        </p>
+
+        <h2 id="subagent">子 agent：能力下传，状态强制传播</h2>
+        <p>
+          官方文档把这里写成「已知缺口：Plan Mode 期间通过 <code>agent_spawn</code> 启动的子 agent <strong>不会</strong>自动继承只读限制」<span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:151-156">plan-mode.md:151-156</span>。2.0.4 的源码已经不是这样了，它做了两层：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">构建期：把能力装到子 agent 上</span>
+            <div>
+              自动构造子 agent 时，<code>configurePlanMode</code> 会把父的 <code>planModeEnabled</code>/<code>allowShellInPlanMode</code>/<code>planFileDir</code> 原样传给子 builder<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:598-618">HarnessAgentBuilderSupport.java:598-618</span>。注释解释了为什么必须这样：<code>PlanModeMiddleware</code> 和 <code>PlanModeManager</code> 是 <code>build()</code> <strong>动态</strong>装的，只拷中间件列表根本拷不过去；如果只把 <code>planActive</code> 置真，等于「给了状态、没给守卫」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:598-606">:598-606</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">运行期：父在 plan，子必进 plan</span>
+            <div>
+              真正拉起子 agent 之前，<code>AgentSpawnTool.propagatePlanMode</code> 会检查父 state：<code>planActive</code> 为真且子是 <code>HarnessAgent</code>，就直接对子调 <code>enterPlanMode(userId, sessionId)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:739-746">AgentSpawnTool.java:739-746</span>。注释特别强调<strong>新建和复用都要跑</strong>——一个常驻子 agent 可能是父在 BUILD 阶段创建的，父后来才进 plan 模式<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:732-738">:732-738</span>。
+            </div>
+          </li>
+        </ol>
+        <p>
+          所以现在的真实语义是：<strong>能力继承 + 状态同步</strong>。但有个边界要说清——传播的是「父当前是否在 plan」，不是「父做过什么计划」。子 agent 的 <code>currentPlanFile</code> 是它自己 state 里的默认值（子工作区如果是隔离的，路径前缀也不同），它不会自动去读父的 <code>plans/PLAN.md</code>。想让子 agent 按父的计划干活，仍然要在 <code>task</code> 里把计划内容或路径告诉它。
+        </p>
+        <div class="callout tip">
+          <span class="ct">为什么这一段值得单独讲</span>
+          <p>
+            这是「文档落后于代码」的典型：如果按文档去写防御性代码（例如给每个子 agent 再手动开一次 plan 模式），在 2.0.4 上是重复劳动；反过来，如果按文档以为「反正子 agent 不受限」而放开 <code>agent_spawn</code>，又会低估 plan 阶段的边界。判断依据永远以源码为准。
+          </p>
+        </div>
+
+        <h2 id="toolsjson">tools.json：在哪、谁读、读不到怎么办</h2>
+        <p>
+          配置文件是工作区根目录下的 <code>tools.json</code>，常量名 <code>WorkspaceConstants.TOOLS_JSON</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceConstants.java:27">WorkspaceConstants.java:27</span>。读取入口是 <code>ToolsConfigLoader.load(wsManager)</code>，走 <code>readManagedWorkspaceFileUtf8</code>，也就是说它和 <code>AGENTS.md</code>、<code>MEMORY.md</code> 走<strong>同一套 overlay 读取</strong>：远端有就用远端，否则用本地模板<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfigLoader.java:57-74">ToolsConfigLoader.java:57-74</span>。
+        </p>
+        <p>
+          三个细节决定了你能不能在生产里用得住：
+        </p>
+        <ul>
+          <li><strong>读之前先做环境变量替换</strong>。<code>${VAR}</code> 用 <code>System.getenv</code> 替换；未设置的变量替换成空串，并且<strong>每个变量只 warn 一次</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfigLoader.java:48">ToolsConfigLoader.java:48</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfigLoader.java:96-116">:96-116</span>。所以 <code>"Authorization": "Bearer ${GITHUB_TOKEN}"</code> 可以安全地留在仓库里。</li>
+          <li><strong>读失败绝不抛异常</strong>。文件缺失、空白、读不到（沙箱/远端在 build 期还没上下文）、JSON 解析失败，统统返回 <code>Optional.empty()</code>，agent 带着默认 toolkit 继续构建<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfigLoader.java:66-88">:66-88</span>。解析失败是 <code>warn</code>，读不到是 <code>debug</code>——后者很容易在日志里被忽略。</li>
+          <li><strong>优先级：编程覆盖 &gt; 文件</strong>。<code>toolsConfigOverride != null</code> 时<strong>根本不读文件</strong>；<code>disableToolsConfig()</code> 则连覆盖带文件一起跳过<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2757-2765">HarnessAgent.java:2757-2765</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2290-2293">:2290-2293</span>。</li>
+        </ul>
+        <div class="callout warn">
+          <span class="ct">沙箱/远端可能「读不到」，而且是静默的</span>
+          <p>
+            <code>ToolsConfigLoader</code> 用 <code>RuntimeContext.empty()</code> 去读，而沙箱后端在 build 期可能还没有可用的调用上下文，于是走进 catch、打一条 <code>debug</code>、返回空<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfigLoader.java:62-74">ToolsConfigLoader.java:62-74</span>。结果就是：<strong>你以为 tools.json 生效了，其实它的 allow/deny 一条都没应用</strong>。沙箱/远端场景请用 <code>builder.toolsConfig(cfg)</code> 兜底，别只依赖文件。
+          </p>
+        </div>
+
+        <h2 id="schema">字段全表：文档里只写了三个</h2>
+        <p>
+          官方 <code>workspace.md</code> 的示例只出现 <code>allow</code>、<code>deny</code>、<code>mcpServers</code> 三个键<span class="src" data-src="docs/v2/zh/docs/harness/workspace.md:418-450">workspace.md:418-450</span>。源码里的 <code>ToolsConfig</code> 还有两个隐藏开关，MCP 那侧则有 11 个字段：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>层级</th><th>键</th><th>默认</th><th>语义</th></tr>
+            </thead>
+            <tbody>
+              <tr><td rowspan="4"><code>ToolsConfig</code></td><td><code>allow</code></td><td>空</td><td>非空时，<strong>编目工具</strong>不在列表里就被删；平台工具默认豁免<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfig.java:45-51">ToolsConfig.java:45-51</span></td></tr>
+              <tr><td><code>deny</code></td><td>空</td><td>无条件删除，优先级最高</td></tr>
+              <tr><td><code>defaultToolsEnabled</code></td><td><code>true</code></td><td>为假 + allow 为空 → 除平台工具外<strong>全删</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfig.java:57">:57</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:77-79">ToolFilter.java:77-79</span></td></tr>
+              <tr><td><code>strictAllow</code></td><td><code>false</code></td><td>为真时<strong>连平台工具也不豁免</strong>、MCP 前缀规则失效<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfig.java:58">:58</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:68-79">ToolFilter.java:68-79</span></td></tr>
+              <tr><td rowspan="11"><code>McpServerConfig</code></td><td><code>transport</code></td><td>无（必填）</td><td><code>stdio</code> / <code>sse</code> / <code>http</code>（另接受 <code>streamable-http</code>、<code>streamablehttp</code>）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:183-195">McpServerRegistrar.java:183-195</span></td></tr>
+              <tr><td><code>command</code> / <code>args</code> / <code>env</code></td><td>—</td><td>stdio 专用；<code>command</code> 缺失直接抛<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:205-213">:205-213</span></td></tr>
+              <tr><td><code>url</code> / <code>headers</code> / <code>queryParams</code></td><td>—</td><td>sse 与 http 共用；<code>url</code> 缺失直接抛<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:215-240">:215-240</span></td></tr>
+              <tr><td><code>enableTools</code></td><td>空</td><td>非空时只导入这些工具名<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerConfig.java:72-77">McpServerConfig.java:72-77</span></td></tr>
+              <tr><td><code>disableTools</code></td><td>空</td><td><strong>先于</strong> <code>enableTools</code> 判断，命中即排除<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:154-160">McpServerRegistrar.java:154-160</span></td></tr>
+              <tr><td><code>defaultToolsEnabled</code></td><td><code>true</code></td><td><code>enableTools</code> 为空时决定「全导」还是「全不导」</td></tr>
+              <tr><td><code>prefixToolNames</code></td><td><code>false</code></td><td>为真时工具名加 <code>&lt;server&gt;__</code> 前缀<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:138-141">:138-141</span></td></tr>
+              <tr><td><code>required</code></td><td><code>false</code></td><td>为真时连不上就<strong>中止 build</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:87-91">:87-91</span></td></tr>
+              <tr><td><code>timeout</code> / <code>initializationTimeout</code></td><td><code>null</code></td><td>ISO-8601 时长，透传给 <code>McpClientBuilder</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:196-201">:196-201</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>defaultToolsEnabled</code> 与 <code>strictAllow</code> 没有 <code>@JsonProperty</code>，但 Jackson 默认按 setter 识别属性，所以 JSON 里直接写 <code>"strictAllow": true</code> 是能生效的——只是官方没写、示例也没有，属于「源码里能用、文档里不存在」的字段。
+        </p>
+
+        <h2 id="filter">ToolFilter：三条语义与一次 warn</h2>
+        <p>
+          <code>ToolFilter</code> 只有两个公开方法：<code>isAllowed(name, cfg)</code> 判单个名字，<code>apply(toolkit, cfg)</code> 批量删。语义写在类注释里，一共三条<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:31-43">ToolFilter.java:31-43</span>：
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">① allow 非空 → 未列出的编目工具被删</span>
+            <div class="ld">
+              「编目工具」指 filesystem / shell / web / memory 这些产品工具。判定顺序是<strong>先 deny、再 MCP 前缀、再平台豁免、最后 allow</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:55-80">:55-80</span>。注意 <code>allow</code> 非空时，<code>defaultToolsEnabled</code> 那一支走不通（它额外要求 allow 为空），所以「列了 3 个就只剩 3 个」是真的。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">② 平台工具永远活过 allow，但活不过 deny</span>
+            <div>
+              <code>HarnessPlatformTools.isPlatformTool(name)</code> 为真时，<code>allow</code> 砍不掉它；但 <code>deny</code> 在函数最前面就返回 <code>false</code> 了，所以<strong>显式 deny 仍然能关掉平台工具</strong>。这是刻意留的运维逃生口。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">③ 两边都空 → 不动</span>
+            <div>
+              <code>apply</code> 开头就判：<code>!allowSet &amp;&amp; !denySet &amp;&amp; defaultToolsEnabled</code> 直接 return<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:90-96">:90-96</span>。只有 <code>mcpServers</code> 的 <code>tools.json</code> 属于这一类，工具面完全不变。
+            </div>
+          </div>
+        </div>
+        <p>
+          还有两个工程细节值得记：
+        </p>
+        <ul>
+          <li><strong>写错名字只 warn，不中止</strong>。<code>allow</code>/<code>deny</code> 里出现当前没注册的工具名，会逐条 <code>warn</code>「references unknown tool」然后忽略<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:102-107">:102-107</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:142-151">:142-151</span>。所以「白名单没生效」第一件事是搜这条日志，而不是怀疑框架。</li>
+          <li><strong>结果会打一条 info</strong>。<code>removed N tool(s); M remain: [..]</code>，平台工具被额外保留时还会单独计数<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:124-139">:124-139</span>。这条 INFO 是确认「过滤器到底跑没跑」的最快证据。</li>
+        </ul>
+        <div class="callout tip">
+          <span class="ct">过滤器也在别处被复用</span>
+          <p>
+            技能那一章的最后一步「<code>tools.json</code> 可以 deny loader」不是比喻：<code>build()</code> 计算 <code>shellToolAvailable</code> 时就是直接调 <code>ToolFilter.isAllowed("execute", resolvedToolsConfig)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2867-2873">HarnessAgent.java:2867-2873</span>，据此决定技能的 <code>files-root</code> 走 <code>noShell()</code> 还是本地/沙箱模式。一个 allow 列表会连带改变技能注入的 XML。
+          </p>
+        </div>
+
+        <h2 id="platform">平台工具名单：37 个名字，为什么是这些</h2>
+        <p>
+          名单是硬编码的 <code>Set.of(...)</code>，一共 37 个<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/HarnessPlatformTools.java:35-78">HarnessPlatformTools.java:35-78</span>，可以分五组：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>组</th><th>数量</th><th>名字</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>AgentTeams 统一入口与逐动作别名</td><td>19</td><td><code>team</code>、<code>listTasks</code>、<code>listClaimableTasks</code>、<code>createTask</code>、<code>assignTask</code>、<code>claimTask</code>、<code>unclaimTask</code>、<code>completeTask</code>、<code>failTask</code>、<code>sendMessage</code>、<code>broadcastMessage</code>、<code>listMessages</code>、<code>listMembers</code>、<code>spawnMember</code>、<code>shutdownMember</code>、<code>submitPlan</code>、<code>approvePlan</code>、<code>rejectPlan</code>、<code>completeTeam</code></td></tr>
+              <tr><td>子 agent（含 session 模式别名）</td><td>9</td><td><code>agent_spawn</code>、<code>agent_send</code>、<code>agent_list</code>、<code>agent_generate</code>、<code>sessions_spawn</code>、<code>sessions_send</code>、<code>sessions_list</code>、<code>sessions_history</code>、<code>sessions_pending_completions</code></td></tr>
+              <tr><td>后台任务</td><td>4</td><td><code>task_output</code>、<code>task_cancel</code>、<code>task_list</code>、<code>wait_async_results</code></td></tr>
+              <tr><td>计划模式</td><td>3</td><td><code>plan_enter</code>、<code>plan_write</code>、<code>plan_exit</code></td></tr>
+              <tr><td>技能自学习</td><td>2</td><td><code>skill_manage</code>、<code>propose_skill</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          为什么是这些？类注释讲得很直白：产品侧的 allow 可以收窄<strong>能力清单</strong>，但不能把<strong>协作运行时</strong>本身拆掉——子 agent、团队、后台任务、计划模式、技能治理都属于「框架怎么跑」，不属于「模型能做什么」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/HarnessPlatformTools.java:20-28">HarnessPlatformTools.java:20-28</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct"><code>todo_write</code> 不在名单里</span>
+          <p>
+            它既不是平台工具，又默认 <code>readOnly=false</code>，所以在 <code>allow</code> 非空且没列它时会被<strong>删掉</strong>——哪怕计划模式的白名单里写着它。开了 <code>enablePlanMode()</code> + <code>enableTaskList()</code> 又用了 allow 白名单的，记得把 <code>todo_write</code> 显式列上。
+          </p>
+        </div>
+
+        <h2 id="mcp">MCP：一个 server 条目，三种 transport</h2>
+        <p>
+          <code>mcpServers</code> 是一个 <code>Map&lt;String, McpServerConfig&gt;</code>，键就是 server 名。字段刻意对齐标准 MCP 客户端配置，方便工作区在 AgentScope 与其它 MCP 工具之间迁移<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerConfig.java:25-39">McpServerConfig.java:25-39</span>：
+        </p>
+        <pre data-lang="json" data-file="workspace/tools.json">{
+  "allow": ["read_file", "grep_files", "todo_write"],
+  "deny": ["execute"],
+  "mcpServers": {
+    "amap": {
+      "transport": "http",
+      "url": "https://mcp.amap.com/mcp?key=${AMAP_API_KEY}",
+      "enableTools": ["maps_weather"],
+      "prefixToolNames": true
+    },
+    "local-fs": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./workspace"],
+      "env": {"NODE_NO_WARNINGS": "1"},
+      "required": false,
+      "timeout": "PT30S"
+    }
+  }
+}</pre>
+        <p>
+          三个 transport 的字段是<strong>互斥</strong>的：<code>stdio</code> 用 <code>command</code>/<code>args</code>/<code>env</code>；<code>sse</code> 与 <code>http</code> 用 <code>url</code>/<code>headers</code>/<code>queryParams</code>，区别只是底层走 SSE 还是 streamable HTTP<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:205-240">McpServerRegistrar.java:205-240</span>。写错了不会「降级」，而是明确抛：<code>unsupported transport '...' (expected: stdio, sse, http)</code>。
+        </p>
+
+        <h2 id="register">注册流程：同步、逐条、失败分两级</h2>
+        <p>
+          <code>McpServerRegistrar.register</code> 在 <code>build()</code> 里被调用一次<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2766-2771">HarnessAgent.java:2766-2771</span>，整个过程是<strong>同步阻塞</strong>的：一个 server 建好、连上、注册完，才轮到下一个<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:44-67">McpServerRegistrar.java:44-67</span>。单个 server 的内部顺序是：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">建客户端</span>
+            <div>
+              <code>McpClientBuilder.create(name)</code> → 按 transport 配置 → 可选 timeout → <code>buildAsync().block()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:176-203">:176-203</span>。注意这里是<strong>阻塞</strong>的：一个连不上的 server 会把 <code>build()</code> 卡到超时。
+            </div>
+          </li>
+          <li>
+            <span class="sh">初始化 + 列工具</span>
+            <div>
+              <code>wrapper.initialize().block()</code>，然后 <code>listTools().block()</code> 拿全量工具名，逐个过 <code>isToolEnabled</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:125-137">:125-137</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">零工具就关掉</span>
+            <div>
+              过滤后一个都不剩时，<code>wrapper.close()</code> 然后 return——<strong>不注册、也不报错</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:134-137">:134-137</span>。外层仍会发一条 <code>SUCCESS</code> 给监听器，因为「连上了但你没要任何工具」不算失败。
+            </div>
+          </li>
+          <li>
+            <span class="sh">注册进 Toolkit</span>
+            <div>
+              <code>toolkit.registration().mcpClient(wrapper).enableTools(selected)</code>；<code>prefixToolNames</code> 为真时再 <code>mcpToolNamePrefix(name + "__")</code>；最后 <code>apply()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:138-141">:138-141</span>。
+            </div>
+          </li>
+        </ol>
+        <p>
+          失败分两级，这一层设计得很清楚：
+        </p>
+        <div class="compare">
+          <div class="side">
+            <h4><code>required: false</code>（默认）</h4>
+            <ul>
+              <li>给监听器发 <code>FAILED</code></li>
+              <li>如果配了 <code>connectionFailureHandler</code> 就回调它</li>
+              <li>打一条 <code>warn</code>（只记异常类名，不记消息）</li>
+              <li><strong>继续下一个 server</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:84-100">:84-100</span></li>
+            </ul>
+          </div>
+          <div class="side">
+            <h4><code>required: true</code></h4>
+            <ul>
+              <li>先 <code>toolkit.closeMcpClients()</code> 把<strong>已经连上的全部关掉</strong></li>
+              <li>抛 <code>McpConnectionException</code>，<code>build()</code> 直接失败</li>
+              <li>异常消息只有 <code>"MCP connection failed: " + serverName</code>，不含 endpoint 与凭据<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpConnectionException.java:18-27">McpConnectionException.java:18-27</span></li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          监听器本身是<strong>尽力而为</strong>的：<code>onCompleted</code> 抛异常只会被 <code>warn</code> 掉，不影响注册，也不影响后面的 server<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrar.java:105-119">McpServerRegistrar.java:105-119</span>。结果对象 <code>McpServerRegistrationResult</code> 的构造器还强制两条不变量：<code>SUCCESS</code> 不许带 cause，非 <code>SUCCESS</code> 必须有 cause<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerRegistrationResult.java:30-49">McpServerRegistrationResult.java:30-49</span>。
+        </p>
+        <div class="callout tip">
+          <span class="ct">谁负责关连接</span>
+          <p>
+            <code>HarnessAgent.close()</code> 里有一行 <code>ownedMcpToolkit.closeMcpClients()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:465-473">HarnessAgent.java:465-473</span>。所以 <code>stdio</code> 拉起来的子进程会随 agent 关闭而回收——别忘了 <code>try-with-resources</code> 或显式 <code>close()</code>，否则 npx 进程会一直挂着。
+          </p>
+        </div>
+
+        <h2 id="strictness">MCP × allow/deny：三个交叉陷阱</h2>
+        <p>
+          MCP 工具注册完之后还要被 <code>ToolFilter</code> 过一遍，两者交叉出三个容易踩的点：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">陷阱一：开了 allow，MCP 工具神秘消失</span>
+            <div>
+              <code>isAllowed</code> 里那条 MCP 豁免要求两个条件同时成立：<code>!strictAllow</code>，以及<strong>某个 server 开了 <code>prefixToolNames</code> 且名字以 <code>&lt;server&gt;__</code> 开头</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:67-76">ToolFilter.java:67-76</span>。默认 <code>prefixToolNames=false</code>，工具名是裸的，于是落进「allow 非空但没列我」那一支——被删。两种解法：开前缀，或把 MCP 工具名也写进 <code>allow</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">陷阱二：<code>deny</code> 永远赢</span>
+            <div>
+              <code>deny.contains(name)</code> 是函数第一支，排在平台豁免和 MCP 豁免之前。所以 <code>deny: ["mcp__danger"]</code> 之类的前缀写法<strong>不生效</strong>——这里只做精确匹配，没有通配。要屏蔽整台 server 的工具，只能逐个列名，或者干脆把它从 <code>mcpServers</code> 里删掉。
+            </div>
+          </li>
+          <li>
+            <span class="sh">陷阱三：声明式子 agent 的 <code>tools:</code> 更严</span>
+            <div>
+              子 agent 的 <code>tools: [..]</code> 会被转成一个<strong>新的</strong> <code>ToolsConfig</code>：<code>strictAllow=true</code>、<code>defaultToolsEnabled=false</code>、<code>allow</code> 只保留「父也允许」的那些；<code>deny</code> 与 <code>mcpServers</code> 从父继承<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:287-305">HarnessAgentBuilderSupport.java:287-305</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:542-543">:542-543</span>。因为 <code>strictAllow=true</code>，<strong>平台工具不再豁免</strong>：子 agent 的 <code>tools:</code> 里没写 <code>agent_spawn</code>，它就真的没有。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="assemble">装配：build() 里这四段谁先谁后</h2>
+        <p>
+          只保留与本章相关的段落，顺序是固定的：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>#</th><th>代码位置</th><th>做了什么</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>1</td><td><code>HarnessAgent:2735-2755</code></td><td>若 <code>planModeEnabled</code>：建 <code>PlanModeManager</code>、注册三个工具、装 <code>PlanModeMiddleware</code>（带 <code>readOnlyResolver</code> 闭包与额外放行集合）</td><td>此时 MCP 还没注册，但闭包按调用时求值，所以后面注册的工具也能判定</td></tr>
+              <tr><td>2</td><td><code>HarnessAgent:2757-2771</code></td><td>解析 <code>ToolsConfig</code>（override &gt; 文件 &gt; 无），再调 <code>McpServerRegistrar.register</code></td><td>MCP 工具在此刻进入 toolkit；<strong>失败可能中止 build</strong></td></tr>
+              <tr><td>3</td><td><code>HarnessAgent:2773-2931</code></td><td>技能四层合成、自学习设施、<code>ShellPathPolicy</code>、<code>HarnessSkillMiddleware</code></td><td>其中 <code>shellToolAvailable</code> 会调用 <code>ToolFilter.isAllowed</code>，受第 2 步的配置影响</td></tr>
+              <tr><td>4</td><td><code>HarnessAgent:2933-2937</code></td><td><code>ToolFilter.apply(agentToolkit, resolvedToolsConfig)</code></td><td><strong>最后</strong>动工具面：此时删掉的就是最终删掉的</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          最后一步之后再没有工具注册，所以 <code>apply</code> 的结果就是模型看到的结果。反过来说：<strong>任何在 build 之后动态加进 toolkit 的工具都不受 allow/deny 约束</strong>——包括你在运行时手动 <code>registerTool</code> 的东西。
+        </p>
+
+        <h2 id="doc-gap">官方说了什么 vs 源码实际是什么</h2>
+        <p>
+          这一章的文档偏差比上一章还集中，而且分两类：一类是<strong>写错了</strong>，一类是<strong>写旧了</strong>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>#</th><th>官方说法（2.0.4 文档）</th><th>源码实际</th><th>依据</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1</td>
+                <td>plan 阶段白名单是「4 个工具」：<code>plan_enter</code>/<code>plan_write</code>/<code>plan_exit</code>/<code>todo_write</code><span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:11">plan-mode.md:11</span></td>
+                <td><strong>9 个</strong>：另含 <code>agent_spawn</code>、<code>agent_send</code>、<code>agent_list</code>、<code>task_output</code>、<code>task_list</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:60-70">PlanModeMiddleware.java:60-70</span></td>
+              </tr>
+              <tr>
+                <td>2</td>
+                <td><code>plan_exit</code> 的参数是 <code>rationale</code>（可选）<span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:45">:45</span></td>
+                <td>input schema 里只有 <code>summary</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/PlanModeTools.java:162-174">PlanModeTools.java:162-174</span></td>
+              </tr>
+              <tr>
+                <td>3</td>
+                <td>拒绝结果是 <code>[Tool denied — plan mode is active]\nOnly read-only tools and …</code><span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:70-73">:70-73</span></td>
+                <td>实际是一段以 <code>Blocked: you are in PLAN mode (read-only).</code> 开头的长文案，带「先调查/用 plan_write/准备好再 plan_exit」的指令</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/PlanModeMiddleware.java:72-76">PlanModeMiddleware.java:72-76</span></td>
+              </tr>
+              <tr>
+                <td>4</td>
+                <td>「已知缺口：子 agent 不会自动继承只读限制」，建议手动限制或自己开 plan 模式<span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:151-156">:151-156</span></td>
+                <td><strong>已修</strong>：构建期 <code>configurePlanMode</code> 下传配置；运行期 <code>propagatePlanMode</code> 对新建与复用的子 agent 强制 <code>enterPlanMode</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:598-618">HarnessAgentBuilderSupport.java:598-618</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/AgentSpawnTool.java:739-746">AgentSpawnTool.java:739-746</span></td>
+              </tr>
+              <tr>
+                <td>5</td>
+                <td>「不想用文件？直接 <code>builder.toolsConfig(ToolsConfig.builder()...)</code>」<span class="src" data-src="docs/v2/zh/docs/harness/workspace.md:449">workspace.md:449</span></td>
+                <td><code>ToolsConfig</code> 里<strong>没有</strong> <code>builder()</code>：它是一个 100 行的普通 POJO，只能 <code>new</code> + setter</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfig.java:43-99">ToolsConfig.java:43-99</span></td>
+              </tr>
+              <tr>
+                <td>6</td>
+                <td>「<code>allow</code> 会连内置工具一起砍，务必把 <code>read_file</code>/<code>memory_search</code>/<code>agent_spawn</code> 一并列出」<span class="src" data-src="docs/v2/zh/docs/harness/workspace.md:447">:447</span></td>
+                <td><code>agent_spawn</code> 在 37 个平台工具里，<strong>默认活过 allow</strong>；<code>read_file</code>/<code>memory_search</code> 确实会被砍</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/HarnessPlatformTools.java:35-78">HarnessPlatformTools.java:35-78</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolFilter.java:77-79">ToolFilter.java:77-79</span></td>
+              </tr>
+              <tr>
+                <td>7</td>
+                <td>「<code>tools.json</code> 三种文件系统模式下行为一致，都是 build 时读」<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:498-502">filesystem.md:498-502</span></td>
+                <td>沙箱/远端在 build 期可能<strong>读不到</strong>：catch 后只打 debug、返回空，配置静默失效</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/ToolsConfigLoader.java:62-74">ToolsConfigLoader.java:62-74</span></td>
+              </tr>
+              <tr>
+                <td>8</td>
+                <td><code>workspace.md</code> 的 <code>tools.json</code> 仅展示 <code>allow</code>/<code>deny</code>/<code>mcpServers</code></td>
+                <td>另有 <code>defaultToolsEnabled</code>、<code>strictAllow</code>；MCP 条目还有 <code>enableTools</code>/<code>disableTools</code>/<code>prefixToolNames</code>/<code>required</code>/<code>timeout</code>/<code>initializationTimeout</code>/<code>queryParams</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tools/McpServerConfig.java:44-133">McpServerConfig.java:44-133</span></td>
+              </tr>
+              <tr>
+                <td>9</td>
+                <td>「退出 Plan Mode 走 HITL 确认（<code>ConfirmResult(true)</code>）」<span class="src" data-src="docs/v2/zh/docs/harness/plan-mode.md:49-66">plan-mode.md:49-66</span></td>
+                <td>实际是 <code>PermissionDecision.ask(...)</code>，走<strong>权限引擎</strong>的确认链，不是另一个 <code>ConfirmResult</code> 回调；因此在 <code>DONT_ASK</code> 下会变成 DENY</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/PlanModeTools.java:180-192">PlanModeTools.java:180-192</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          四行里第 4 行最值得注意：这是<strong>文档比代码旧</strong>。遇到这类描述时，最快的判别方式是搜一下对应类名——如果 <code>PlanModeMiddleware</code> 里出现了 <code>propagatePlanMode</code> 这种 API，就说明缺口已经补上了。
+        </p>
+
+        <h2 id="cheatsheet">速查</h2>
+        <h3 id="plan-mode">一、计划模式</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>你要</th><th>写法</th><th>备注</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>开启</td><td><code>.enablePlanMode()</code></td><td>同时装三工具 + 中间件</td></tr>
+              <tr><td>改计划目录</td><td><code>.planFileDirectory("design-docs")</code></td><td>默认 <code>plans</code>，实际文件 <code>&lt;dir&gt;/PLAN.md</code></td></tr>
+              <tr><td>允许 shell 调查</td><td><code>.allowShellInPlanMode()</code></td><td>只放行 <code>execute</code>，写文件工具仍被拒</td></tr>
+              <tr><td>装上 <code>todo_write</code></td><td><code>.enableTaskList()</code></td><td>白名单里有它不代表已注册</td></tr>
+              <tr><td>程序化进入/退出</td><td><code>enterPlanMode(ctx)</code> / <code>exitPlanMode(ctx)</code></td><td>不触发 HITL；<strong>未开 enablePlanMode 时无防护</strong></td></tr>
+              <tr><td>判断是否在 plan</td><td><code>isPlanModeActive(ctx)</code></td><td>读 <code>PlanModeContextState</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 id="tool-filter-order">二、工具面的判定顺序</h3>
+        <pre data-lang="text" data-file="ToolFilter.isAllowed 逐字顺序">name 为空 → false
+cfg 为空 → true
+deny 命中 → false            // 最高优先级，平台工具也挡
+MCP 前缀命中（!strictAllow 且 server.prefixToolNames 且 name 以 server__ 开头）→ true
+平台工具（!strictAllow）→ true
+allow 命中 → true
+defaultToolsEnabled 且 allow 为空 → true
+否则 → false</pre>
+        <h3 id="mcp-failure-matrix">三、MCP 失败矩阵</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>情况</th><th><code>required=false</code></th><th><code>required=true</code></th></tr>
+            </thead>
+            <tbody>
+              <tr><td>连不上 / 初始化失败</td><td>warn + <code>FAILED</code>，继续下一个</td><td>关掉已连的全部 client，抛 <code>McpConnectionException</code></td></tr>
+              <tr><td>连上但过滤后零工具</td><td colspan="2">关闭 client、不注册，仍然上报 <code>SUCCESS</code></td></tr>
+              <tr><td>名字空白 / 配置为 null</td><td colspan="2">跳过，上报 <code>SKIPPED</code>（带 <code>IllegalArgumentException</code>）</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <h4>陷阱 1：开了 plan 模式，模型却什么都能干</h4>
+          <p>
+            两种可能：① 你只调了 <code>agent.enterPlanMode(ctx)</code>，却没在 builder 上 <code>enablePlanMode()</code>——中间件根本没装；② 你用的是 <code>enterPlanMode</code> 之后又手动重建了 agent（子 agent 或者新的 builder），新实例的 <code>planActive</code> 默认为假。先看 <code>isPlanModeActive</code>，再看有没有 <code>PlanModeMiddleware</code>。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h4>陷阱 2：以为 plan 阶段能「先小改一下」</h4>
+          <p>
+            <code>write_file</code>/<code>edit_file</code> 在 plan 阶段<strong>一律被拒</strong>，包括改一个错别字。真要改，只能走 <code>plan_write</code>（只改计划文件），或者先 <code>plan_exit</code> 拿批准。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h4>陷阱 3：无人值守 + plan 模式 = 卡死</h4>
+          <p>
+            <code>PermissionMode.DONT_ASK</code> 把 ASK 降成 DENY，而 <code>plan_exit</code> 只会 ASK。结果：模型反复请求退出、反复被拒、直到耗尽 <code>maxIters</code>。批量任务要么别让它进 plan，要么用程序化 <code>exitPlanMode</code> 退出。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h4>陷阱 4：allow 白名单把 <code>todo_write</code> 砍了</h4>
+          <p>
+            它不在平台豁免名单里，<code>readOnly</code> 也是 <code>false</code>。表现是：plan 退出后模型说「我会拆任务」，但从来没调过工具——因为工具不存在。检查 <code>ToolFilter</code> 那条 INFO 日志里的 <code>remain</code> 列表。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h4>陷阱 5：MCP 的 <code>enableTools</code> 写对了，工具还是没出现</h4>
+          <p>
+            先确认 server 名与工具名都没写错（写错只是被过滤，不会报错），再确认 <code>defaultToolsEnabled</code> 没被误设成 <code>false</code>，最后看 <code>tools.json</code> 的 <code>allow</code> 是否把它砍了（默认 <code>prefixToolNames=false</code> 时没有 MCP 豁免）。三步都没问题，就去看是不是 build 期根本没读到文件。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h4>陷阱 6：一个可选 MCP server 拖慢了整个 build</h4>
+          <p>
+            注册是同步且逐条的，每个 server 都要 <code>initialize().block()</code> + <code>listTools().block()</code>。给每个条目配 <code>timeout</code>/<code>initializationTimeout</code>，并评估是否真需要放在主 agent 上（也可以用 <code>tools.json</code> 只给子 agent）。
+          </p>
+        </div>
+        <div class="pitfall">
+          <h4>陷阱 7：以为声明式子 agent 会自动继承平台工具</h4>
+          <p>
+            声明式 <code>tools: [read_file]</code> 会生成 <code>strictAllow=true</code> 的配置，平台工具不再豁免——子 agent 不能派孙 agent、不能写 todo。需要协作能力就把对应名字写进 <code>tools:</code>，并确保父的配置也允许它们。
+          </p>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>1. plan 阶段下，<code>read_file</code>、<code>web_search</code>、<code>execute</code>、<code>agent_spawn</code> 四个调用分别放行吗？</summary>
+          <p>
+            放行 / 放行 / 默认拒绝（除非 <code>allowShellInPlanMode()</code>）/ 放行。前两个靠 <code>readOnly=true</code>，第三个因为双用途且默认非只读，第四个在白名单里——而且它拉起的子 agent 会被 <code>propagatePlanMode</code> 同样置为 plan。
+          </p>
+        </details>
+        <details>
+          <summary>2. <code>tools.json</code> 写 <code>"allow": ["read_file"]</code>，<code>agent_spawn</code> 和 <code>todo_write</code> 还在吗？</summary>
+          <p>
+            <code>agent_spawn</code> 在（平台工具豁免 allow）；<code>todo_write</code> 不在（不在平台名单，allow 非空且未列出→被删）。同理，所有 MCP 工具默认也不在（<code>prefixToolNames=false</code> 时无豁免）。
+          </p>
+        </details>
+        <details>
+          <summary>3. MCP 条目写了 <code>"transport":"stdio"</code> 但没写 <code>command</code>，会发生什么？</summary>
+          <p>
+            <code>buildClient</code> 先校验 transport（合法），再进 <code>configureStdio</code>；那里发现 <code>command</code> 空白，抛 <code>IllegalArgumentException("stdio MCP server 'x' requires a 'command'.")</code>。然后看 <code>required</code>：为假则 warn + 继续构建，为真则关掉已连 client 并中止 build。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">看见一次 DENIED</span>
+            <div>
+              用 <code>LocalFilesystemSpec</code> + <code>enablePlanMode()</code> 起一个 agent，给一个「先出方案再改代码」的任务。从事件流里找 <code>TOOL_RESULT_END</code> 且状态为 <code>DENIED</code> 的那条，比对它的文案与 <code>PlanModeMiddleware.DENY_MESSAGE</code>；同时确认 <code>state.contextMutable()</code> 里多了一条对应的 tool result（可用自定义中间件打印消息数量）。
+            </div>
+          </li>
+          <li>
+            <span class="sh">对比 <code>allowShellInPlanMode</code></span>
+            <div>
+              同一个任务再跑一次，加上 <code>.allowShellInPlanMode()</code>，确认两件事：<code>execute</code> 不再被拒；系统提示末尾多了一段「以下工具额外可用……只用于 cat/ls/grep/git log」的 <code>system-reminder</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">验证 tools.json 的三条语义</span>
+            <div>
+              写一份 <code>tools.json</code>：<code>allow: ["read_file","todo_write"]</code>、<code>deny: ["execute"]</code>，开 <code>enableTaskList()</code> 但不 <code>allowShellInPlanMode</code>。启动后看 INFO 日志里的 remain 列表，逐项解释：为什么 <code>agent_spawn</code> 还在、为什么 <code>glob_files</code> 没了、为什么 <code>todo_write</code> 还在。再在 allow 里加一个拼错的名字，确认只看得到一条 warn。
+            </div>
+          </li>
+          <li>
+            <span class="sh">接一台 stdio MCP 并让它进 plan</span>
+            <div>
+              配一个 <code>npx -y @modelcontextprotocol/server-filesystem ./workspace</code> 的 server，设 <code>prefixToolNames: true</code> 与 <code>required: false</code>，启动后确认工具名是 <code>local-fs__read_file</code> 这种形式。然后在 plan 阶段让它调一次 MCP 工具：预期是 <code>DENIED</code>（没声明 <code>readOnlyHint</code> 的 MCP 工具默认非只读）。最后把 <code>command</code> 改成一个不存在的命令，观察 build 是否继续、监听器收到什么状态。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">完成这一章之后</h2>
+        <p>
+          到这里，「能力」这一条线就闭环了：第 16 章管「知识怎么按需展开」，这一章管「动作怎么被约束与扩充」。还剩下的最后一块是「它怎么变成服务」——网关、渠道、消息总线、异步工具，以及这些东西怎么把上面所有能力串成一条可运维的链路。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="18-gateway-channel-bus.html">18 网关、渠道与异步</a></td><td>把本章装好的 agent 接到真实渠道上；<code>MessageBus</code> 与 <code>AsyncToolRegistry</code> 都在这条链上</td></tr>
+              <tr><td><a href="16-skill.html">16 技能：从 SKILL.md 到治理</a></td><td><code>ShellPathPolicy</code> 由本章的 <code>ToolFilter.isAllowed("execute")</code> 决定；<code>skill_manage</code> 在平台名单里</td></tr>
+              <tr><td><a href="14-subagent-team.html">14 子 agent 与团队</a></td><td>plan 模式下的 <code>agent_spawn</code> 与会话隔离、状态传播</td></tr>
+              <tr><td><a href="08-permission-hitl.html">8 权限与 HITL</a></td><td><code>PermissionDecision.ask</code> 的完整链路，以及 <code>DONT_ASK</code>/<code>BYPASS</code> 的差别</td></tr>
+              <tr><td><a href="../appendix/api-cheatsheet.html#h-plan">附录 C：Harness ⑥计划模式与团队</a></td><td>这一章所有 builder 方法的一页清单</td></tr>
+              <tr><td>官方 <code>docs/v2/zh/docs/harness/plan-mode.md</code></td><td>流程与取舍可以看；白名单、参数名、子 agent 缺口三处以本章为准</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">一句话记住这一章</span>
+          <p>
+            计划模式靠 <code>onActing</code> 按<strong>名字</strong>拦、放行集合是 <strong>9 个名字加 <code>readOnly=true</code></strong>、退出必过 <code>ASK</code>；<code>tools.json</code> 在 <strong>build 末尾</strong>物理删工具、<code>deny</code> 永远赢、<strong>37 个平台工具默认豁免 allow</strong>；MCP 在<strong>过滤之前</strong>同步注册、<code>required</code> 为真时连不上就中止构建——记住这五句，剩下的细节都能从 <code>PlanModeMiddleware:60-70</code>、<code>PlanModeTools:185-192</code>、<code>ToolFilter:55-80</code>、<code>HarnessAgent:2933-2937</code>、<code>McpServerRegistrar:84-100</code> 推回来。
+          </p>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="这一页不解释功能，只回答一个问题：我现在该打开哪个目录。统计口径是 2.0.4 源码里的 .java 文件数（递归含子包、不含测试）：agentscope-core 有 308 个，agentscope-harness 的 agent 包下有 269 个。数字只用来看「这个包有多重」，不是质量指标。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="附录 D 源码地图：core 20 个包 + harness 15 个子包 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="这一页不解释功能，只回答一个问题：我现在该打开哪个目录。统计口径是 2.0.4 源码里的 .java 文件数（递归含子包、不含测试）：agentscope-core 有 308 个，agentscope-harness 的 agent 包下有 269 个。数字只用来看「这个包有多重」，不是质量指标。" />
+    <title>附录 D 源码地图：core 20 个包 + harness 15 个子包 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="source-map" data-root="..">
+    <main>
+      <article class="article">
+        <h1>附录 D · 源码地图：core 20 个包 + harness 15 个子包</h1>
+        <p class="lede">
+          这一页不解释功能，只回答一个问题：<strong>我现在该打开哪个目录</strong>。统计口径是 2.0.4
+          源码里的 <code>.java</code> 文件数（递归含子包、不含测试）：<code>agentscope-core</code> 有
+          <strong>308</strong> 个，<code>agentscope-harness</code> 的 <code>agent</code> 包下有
+          <strong>269</strong> 个。数字只用来看「这个包有多重」，不是质量指标。
+        </p>
+
+        <h2 id="how">怎么用这一页</h2>
+        <ul class="goals">
+          <li><strong>别从头读。</strong>先看下面的「症状 → 包」，带着问题跳进去，读完一个类就回来</li>
+          <li>每一行给出「管什么」和「先看哪个类」。<strong>类名是入口，不是全部</strong>：真正的细节往往在它的内部类里</li>
+          <li>包里文件多不代表重要，只代表可变体多。比如 <code>tool</code> 有 57 个文件，是因为它同时包含注解、注册表、执行器、MCP、内置工具五摊事</li>
+          <li>在 IDEA 里 <code>Ctrl+N</code> 直接搜类名，比顺着目录点快得多；本页的作用是告诉你<strong>搜什么</strong></li>
+        </ul>
+        <div class="callout tip">
+          <span class="ct">一个反直觉的结论：最大的包不是 <code>agent</code></span>
+          <p>
+            <code>tool</code> 57 个文件、<code>model</code> 40 个，而 <code>agent</code> 只有 27 个。
+            这说明框架的核心不是「agent 这个类」，而是它调用的那些零件：模型适配、工具协议、消息与状态。
+            <code>ReActAgent</code> 本身只负责把零件串成循环——所以遇到问题时，<strong>先怀疑零件，再怀疑循环</strong>。
+          </p>
+        </div>
+
+        <h2 id="layers">先建立一张分层图</h2>
+        <p>
+          两个模块的关系不是「大模块包含小模块」，而是<strong>同一个引擎 + 不同外壳</strong>：
+          <code>HarnessAgent</code> 内部持有一个 <code>ReActAgent</code>，把自己装配的中间件挂到它的循环上。
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">agentscope-harness · io.agentscope.harness.agent</span>
+            <div class="ld">
+              外壳：工作区、文件系统、沙箱、子 agent、技能、计划模式、消息总线。
+              <strong>它不重新实现循环</strong>，只往 <code>ReActAgent</code> 上装中间件。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">agentscope-core 根 · agent · middleware · hook</span>
+            <div class="ld">
+              循环与编排：<code>ReActAgent</code> 的主循环、<code>AgentBase</code> 的生命周期与 Hook 分发、
+              <code>MiddlewareBase</code> 的四类包裹点。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">message · event · formatter · model · tool · memory · state · permission · rag · skill</span>
+            <div class="ld">
+              零件：这一层才是日常改代码最常碰的。第 04 ~ 09 章讲的就是它们。
+            </div>
+          </div>
+        </div>
+        <p class="src-line">
+          core 的唯一入口类：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:218">ReActAgent.java:218</span>；harness 的入口：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:169">HarnessAgent.java:169</span>
+        </p>
+
+        <h2 id="core">core：20 个包，按「你为什么会打开它」分四组</h2>
+        <p>
+          包的顺序按「入口 → 契约 → 零件 → 横切」排。第一次读源码时，建议只读前两组；第三组等遇到具体问题时再按行跳。
+        </p>
+
+        <h3 id="packages-entry">1. 入口与循环（5 个包）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>包</th><th>文件</th><th>管什么</th><th>先看哪个类</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>core</code>（根）</td><td>2</td><td>模块的公开入口与版本号</td><td><code>ReActAgent</code>；还有一个 <code>Version</code></td></tr>
+              <tr><td><code>agent</code></td><td>27</td><td>Agent 契约、基类生命周期、运行时上下文、运行控制</td><td><code>Agent</code> / <code>AgentBase</code> / <code>RuntimeContext</code></td></tr>
+              <tr><td><code>middleware</code></td><td>8</td><td>中间件契约：四类 Input + 链式执行 + 两个内置实现</td><td><code>MiddlewareBase</code>（一个类包住四个切点）</td></tr>
+              <tr><td><code>hook</code></td><td>20</td><td>旧版切点回调：20 个 <code>HookEvent</code> 与分发器</td><td><code>Hook</code> / <code>HookEventType</code>；新代码优先用 middleware</td></tr>
+              <tr><td><code>interruption</code></td><td>3</td><td>中断的「谁在中断、中断到哪一步」</td><td><code>InterruptControl</code></td></tr>
+              <tr><td><code>shutdown</code></td><td>10</td><td>优雅停机：JVM 钩子、在跑请求收尾、状态落盘</td><td><code>GracefulShutdownManager</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="packages-contract">2. 内容与契约（4 个包）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>包</th><th>文件</th><th>管什么</th><th>先看哪个类</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>message</code></td><td>23</td><td>消息与内容块：4 种 role、12 种内容块相关类型、两个状态枚举</td><td><code>Msg</code>；配 <code>GenerateReason</code> / <code>ToolCallState</code></td></tr>
+              <tr><td><code>event</code></td><td>35</td><td>对外事件流：31 种事件 + <code>ConfirmResult</code> + 发射器</td><td><code>AgentEvent</code> / <code>AgentEventType</code></td></tr>
+              <tr><td><code>formatter</code></td><td>6</td><td>把消息翻译成各家模型要的 JSON，再把回包翻译回来</td><td><code>AbstractBaseFormatter</code>；<strong>厂商差异都在这里</strong></td></tr>
+              <tr><td><code>exception</code></td><td>1</td><td>把多个异常聚合成一个</td><td><code>CompositeAgentException</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="packages-runtime">3. 执行与治理（8 个包）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>包</th><th>文件</th><th>管什么</th><th>先看哪个类</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>model</code></td><td>40</td><td>模型抽象、注册表、生成参数、执行配置、工具 schema；含 <code>transport</code> 22 个</td><td><code>Model</code> / <code>ModelRegistry</code></td></tr>
+              <tr><td><code>tool</code></td><td>57</td><td>注解、<code>ToolBase</code>、注册表、执行器、分组、MCP、内置工具</td><td><code>Toolkit</code> / <code>ToolBase</code> / <code>ToolExecutor</code></td></tr>
+              <tr><td><code>memory</code></td><td>8</td><td>进上下文的那串消息，以及长期记忆的两种接法</td><td><code>Memory</code> / <code>StateBackedMemory</code> / <code>LongTermMemory</code></td></tr>
+              <tr><td><code>state</code></td><td>17</td><td>会话状态存哪、怎么存、冲突怎么办；还带任务与计划模式的状态</td><td><code>AgentStateStore</code> / <code>JsonFileAgentStateStore</code></td></tr>
+              <tr><td><code>permission</code></td><td>8</td><td>五种模式、四种行为、规则表与六步判定引擎</td><td><code>PermissionEngine</code> / <code>PermissionContextState</code></td></tr>
+              <tr><td><code>rag</code></td><td>7</td><td>知识库抽象、检索模式、检索工具与自动检索 Hook</td><td><code>Knowledge</code> / <code>GenericRAGHook</code></td></tr>
+              <tr><td><code>skill</code></td><td>17</td><td>技能模型、过滤器、仓库、按需加载与工具工厂</td><td><code>AgentSkill</code> / <code>SkillFilter</code></td></tr>
+              <tr><td><code>credential</code></td><td>6</td><td>模型凭据与 <code>ModelCard</code>：key 从哪读、怎么匹配</td><td><code>ModelCard</code>；查「key 为什么没读到」时来</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="packages-crosscut">4. 横切与占位（3 个包）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>包</th><th>文件</th><th>管什么</th><th>先看哪个类</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>tracing</code></td><td>4</td><td>链路追踪抽象与 OpenTelemetry 中间件</td><td><code>Tracer</code> / <code>OtelTracingMiddleware</code></td></tr>
+              <tr><td><code>util</code></td><td>8</td><td>JSON 编解码、消息工具、类型与异常工具</td><td><code>JsonCodec</code> / <code>MessageUtils</code></td></tr>
+              <tr><td><code>workspace</code></td><td>1</td><td><strong>只有 package-info</strong>：core 不实现工作区</td><td>想看工作区去 <code>harness.agent.workspace</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          <span class="ct">为什么 <code>workspace</code> 是个空包</span>
+          <p>
+            它只留了一份 <code>package-info.java</code> 说明「工作区是 Harness 的概念」。这不是没写完，而是模块边界：
+            core 只承诺「状态可存可取」，不承诺「工作区目录长什么样」。所以你在 core 里永远找不到
+            <code>WorkspaceManager</code>。
+          </p>
+        </div>
+
+        <h2 id="core-sub">core 里值得单独记住的 15 个子包</h2>
+        <p>
+          子包只在「主包太杂」时才拆。下面这些名字会反复出现在堆栈里，先混个脸熟：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>子包</th><th>文件</th><th>一句话</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>model.transport</code></td><td>22</td><td>HTTP / SSE 传输与请求体拼装；抓包对不上时先来这里</td></tr>
+              <tr><td><code>model.spi</code></td><td>1</td><td><code>ModelProvider</code>：所有厂商扩展实现的唯一接口</td></tr>
+              <tr><td><code>tool.mcp</code></td><td>7</td><td>MCP 客户端封装、内容转换、<code>McpTool</code></td></tr>
+              <tr><td><code>tool.file</code></td><td>3</td><td><code>ReadFileTool</code> / <code>WriteFileTool</code> / 路径工具</td></tr>
+              <tr><td><code>tool.coding</code></td><td>4</td><td><code>ShellCommandTool</code> + Unix / Windows 命令校验器</td></tr>
+              <tr><td><code>tool.subagent</code></td><td>3</td><td>把子 agent 包成工具的 <code>SubAgentTool</code></td></tr>
+              <tr><td><code>tool.builtin</code></td><td>1</td><td><code>TodoTools</code>：任务清单工具</td></tr>
+              <tr><td><code>agent.accumulator</code></td><td>5</td><td>流式增量拼装：文本、思考、工具调用各一个累加器</td></tr>
+              <tr><td><code>agent.config</code></td><td>4</td><td><code>ModelConfig</code> / <code>ReactConfig</code> / <code>FailoverListener</code></td></tr>
+              <tr><td><code>agent.user</code></td><td>4</td><td><code>UserAgent</code> 与流式用户输入（人工输入型 agent）</td></tr>
+              <tr><td><code>hook.recorder</code></td><td>1</td><td><code>JsonlTraceExporter</code>：把切点落成 JSONL</td></tr>
+              <tr><td><code>rag.model</code></td><td>3</td><td><code>Document</code> / <code>DocumentMetadata</code> / <code>RetrieveConfig</code></td></tr>
+              <tr><td><code>skill.repository</code></td><td>5</td><td>Classpath / FileSystem / RuntimeContext 三种仓库实现</td></tr>
+              <tr><td><code>skill.util</code></td><td>3</td><td><code>MarkdownSkillParser</code> 等解析工具</td></tr>
+              <tr><td><code>state.legacy</code></td><td>1</td><td><code>ToolkitState</code>：旧状态迁移用</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="harness">harness：根包 4 个类 + 15 个子包</h2>
+        <p>
+          <code>io.agentscope.harness.agent</code> 根下只有四个文件：<code>HarnessAgent</code>、
+          <code>HarnessAgentBuilderSupport</code>（装配逻辑）、<code>DistributedStore</code>（分布式组件聚合）、
+          <code>IsolationScope</code>（隔离范围）。剩下的全在子包里，<strong>按能力分，不按层分</strong>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>子包</th><th>文件</th><th>管什么</th><th>内含</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>middleware</code></td><td>20</td><td>Harness 的全部「加装行为」：压缩、记忆、计划模式、子 agent、团队、收件箱</td><td>20 个中间件，一文件一个</td></tr>
+              <tr><td><code>tool</code></td><td>18</td><td>内置工具：文件、Shell、联网、记忆、计划、子 agent、团队、异步等待</td><td>—</td></tr>
+              <tr><td><code>tools</code></td><td>9</td><td>工具配置与 MCP 注册：<code>ToolsConfig</code>、<code>McpServerRegistrar</code>、<code>ToolFilter</code></td><td>注意：单数 <code>tool</code> 是工具，复数 <code>tools</code> 是配置</td></tr>
+              <tr><td><code>workspace</code></td><td>7</td><td>工作区管理、路径策略、索引、路径归一化</td><td><code>plan</code> 1（计划模式）</td></tr>
+              <tr><td><code>filesystem</code></td><td>33</td><td>文件系统抽象与组合：复合、覆盖、路由、本地、远程、沙箱</td><td><code>model</code> 12、<code>remote</code> 5、<code>sandbox</code> 4、<code>spec</code> 3、<code>local</code> 2、<code>util</code> 1</td></tr>
+              <tr><td><code>sandbox</code></td><td>45</td><td>沙箱生命周期、状态、快照、工作区投影</td><td><code>snapshot</code> 9、<code>layout</code> 8、<code>impl</code> 5、<code>json</code> 1</td></tr>
+              <tr><td><code>skill</code></td><td>33</td><td>工作区技能仓库与运行时</td><td><code>curator</code> 23、<code>runtime</code> 7</td></tr>
+              <tr><td><code>subagent</code></td><td>27</td><td>子 agent 声明、工厂、后台任务、远程协议</td><td><code>task</code> 13、<code>protocol</code> 6</td></tr>
+              <tr><td><code>memory</code></td><td>12</td><td>长期记忆配置、flush、合并、后台任务</td><td><code>compaction</code> 4、<code>session</code> 4</td></tr>
+              <tr><td><code>gateway</code></td><td>34</td><td>对外网关：会话轮次租约、子 agent 桥接、渠道路由</td><td><code>channel</code> 17</td></tr>
+              <tr><td><code>team</code></td><td>11</td><td>AgentTeams：客户端、上下文、消息、任务</td><td>—</td></tr>
+              <tr><td><code>transcript</code></td><td>4</td><td>会话转录：分段追加存储</td><td>文件系统 / 对象存储两种实现</td></tr>
+              <tr><td><code>bus</code></td><td>6</td><td>消息总线与异步工具注册表</td><td>工作区版实现各一个</td></tr>
+              <tr><td><code>artifact</code></td><td>3</td><td><code>deliver_artifact</code> 的请求、结果、目标</td><td>—</td></tr>
+              <tr><td><code>coordination</code></td><td>3</td><td>周期门闩：本地版、存储版、接口</td><td>记忆维护的「多久跑一次」</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="harness-sub">harness 的 18 个二级子包</h2>
+        <p>
+          只有前一行表格里「内含」不为空才展开。名字很长的，基本可以望文生义；这里只补一句最容易猜错的。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>二级子包</th><th>文件</th><th>一句话</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>filesystem.util</code></td><td>1</td><td><code>FilesystemUtils</code>：路径与流的共用工具</td></tr>
+              <tr><td><code>filesystem.model</code></td><td>12</td><td>文件系统的数据模型：<code>FileInfo</code>、<code>ReadResult</code>、<code>GrepResult</code> 等</td></tr>
+              <tr><td><code>filesystem.remote</code></td><td>5</td><td><code>RemoteFilesystem</code>：走网络的文件系统</td></tr>
+              <tr><td><code>filesystem.sandbox</code></td><td>4</td><td>沙箱文件系统的四种包装（含「钉住」版本）</td></tr>
+              <tr><td><code>filesystem.spec</code></td><td>3</td><td><code>LocalFilesystemSpec</code> / <code>SandboxFilesystemSpec</code> / <code>RemoteFilesystemSpec</code></td></tr>
+              <tr><td><code>filesystem.local</code></td><td>2</td><td><code>LocalFilesystem</code> 与带 Shell 的版本</td></tr>
+              <tr><td><code>sandbox.snapshot</code></td><td>9</td><td>沙箱快照：本地 / 远程 / 空实现各一套</td></tr>
+              <tr><td><code>sandbox.layout</code></td><td>8</td><td>工作区投影的条目类型：文件 / 目录 / 挂载 / Git 仓库</td></tr>
+              <tr><td><code>sandbox.impl</code></td><td>5</td><td>目前只有 Docker 一种实现</td></tr>
+              <tr><td><code>sandbox.json</code></td><td>1</td><td><code>HarnessSandboxJacksonModule</code>：沙箱状态的序列化模块</td></tr>
+              <tr><td><code>skill.curator</code></td><td>23</td><td>技能治理：候选、晋升门禁、可见性过滤、审计、安全扫描</td></tr>
+              <tr><td><code>skill.runtime</code></td><td>7</td><td>技能运行时：目录、加载工具、提示词构建、市场暂存</td></tr>
+              <tr><td><code>subagent.task</code></td><td>13</td><td>后台子 agent 的任务模型与仓库</td></tr>
+              <tr><td><code>subagent.protocol</code></td><td>6</td><td>远程子 agent 的事件协议与编解码</td></tr>
+              <tr><td><code>gateway.channel</code></td><td>17</td><td><strong>渠道抽象</strong>（Channel / Binding / Router）；具体飞书钉钉适配在 extensions 里</td></tr>
+              <tr><td><code>memory.compaction</code></td><td>4</td><td>压缩配置、会话压缩器、token 计数、工具结果驱逐配置</td></tr>
+              <tr><td><code>memory.session</code></td><td>4</td><td>会话树、新鲜度评估、转录写入</td></tr>
+              <tr><td><code>workspace.plan</code></td><td>1</td><td><code>PlanModeManager</code>：计划模式的落盘与恢复</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="paths">六条「症状 → 包」的追踪路线</h2>
+        <p>
+          这六条覆盖了前 18 章会遇到的绝大多数问题。每条都按<strong>从外到内</strong>的顺序排，先看最外层。
+        </p>
+        <ol class="steps">
+          <li>
+            <strong>模型返回的东西不对</strong><br />
+            <code>model.transport</code>（HTTP / SSE 原样）→ <code>formatter.AbstractBaseFormatter</code>（转成
+            <code>ContentBlock</code>）→ <code>message.Msg</code>。断点打在 formatter 上，能立刻分清是「厂商没给」还是
+            「框架没解析」。
+          </li>
+          <li>
+            <strong>工具没被调用，或参数是空的</strong><br />
+            <code>tool.Toolkit</code>（注册）→ <code>tool.ToolSchemaGenerator</code>（给模型看的 schema）→
+            <code>tool.ToolExecutor</code>（真正执行）→ <code>ToolResultBlock</code>。MCP 工具先看
+            <code>tool.mcp.McpTool</code>，它的调用链多一层客户端。
+          </li>
+          <li>
+            <strong>agent 为什么停了</strong><br />
+            先读 <code>Msg.getGenerateReason()</code> 的 12 个值，再进 <code>ReActAgent</code> 主循环找对应分支，
+            最后才看 <code>event.AgentEndEvent</code>。<strong>别先怀疑模型</strong>：一半的「它不继续了」是
+            <code>MAX_ITERATIONS</code> 或 <code>PERMISSION_ASKING</code>。
+          </li>
+          <li>
+            <strong>重启后状态没了</strong><br />
+            <code>state.AgentStateStore</code>（存在哪、key 是什么）→ <code>memory.StateBackedMemory</code>
+            （怎么读回）→ <code>ReActAgent</code> 的加载与保存。Harness 还要多查一层
+            <code>workspace.WorkspaceManager</code>：状态和工作区是两个地方。
+          </li>
+          <li>
+            <strong>Harness 多出来的行为从哪来</strong><br />
+            <code>harness.agent.middleware</code> 的 20 个类，名字就是功能。最快的办法是在
+            <code>HarnessAgent.build()</code> 里搜 <code>inner.middleware</code>，能看到它们的<strong>安装顺序</strong>——
+            顺序决定谁先看到消息。
+          </li>
+          <li>
+            <strong>渠道消息没回复，或后台结果永远不回来</strong><br />
+            <code>gateway.channel.ChannelRouter</code>（选了哪个 agent、哪个会话键）→
+            <code>gateway.HarnessGateway</code>（sessionId、轮次锁）→ <code>bus.MessageBus</code>
+            （inbox / 唤醒队列）→ <code>gateway.WakeupDispatcher</code>（谁被叫醒）→
+            <code>middleware.InboxMiddleware</code>（结果什么时候被注入）。断点先打在
+            <code>resolveRoute</code>：五成问题是 routing binding 写错后静默落到了主 agent。
+          </li>
+        </ol>
+        <p class="src-line">
+          中间件安装位置（搜 <code>inner.middleware</code>）：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2520">HarnessAgent.java:2520</span>；消息与原因枚举：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/message/GenerateReason.java:36">GenerateReason.java:36</span>
+        </p>
+
+        <h2 id="extensions">扩展到哪去找：不在 core / harness 里的那些</h2>
+        <p>
+          本站覆盖 core 与 harness（第 01–18 章），但你看源码时一定会跳到别的模块。记住包名规律就够了：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模块</th><th>包名</th><th>典型实现</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>模型厂商</td><td><code>io.agentscope.extensions.model.&lt;provider&gt;</code></td><td><code>DashScopeModelProvider</code> 实现 <code>model.spi.ModelProvider</code></td></tr>
+              <tr><td>状态存储</td><td><code>io.agentscope.extensions.&lt;store&gt;</code></td><td><code>RedisAgentStateStore</code>（在 <code>.redis.state</code>）；MySQL / Postgres / Mongo 提供的是 <code>*DistributedStore</code>，对应 Harness 的 <code>distributedStore(...)</code></td></tr>
+              <tr><td>RAG</td><td><code>io.agentscope.extensions.rag.&lt;vendor&gt;</code></td><td>Dify / RagFlow / Bailian / Haystack</td></tr>
+              <tr><td>长期记忆</td><td><code>io.agentscope.extensions.memory.&lt;vendor&gt;</code></td><td>Mem0 / ReMe / 百炼记忆</td></tr>
+              <tr><td>渠道</td><td><code>io.agentscope.extensions.channel.&lt;vendor&gt;</code></td><td>飞书 / 钉钉 / 企微 / GitHub / GitLab</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">找扩展代码的最快办法：从 SPI 反查</span>
+          <p>
+            核心只认两个 SPI：<code>model.spi.ModelProvider</code> 和 <code>AgentStateStore</code>。
+            在 IDEA 里对接口按 <em>Ctrl+Alt+B</em>（Show Implementations），所有扩展实现会一次列出来，
+            比按模块名猜路径可靠。
+          </p>
+        </div>
+
+        <h2 id="read">读源码的三条建议</h2>
+        <ul class="goals">
+          <li><strong>先读接口，再读唯一实现。</strong><code>Agent</code> 只有四个承诺，<code>Model</code> 只有几个方法；读完契约再看实现，不会被 27 个辅助类淹掉</li>
+          <li><strong>把 builder 当功能清单。</strong><code>ReActAgent</code> 43 个、<code>HarnessAgent</code> 97 个方法，按能力分组就是一份路线图（见<a href="api-cheatsheet.html">附录 C</a>）</li>
+          <li><strong>测试是最好的用例。</strong><code>agentscope-core/src/test</code> 与 <code>agentscope-harness/src/test</code> 里有大量「最小可复现」，比读实现快</li>
+        </ul>
+        <div class="callout">
+          <span class="ct">关于这一页的数字</span>
+          <p>
+            308 与 269 是 <strong>2.0.4 快照</strong>下 <code>src/main/java</code> 里 <code>.java</code> 文件的递归计数，
+            不含测试与扩展模块；同一个文件只算一次。换版本后数字一定会变，但<strong>包的划分很少变</strong>——
+            这页真正有用的是「哪个包管什么」，不是具体数字。
+          </p>
+        </div>
+
+        <h2 id="next">接着看什么</h2>
+        <ul class="goals">
+          <li>想按功能查 builder 方法：<a href="api-cheatsheet.html">附录 C API 速查</a></li>
+          <li>报错文本对不上：<a href="errors.html">附录 B 报错速查</a></li>
+          <li>概念名字想不起来：<a href="glossary.html">附录 A 术语表</a></li>
+          <li>想把这些包串成一条真实调用链：<a href="../chapters/11-capstone.html">第 11 章综合案例</a></li>
+        </ul>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

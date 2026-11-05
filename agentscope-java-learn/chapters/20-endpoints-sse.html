@@ -1,0 +1,907 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="控制台能聊只是第一步，应用要调它得有一个稳定入口。这一章把 Managed Agent 发布成 Endpoint：conversation 与 job 两种契约怎么选、asep_ 开头的 API key 怎么发、Idempotency-Key 为什么必填、SSE 帧长什么样、断线后靠什么续传、状态机里哪些状态才算完成。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="20 Endpoint 与 SSE：把 Agent 发布成一条带凭据的调用契约 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="控制台能聊只是第一步，应用要调它得有一个稳定入口。这一章把 Managed Agent 发布成 Endpoint：conversation 与 job 两种契约怎么选、asep_ 开头的 API key 怎么发、Idempotency-Key 为什么必填、SSE 帧长什么样、断线后靠什么续传、状态机里哪些状态才算完成。" />
+    <title>20 Endpoint 与 SSE：把 Agent 发布成一条带凭据的调用契约 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="20-endpoints-sse" data-root="..">
+    <main>
+      <article class="article">
+        <h1>20 · Endpoint 与 SSE：把 Agent 发布成一条带凭据的调用契约</h1>
+        <p class="lede">
+          第 19 章结束时，你在控制台里有了一个能对话的 Agent。但「人坐在浏览器前点按钮」和「另一个系统自动调它」是两件事：后者需要固定地址、可轮换的凭据、输入输出约定、
+          幂等重试、以及一条能把过程播出来的事件流。这一章把 Agent 发布成 <strong>Endpoint</strong>，
+          然后像第三方系统那样，用 <code>curl</code> 把它完整跑一遍。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 Endpoint 到底「包装」了什么：为什么它必须是一个与运行时地址解耦的稳定契约</li>
+          <li>在 conversation 与 job 之间做正确选择，并知道 Team / Workflow 为什么只能走 job</li>
+          <li>发布一个 Endpoint，拿到 <code>asep_</code> 开头的 key，并解释它为什么还能被找回</li>
+          <li>用 <code>curl</code> 提交一个 job，从 <code>eventsUrl</code> 读 SSE，从 <code>statusUrl</code> 取结果</li>
+          <li>解释三个高频故障：为什么 <code>X-Builder-Environment-Key</code> 调不通、为什么断线不等于失败、为什么重试要复用同一个 key</li>
+        </ul>
+
+        <h2 id="why">先说为什么：控制台能聊，不等于系统能调</h2>
+        <p>
+          官方对 Endpoint 的定义只有一句话，但每个词都是约束：把 Agent、Team 或已发布的 Workflow revision
+          包装成<strong>具有认证、输入输出 schema 和调用记录的服务</strong>，调用方无需了解内部调度和运行时地址<span
+            class="src"
+            data-src="docs/v2/zh/service/endpoints.md:10"
+            >endpoints.md:10</span
+          >。源码里的注释把这句话补全了：Endpoint 是「稳定公开的 API 契约」，<strong>运行时绑定与物理实例在调用时才解析，
+          永远不会变成公开地址的一部分</strong><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/controlplane/model/agent_endpoint.go:51-53"
+            >agent_endpoint.go:51-53</span
+          >。
+        </p>
+        <p>把「控制台里的一次对话」和「一条 Endpoint 调用」并排看，差别立刻出来：</p>
+        <div class="compare">
+          <div class="col">
+            <h4>控制台里点「发送」</h4>
+            <ul>
+              <li>身份是登录用户的 JWT</li>
+              <li>地址是 SPA 拼出来的 <code>/api/sessions/...</code></li>
+              <li>目标 Agent 是本次会话里选中的那个实例</li>
+              <li>重发一次，就是多说一句话</li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4>应用调用 Endpoint</h4>
+            <ul>
+              <li>身份是 Endpoint 自己的 key 或平台令牌</li>
+              <li>地址是 <code>/invoke/v1/endpoints/{slug}/...</code>，与部署无关</li>
+              <li>目标由发布的 release 决定，调用方看不见</li>
+              <li>重发一次，可能命中幂等、也可能报冲突</li>
+            </ul>
+          </div>
+        </div>
+        <div class="callout tip">
+          <span class="ct">一句话分工</span>
+          <p>
+            控制台是「给人用的客户端」，Endpoint 是「给系统用的契约」。前者可以依赖登录态和内部路由，后者不行——
+            所以 Endpoint 必须自己带认证、自己定 schema、自己记调用记录，并且把「调度到哪台机器」藏起来。
+          </p>
+        </div>
+
+        <h2 id="two-modes">两种契约：conversation 与 job</h2>
+        <p>
+          发布时要先选调用形式，只有两种<span class="src" data-src="docs/v2/zh/service/endpoints.md:14-21">endpoints.md:14-21</span>：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>形式</th><th>请求入口</th><th>语义</th><th>结果怎么拿</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>conversation</strong></td>
+                <td><code>/invoke/v1/endpoints/{slug}/conversations</code></td>
+                <td>多轮交互；下一轮发到 <code>/invoke/v1/conversations/{conversationId}/turns</code></td>
+                <td>订阅 <code>eventsUrl</code>，用 <code>invocationId</code> 判断这一轮何时结束</td>
+              </tr>
+              <tr>
+                <td><strong>job</strong></td>
+                <td><code>/invoke/v1/endpoints/{slug}/jobs</code></td>
+                <td>一次可跟踪的工作；Agent、Team、Workflow 都能用</td>
+                <td>轮询 <code>statusUrl</code> 取 <code>invocation.result</code>，文件走 artifacts 接口</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          源码里这两条不是「建议」而是<strong>硬校验</strong>。发布时，conversation 只允许 <code>targetType=agent</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:292-294"
+            >agent_endpoint_handler.go:292-294</span
+          >；调用时还会再看一次，模式不对直接 409<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1183-1186"
+            >agent_endpoint_handler.go:1183-1186</span
+          >。Team 与 Workflow revision 则明确只支持 job，Readiness 会给出 <code>incompatible</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:615-640"
+            >agent_endpoint_handler.go:615-640</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">别把「能对话的 Agent」套在 Team 上</span>
+          <p>
+            官方原话是「不要强行将只支持 job 的 Team / Workflow 作为会话目标」<span
+              class="src"
+              data-src="docs/v2/zh/service/endpoints.md:21"
+              >endpoints.md:21</span
+            >。原因不神秘：conversation 绑定的是<strong>一个 session 的多轮</strong>，而 Team 的产物是一次 Run 的编排结果，
+            两者根本不是一个形状。
+          </p>
+        </div>
+        <p>
+          请求体也完全不同。conversation 只认 <code>{"message":"..."}</code>，空消息直接 400<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1213-1223"
+            >agent_endpoint_handler.go:1213-1223</span
+          >；job 认 <code>title</code>、<code>description</code> 和 <code>input</code>，<code>title</code>
+          缺省时会被填成 <code>Endpoint job</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1434-1460"
+            >agent_endpoint_handler.go:1434-1460</span
+          >。
+        </p>
+
+        <h2 id="publish">发布：slug、schema、认证，以及先看 Readiness</h2>
+        <p>
+          在目标详情的 Endpoint 发布区域创建入口，设置 slug、模式、schema、认证、超时和请求大小限制；
+          发布前看 Readiness，处理目标缺失或能力不匹配<span
+            class="src"
+            data-src="docs/v2/zh/service/endpoints.md:21"
+            >endpoints.md:21</span
+          >。创建接口的校验顺序值得记住，因为报错文本就是按这个顺序出的：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>约束</th><th>不满足时</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>name</code> / <code>slug</code> / <code>targetRef</code></td>
+                <td>都不能为空；slug 只允许小写字母、数字与单个连字符分隔</td>
+                <td><code>name, slug and targetRef are required</code></td>
+              </tr>
+              <tr>
+                <td><code>slug</code> 正则</td>
+                <td><code>^[a-z0-9]+(?:-[a-z0-9]+)*$</code></td>
+                <td><code>slug must contain lowercase letters, numbers, and single hyphen separators</code></td>
+              </tr>
+              <tr>
+                <td><code>invocationMode</code></td>
+                <td>只能是 <code>conversation</code> 或 <code>job</code></td>
+                <td><code>invocationMode must be conversation or job</code></td>
+              </tr>
+              <tr>
+                <td><code>timeoutSeconds</code> / <code>maxPayloadBytes</code></td>
+                <td>不能为负数</td>
+                <td><code>timeoutSeconds and maxPayloadBytes cannot be negative</code></td>
+              </tr>
+              <tr>
+                <td><code>rateLimit</code></td>
+                <td>给了就必须 <code>requests</code> 与 <code>windowSeconds</code> 都为正</td>
+                <td><code>rateLimit requires positive requests and windowSeconds</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          以上五行全部来自同一个函数 <span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:282-311">agent_endpoint_handler.go:282-311</span>；
+          slug 正则定义在文件头部 <span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:56">agent_endpoint_handler.go:56</span>。
+        </p>
+        <p>
+          另一个容易忽略的默认值：<strong>不写 <code>authPolicy</code> 就等于 <code>api_key</code></strong>，而且创建响应里
+          会直接带出一个默认凭据的明文 key<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:354-365"
+            >agent_endpoint_handler.go:354-365</span
+          ><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:386-399"
+            >agent_endpoint_handler.go:386-399</span
+          >。也就是说，「先建一个试试」也可能已经产生了一把可用的钥匙——建完要立刻决定是保管还是撤销。
+        </p>
+        <p>
+          创建成功只是 <code>draft</code>，<strong>Draft 不接收正式调用</strong><span
+            class="src"
+            data-src="docs/v2/zh/service/endpoints.md:25"
+            >endpoints.md:25</span
+          >。Publish 时请求体必须带 <code>version</code>，Readiness 不兼容就 409 并把原因一起返回<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:682-693"
+            >agent_endpoint_handler.go:682-693</span
+          >；首次发布会自动写一条 release，理由是 <code>initial publication</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:694-701"
+            >agent_endpoint_handler.go:694-701</span
+          >。之后的版本切换、回滚都不是改 Endpoint 本身，而是追加 release——slug 与契约保持稳定，目标历史保留下来<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/controlplane/model/agent_endpoint.go:80-93"
+            >agent_endpoint.go:80-93</span
+          >。
+        </p>
+        <div class="callout">
+          <span class="ct">Readiness 的六种状态值得先认全</span>
+          <p>
+            <code>ready</code>、<code>unavailable</code>（目标 Agent 不活跃）、<code>inactive</code> /
+            <code>unbound</code>（没有可用实例或绑定）、<code>incompatible</code>（模式与目标类型不匹配）、
+            <code>disabled</code>（已归档）<span
+              class="src"
+              data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:571-649"
+              >agent_endpoint_handler.go:571-649</span
+            >。发布被 409 挡住时，先看返回里的 <code>readiness.reason</code>，比翻日志快。
+          </p>
+        </div>
+
+        <h2 id="credential">凭据：asep_ 前缀、两种认证、三条轮换规则</h2>
+        <p>
+          选 <code>api_key</code> 时创建调用凭据，并以 <code>X-API-Key</code> 发送；选 <code>platform</code> 时使用
+          <code>Authorization: Bearer</code>，两种凭据用途不能互换<span
+            class="src"
+            data-src="docs/v2/zh/service/endpoints.md:25"
+            >endpoints.md:25</span
+          >。源码生成的 key 长这样：<code>asep_</code> 加 32 字节随机数的 base64url 编码<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:66-75"
+            >agent_endpoint_handler.go:66-75</span
+          >。
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">库里存的是三样东西，不是明文</span>
+            <div class="ld">
+              前缀（用于查行）、SHA-256 哈希（用于常量时间比对）、AES-GCM 密文（用于授权后「再看一眼」）。所以凭据列表里
+              只能看到前缀，<code>reveal</code> 才能拿回完整 key<span
+                class="src"
+                data-src="agentscope-service/aistio/internal/controlplane/model/agent_endpoint.go:103-120"
+                >agent_endpoint.go:103-120</span
+              >。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">轮换后 principal 不变</span>
+            <div class="ld">
+              新 key 的 <code>rotatedFrom</code> 指回根凭据，认证时用它算 principal<span
+                class="src"
+                data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1136-1143"
+                >agent_endpoint_handler.go:1136-1143</span
+              >。所以轮换不会让同一个人「变成另一个人」，历史 job 仍归他。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">每次都记 LastUsedAt，签发时可设过期</span>
+            <div class="ld">
+              认证成功会更新使用时间；过期时间一到，即使 key 没被撤销也会判无效<span
+                class="src"
+                data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1124-1138"
+                >agent_endpoint_handler.go:1124-1138</span
+              >。轮换与撤销都是新增状态，不是删行。
+            </div>
+          </div>
+        </div>
+        <p>
+          还有一个藏在实现里的宽容：<code>api_key</code> 模式下先读 <code>X-API-Key</code>，读不到会退回
+          <code>Authorization: Bearer</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1120-1123"
+            >agent_endpoint_handler.go:1120-1123</span
+          >。这不是「两种认证可以互换」——policy 仍然决定走哪条分支；它只是让不支持自定义头的 HTTP 客户端也能带上 key。
+        </p>
+        <div class="callout warn">
+          <span class="ct"><code>X-Builder-Environment-Key</code> 不是 Endpoint 凭据</span>
+          <p>
+            API 参考里它是<strong>Worker 工具执行协议</strong>的头，和 Endpoint API key 分属两行<span
+              class="src"
+              data-src="docs/v2/zh/service/api-reference.md:12-21"
+              >api-reference.md:12-21</span
+            >。更关键的是：Gateway 在 <code>/invoke/v1/**</code> 这条路由上会主动移除它，连同
+            <code>X-Builder-Internal-Token</code> 与 <code>X-Builder-Internal-User</code><span
+              class="src"
+              data-src="agentscope-service/service-gateway/src/main/resources/application.yml:80-88"
+              >application.yml:80-88</span
+            >。所以拿它调 Endpoint，结果只能是 401，而不是「权限更大」。
+          </p>
+        </div>
+        <p>
+          限流也是 Endpoint 自己的属性：配置了 <code>rateLimit</code> 就按 <strong>principal</strong> 计数，超了返回
+          429 与 <code>Retry-After</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1147-1169"
+            >agent_endpoint_handler.go:1147-1169</span
+          >。这也是「为不同调用方建不同凭据」的实际收益：限流与审计能分开算<span
+            class="src"
+            data-src="docs/v2/zh/service/endpoints.md:27"
+            >endpoints.md:27</span
+          >。
+        </p>
+
+        <h2 id="first-job">最小可跑：提交一个 job，然后拿到它的结果</h2>
+        <p>
+          假设已发布一个 slug 为 <code>report</code> 的 job Endpoint，且 input schema 允许 <code>request</code> 字段。
+          把 <code>BASE_URL</code> 设为 Gateway 的公开 origin（末尾不带斜杠），<code>ENDPOINT_TOKEN</code>
+          设为该入口的凭据<span class="src" data-src="docs/v2/zh/service/endpoints.md:31-41">endpoints.md:31-41</span>：
+        </p>
+        <pre data-lang="bash" data-file="service endpoints（节选）">curl --fail-with-body "$BASE_URL/invoke/v1/endpoints/report/jobs" \
+  -H "X-API-Key: $ENDPOINT_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: report-order-001' \
+  --data '{"title":"Prepare report","description":"Summarize the supplied material","input":{"request":"List the open questions"}}'</pre>
+        <p>
+          响应是 202，带四个必须保存的东西：<code>invocationId</code>、<code>status</code>、<code>statusUrl</code>、
+          <code>eventsUrl</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1770-1782"
+            >agent_endpoint_handler.go:1770-1782</span
+          >。如果这次 job 已经物化出 Issue 与 Run，响应里还会多 <code>issueId</code>、<code>runId</code>。
+        </p>
+        <pre data-lang="json" data-file="job 提交响应（示意）">{
+  "invocationId": "9f1c...",
+  "status": "running",
+  "statusUrl": "/invoke/v1/jobs/9f1c...",
+  "eventsUrl": "/invoke/v1/jobs/9f1c.../events",
+  "issueId": "3a77...",
+  "runId": "d2e0..."
+}</pre>
+        <p>
+          官方提醒得很直接：<strong>保存返回的 URL，用它查询状态或订阅事件，不要自行拼接假定的内部 Run 地址</strong><span
+            class="src"
+            data-src="docs/v2/zh/service/endpoints.md:43"
+            >endpoints.md:43</span
+          >。然后先查一次状态：
+        </p>
+        <pre data-lang="bash" data-file="service endpoints（节选）">curl --fail-with-body "$BASE_URL$STATUS_PATH" -H "X-API-Key: $ENDPOINT_TOKEN"</pre>
+        <p>
+          状态响应是三个对象的合体：<code>invocation</code> 本身，加上 <code>issue</code> 与 <code>run</code>
+          的摘要<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1860-1866"
+            >agent_endpoint_handler.go:1860-1866</span
+          >。终态时 <code>invocation.result</code> 才承载结果，按该 Endpoint 的 output schema 读<span
+            class="src"
+            data-src="docs/v2/zh/service/endpoints.md:50"
+            >endpoints.md:50</span
+          >。要文件就走 artifacts 列表，再用返回的 <code>downloadUrl</code> 和同一凭据下载<span
+            class="src"
+            data-src="docs/v2/zh/service/sse-events.md:106-108"
+            >sse-events.md:106-108</span
+          >。
+        </p>
+        <div class="callout">
+          <span class="ct">job 背后真的有一个 Issue</span>
+          <p>
+            实现里，job 会先创建一个 <code>IssueKindEndpointJob</code> 的 Issue，完成策略是自动，来源标记为
+            <code>endpoint</code>，然后把 Agent 或 Team 指为 assignee<span
+              class="src"
+              data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1483-1522"
+              >agent_endpoint_handler.go:1483-1522</span
+            >。所以控制台的 Issue 列表里能看到它——这也是排查「job 卡住」时最有用的一处现场。
+          </p>
+        </div>
+
+        <h2 id="sse">SSE：帧格式、心跳、游标与续传</h2>
+        <p>
+          订阅只要三件事：同一个凭据、<code>GET</code> 到 <code>eventsUrl</code>、<code>Accept: text/event-stream</code><span
+            class="src"
+            data-src="docs/v2/zh/service/sse-events.md:12-17"
+            >sse-events.md:12-17</span
+          >。每条业务事件包含 <code>id</code>、<code>event</code> 与 JSON <code>data</code>，以空行结束<span
+            class="src"
+            data-src="docs/v2/zh/service/sse-events.md:21-30"
+            >sse-events.md:21-30</span
+          >：
+        </p>
+        <pre data-lang="text" data-file="service sse-events（节选）">id: 1
+event: run.started
+data: {"id":"...","runId":"...","sequence":1,"type":"run.started","actor":{"type":"system","ref":"endpoint:example"},"occurredAt":"..."}
+
+</pre>
+        <p>
+          服务端就是按这个格式逐帧写出的：<code>id: %d
+event: %s
+data: %s
+
+</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1962-1965"
+            >agent_endpoint_handler.go:1962-1965</span
+          >。响应头四项也都写死：<code>text/event-stream</code>、<code>no-cache, no-transform</code>、
+          <code>keep-alive</code>、<code>X-Accel-Buffering: no</code>——最后一项专门用来关掉 Nginx 一类代理的缓冲<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:2001-2005"
+            >agent_endpoint_handler.go:2001-2005</span
+          >。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>你会看到</th><th>它是什么</th><th>怎么处理</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>id:</code></td>
+                <td>该流的顺序游标，不是调用 ID</td>
+                <td>处理成功后保存，断线续传用它</td>
+              </tr>
+              <tr>
+                <td><code>event:</code></td>
+                <td>事件类型</td>
+                <td>按类型分派，遇到未知类型要容忍</td>
+              </tr>
+              <tr>
+                <td><code>data:</code></td>
+                <td>一个 JSON 事件对象</td>
+                <td>Conversation 与 Job 的结构不同，分别解析</td>
+              </tr>
+              <tr>
+                <td><code>: heartbeat</code></td>
+                <td>空事件的注释行，服务端 15 秒没新事件就发一次</td>
+                <td>忽略，不当成 JSON，也不当成进展</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          心跳不是协议要求，是实现的等待策略：服务端最多等 15 秒新事件，超时就写一行 <code>: heartbeat\n\n</code> 再继续<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1981-1995"
+            >agent_endpoint_handler.go:1981-1995</span
+          >。它也解释了为什么长时间没内容时连接不会立刻断——但这也意味着「连着」不等于「在跑」。
+        </p>
+        <p><strong>续传靠游标，不靠重连碰运气。</strong>两个入口都接受 <code>after</code> 查询参数与 <code>Last-Event-ID</code> 头，同时给出时取较大的有效数值<span class="src" data-src="docs/v2/zh/service/sse-events.md:84-93">sse-events.md:84-93</span>，源码里就是一次比较<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1951-1954">agent_endpoint_handler.go:1951-1954</span>：</p>
+        <pre data-lang="bash" data-file="service sse-events（节选）">curl -N --fail-with-body "$BASE_URL$EVENTS_PATH" \
+  -H "X-API-Key: $ENDPOINT_TOKEN" \
+  -H 'Accept: text/event-stream' \
+  -H "Last-Event-ID: $LAST_EVENT_ID"</pre>
+        <p>
+          conversation 与 job 的事件<strong>不是同一种事件</strong>，字段名都不一样：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th></th><th>Conversation</th><th>Job</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>事件来源</td><td>运行时 Session 事件</td><td>Run 编排事件</td></tr>
+              <tr><td>SSE <code>id</code> 对应</td><td><code>seq</code></td><td><code>sequence</code></td></tr>
+              <tr><td>类型字段</td><td><code>eventType</code></td><td><code>type</code></td></tr>
+              <tr><td>关联标识</td><td><code>sessionFk</code>，可能带 <code>frameworkMeta</code></td><td><code>runId</code>，可选 <code>nodeId</code> / <code>attemptId</code></td></tr>
+              <tr><td>常用内容</td><td><code>role</code>、<code>content</code>、<code>toolName</code></td><td><code>actor</code>、<code>payload</code>、<code>occurredAt</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          表格来自 <span class="src" data-src="docs/v2/zh/service/sse-events.md:48-59">sse-events.md:48-59</span>。
+          实现上的差别也能对上：job 的 <code>eventsUrl</code> 读的是 Run 的事件表<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1957-1966"
+            >agent_endpoint_handler.go:1957-1966</span
+          >，conversation 读的是 Session 事件<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1660-1670"
+            >agent_endpoint_handler.go:1660-1670</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">从 0 订阅 conversation，可能收到「上一轮」</span>
+          <p>
+            conversation 的 <code>eventsUrl</code> 带一个 <code>invocationId</code> 查询参数，它只用来判断<strong>当前这轮何时结束</strong>，
+            不会把 Session 历史过滤成只剩这一轮；从游标 0 开始订阅，可能先收到早先的会话事件<span
+              class="src"
+              data-src="docs/v2/zh/service/sse-events.md:70"
+              >sse-events.md:70</span
+            >。实现里也确认了这一点：返回的 URL 就长这样<span
+              class="src"
+              data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1309-1314"
+              >agent_endpoint_handler.go:1309-1314</span
+            >。所以客户端要按 <code>turnId</code> 等关联信息区分轮次，别把历史当新回复重复显示。
+          </p>
+        </div>
+        <p>
+          最后一条边界：这里用的是标准 SSE 封装，业务事件是 <strong>Service 的会话或编排事件</strong>，
+          不要假设 <code>data</code> 是某个模型厂商的 token 增量协议，也不要依赖固定的 <code>[DONE]</code> 标记<span
+            class="src"
+            data-src="docs/v2/zh/service/sse-events.md:46"
+            >sse-events.md:46</span
+          >。流结束的唯一可靠信号，是状态查询说它到了终态。
+        </p>
+
+        <h2 id="state">状态与幂等：哪些状态算完成，重发会发生什么</h2>
+        <p>
+          调用状态一共八个，源码里是一组常量<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/controlplane/model/agent_endpoint.go:122-133"
+            >agent_endpoint.go:122-133</span
+          >：
+        </p>
+        <div class="timeline">
+          <li>
+            <span class="who">accepted</span>
+            <span class="what">请求已受理，还没开始派发。不是完成。</span>
+          </li>
+          <li>
+            <span class="who">dispatching</span>
+            <span class="what">正在物化目标（建 Issue / 建 Run / 派 AgentTask）。不是完成。</span>
+          </li>
+          <li>
+            <span class="who">running</span>
+            <span class="what">Run 已启动、正在执行。不是完成。</span>
+          </li>
+          <li>
+            <span class="who">waiting</span>
+            <span class="what">等待人工审批或外部条件。不是完成，但通常需要人。</span>
+          </li>
+          <li>
+            <span class="who">completed</span>
+            <span class="what">成功终态。结果在 <code>invocation.result</code>。</span>
+          </li>
+          <li>
+            <span class="who">failed / cancelled / timed_out</span>
+            <span class="what">三种不成功的终态，分别对应执行失败、主动取消、超过 <code>timeoutSeconds</code>。</span>
+          </li>
+        </div>
+        <p>
+          「终态」在代码里就是一个四值判断<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:2008-2011"
+            >agent_endpoint_handler.go:2008-2011</span
+          >；SSE 循环也只在「Run 终态」或「invocation 终态」时才关流<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1970-1977"
+            >agent_endpoint_handler.go:1970-1977</span
+          >。所以断线本身不携带任何「成功/失败」信息。
+        </p>
+        <div class="callout warn">
+          <span class="ct">partial success 也会映射成 completed</span>
+          <p>
+            Run 结束时按状态映射：<code>succeeded</code> 与 <code>partial_succeeded</code> 都映射为
+            <code>completed</code>，只有 <code>cancelled</code> 映射为取消，其余算失败<span
+              class="src"
+              data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1829-1843"
+              >agent_endpoint_handler.go:1829-1843</span
+            >。官方也写了「单个节点成功不代表整个 Run 成功；部分成功是否足够由业务决定」<span
+              class="src"
+              data-src="docs/v2/zh/service/sse-events.md:110"
+              >sse-events.md:110</span
+            >。也就是说：<code>completed</code> 是「调用结束且没整体失败」，不等于「业务验收通过」。
+          </p>
+        </div>
+        <p>
+          <strong>幂等键不是可选优化，是必填项。</strong>job 与 conversation 都在第一步就校验它，缺了直接 400
+          <code>Idempotency-Key is required</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1429-1433"
+            >agent_endpoint_handler.go:1429-1433</span
+          ><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1232-1236"
+            >agent_endpoint_handler.go:1232-1236</span
+          >。同一个 key 再来一次，只有两种结局：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>重发的请求</th><th>结果</th><th>为什么</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>同 key + 同内容</td>
+                <td>返回原来那次 invocation（202），不会重复执行</td>
+                <td>先按 key 找到记录，内容一致就直接复用<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1472-1479">agent_endpoint_handler.go:1472-1479</span></td>
+              </tr>
+              <tr>
+                <td>同 key + 不同内容</td>
+                <td>409 <code>Idempotency-Key was already used with different input</code></td>
+                <td>内容不一致说明这是另一个业务请求，却复用了旧号<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1473-1475">agent_endpoint_handler.go:1473-1475</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「内容一致」的判断比字符串相等聪明一点：它先把 JSON 解析再重新序列化，<strong>忽略对象 key 顺序</strong>，同时保留数字精度<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:171-189"
+            >agent_endpoint_handler.go:171-189</span
+          >。所以你重试时字段顺序变了不算「不同内容」，但改了一个值就一定算。job 还会把这个 key 与 Endpoint ID
+          拼起来，作为 Run 的幂等键<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1523-1548"
+            >agent_endpoint_handler.go:1523-1548</span
+          >——两层幂等，任一层挡住都不会重复建 Run。
+        </p>
+        <p>
+          超时也是状态机的一部分：配了 <code>timeoutSeconds</code> 且已过期，读取状态时会被就地改成
+          <code>timed_out</code>、错误码 <code>endpoint_timeout</code>；job 还会顺带取消 Run<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1751-1767"
+            >agent_endpoint_handler.go:1751-1767</span
+          >。这就是为什么「查状态」不只是读，它可能推进状态。
+        </p>
+
+        <h2 id="line">端到端：一条 job 请求在平台里走了哪些门</h2>
+        <p>
+          把前面几节串成时间轴，每一步都对应截图上能验证的一行：
+        </p>
+        <ul class="timeline">
+          <li>
+            <span class="who">应用 → Gateway</span>
+            <span class="what">请求进 <code>/invoke/v1/**</code>，Gateway 用一条独立路由转发到 Control，并剥掉客户端伪造的环境头与内部头<span class="src" data-src="agentscope-service/service-gateway/src/main/resources/application.yml:77-88">application.yml:77-88</span>。</span>
+          </li>
+          <li>
+            <span class="who">Gateway → Control</span>
+            <span class="what">aistiod 从 slug 取 Endpoint，校验是否已发布、认证策略、限流，再校验请求体与 input schema<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1413-1467">agent_endpoint_handler.go:1413-1467</span>。</span>
+          </li>
+          <li>
+            <span class="who">Control：幂等</span>
+            <span class="what">用 <code>Idempotency-Key</code> 预留 invocation。命中旧的且内容相同就原地返回；内容不同就 409<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1463-1479">agent_endpoint_handler.go:1463-1479</span>。</span>
+          </li>
+          <li>
+            <span class="who">Control：物化</span>
+            <span class="what">建一个来源为 <code>endpoint</code> 的 Issue，把 Agent / Team 设为 assignee；Agent 走 direct Run，Team 走 adaptive Run，Workflow 则从已发布 revision 启动<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1483-1549">agent_endpoint_handler.go:1483-1549</span>。</span>
+          </li>
+          <li>
+            <span class="who">Control → Dataplane</span>
+            <span class="what">派发排队中的 AgentTask；Managed Agent 的模型循环在 Dataplane 里跑，产出 run 事件<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1555-1560">agent_endpoint_handler.go:1555-1560</span>。</span>
+          </li>
+          <li>
+            <span class="who">应用 ← eventsUrl</span>
+            <span class="what">SSE 从 Run 事件表按 <code>sequence</code> 顺序吐出；15 秒无新事件发心跳；Run 到终态关流<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1957-1996">agent_endpoint_handler.go:1957-1996</span>。</span>
+          </li>
+          <li>
+            <span class="who">应用 ← statusUrl</span>
+            <span class="what">最后再查一次状态：<code>completed</code> 读 <code>invocation.result</code>，否则按 <code>errorCode</code> 处理；同时能看到 issue 与 run 的摘要<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1815-1867">agent_endpoint_handler.go:1815-1867</span>。</span>
+          </li>
+        </ul>
+        <p>
+          把这张时间轴与第 19 章的组件表叠起来看，会发现 Endpoint 的入口与编排决策都在 <strong>Control</strong> 里：
+          Gateway 只转发，Dataplane 只执行模型循环与工具，Scheduler 不参与这条同步链路。这也解释了为什么「Endpoint 报错」和「Agent 回复慢」
+          要查完全不同的地方。
+        </p>
+
+        <h2 id="cheatsheet">速查：路径、错误码、三个必存变量</h2>
+        <p>调用侧只有 10 条路由，全部挂在 Gateway 上<span class="src" data-src="agentscope-service/aistio/internal/httpapi/server.go:387-396">server.go:387-396</span>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>用途</th><th>方法与路径</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>开启 conversation</td><td><code>POST /invoke/v1/endpoints/{slug}/conversations</code></td></tr>
+              <tr><td>继续一轮</td><td><code>POST /invoke/v1/conversations/{conversationId}/turns</code></td></tr>
+              <tr><td>conversation 状态</td><td><code>GET /invoke/v1/conversations/{conversationId}</code></td></tr>
+              <tr><td>conversation 事件</td><td><code>GET /invoke/v1/conversations/{conversationId}/events</code></td></tr>
+              <tr><td>提交 job</td><td><code>POST /invoke/v1/endpoints/{slug}/jobs</code></td></tr>
+              <tr><td>job 状态</td><td><code>GET /invoke/v1/jobs/{invocationId}</code></td></tr>
+              <tr><td>job 事件</td><td><code>GET /invoke/v1/jobs/{invocationId}/events</code></td></tr>
+              <tr><td>job 交付文件列表</td><td><code>GET /invoke/v1/jobs/{invocationId}/artifacts</code></td></tr>
+              <tr><td>下载单个交付文件</td><td><code>GET /invoke/v1/jobs/{invocationId}/artifacts/{artifactId}</code></td></tr>
+              <tr><td>取消 job</td><td><code>POST /invoke/v1/jobs/{invocationId}/cancel</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>错误码按「谁的问题」记，比背文案有用：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>响应</th><th>典型原因</th><th>下一步</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>400</td><td>缺 <code>Idempotency-Key</code>、空 message、input 不符合 schema、payload 超限</td><td>先修请求，不要换 key</td></tr>
+              <tr><td>401</td><td>key 错误/过期/已撤销，或把环境头当成了凭据</td><td>核对认证类型与凭据</td></tr>
+              <tr><td>404</td><td>slug 不存在、Endpoint 未发布或已归档、job 不属于当前 principal</td><td>先确认是「没有」还是「不是你的」</td></tr>
+              <tr><td>409</td><td>模式不匹配、幂等键内容冲突、Readiness 不兼容</td><td>读响应里的原因，别盲目重试</td></tr>
+              <tr><td>413</td><td>超过 <code>maxPayloadBytes</code></td><td>压缩或拆分输入</td></tr>
+              <tr><td>429</td><td>超过 <code>rateLimit</code></td><td>按 <code>Retry-After</code> 退避，保留同一个 key</td></tr>
+              <tr><td>503</td><td>限流器不可用或派发失败</td><td>先查状态，再决定重试</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          错误语义与官方错误表一致 <span class="src" data-src="docs/v2/zh/service/api-reference.md:74-84">api-reference.md:74-84</span>；
+          具体状态码来自实现里的分支，例如 413 <span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1443-1446">agent_endpoint_handler.go:1443-1446</span>、
+          409 模式不匹配 <span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1425-1428">agent_endpoint_handler.go:1425-1428</span>、
+          404 归属校验 <span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1808-1812">agent_endpoint_handler.go:1808-1812</span>。
+        </p>
+        <div class="callout tip">
+          <span class="ct">应用侧只需要存三个变量</span>
+          <p>
+            <code>BASE_URL</code>（Gateway 公开 origin）、<code>ENDPOINT_TOKEN</code>（凭据，放后端 secret 配置）、
+            <code>LAST_EVENT_ID</code>（按流分别保存的游标）。<strong>不要</strong>存内部 Run 地址、不要存 slug
+            之外的拼装路径，也不要把 key 塞进前端页面<span
+              class="src"
+              data-src="docs/v2/zh/service/endpoints.md:27"
+              >endpoints.md:27</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. 用 <code>X-Builder-Environment-Key</code> 调 Endpoint，一直 401</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>请求带着「看起来更内部」的头，但返回 <code>invalid endpoint credential</code>。</dd>
+            <dt>因为</dt>
+            <dd>它是 Worker 工具执行协议的头，不是 Endpoint 凭据<span class="src" data-src="docs/v2/zh/service/api-reference.md:20">api-reference.md:20</span>；而且 Gateway 在 <code>/invoke/v1/**</code> 上会主动把它删掉<span class="src" data-src="agentscope-service/service-gateway/src/main/resources/application.yml:80-88">application.yml:80-88</span>，根本到不了校验逻辑。</dd>
+            <dt>改成</dt>
+            <dd>按 policy 二选一：<code>X-API-Key</code> 或 <code>Authorization: Bearer</code>。想「绕过用户权限」的念头也要打消：平台管理员不等于能读所有私有工作<span class="src" data-src="docs/v2/zh/service/access.md:28">access.md:28</span>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. SSE 连接断了，就判定「任务失败」并重新提交</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>网络抖动后 curl 退出，界面上任务还显示执行中——或者反过来，任务其实成功了，却因为重提又跑了一遍。</dd>
+            <dt>因为</dt>
+            <dd>SSE 只是事件传输方式，接到一个事件或连接关闭都不能单独作为成功依据<span class="src" data-src="docs/v2/zh/service/sse-events.md:19">sse-events.md:19</span>。重连不会重新提交工作，重提才会<span class="src" data-src="docs/v2/zh/service/sse-events.md:95">sse-events.md:95</span>。</dd>
+            <dt>改成</dt>
+            <dd>断了先查 <code>statusUrl</code>；还要看事件就用同一凭据带 <code>Last-Event-ID</code> 重新订阅。只有确实要重试提交时，才复用原 <code>Idempotency-Key</code>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. 重试时换了新的 <code>Idempotency-Key</code>，结果多出两条 job</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>业务上只应有一次报告生成，Issue 列表里却有两个 endpoint job，各带一个 Run。</dd>
+            <dt>因为</dt>
+            <dd>幂等只在「同一个 key」内生效；新 key 就是新的业务请求<span class="src" data-src="docs/v2/zh/service/endpoints.md:56-58">endpoints.md:56-58</span>。而且 job 会真实创建 Issue 与 Run，副作用是可见的。</dd>
+            <dt>改成</dt>
+            <dd>把 key 的生成放在「业务请求」这一层：一次用户操作生成一次，重传沿用；用户明确发起新工作才换 key。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 把 Team 发布成 conversation，卡在 Readiness</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>发布时报 <code>endpoint target is incompatible</code>，或调用时 409 <code>endpoint does not accept conversations</code>。</dd>
+            <dt>因为</dt>
+            <dd>conversation 在发布与调用两处都要求 <code>targetType=agent</code><span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:286-294">agent_endpoint_handler.go:286-294</span>；Team 与 Workflow revision 只支持 job<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:615-640">agent_endpoint_handler.go:615-640</span>。</dd>
+            <dt>改成</dt>
+            <dd>要「多轮聊」就发布 Agent；要「跑一次团队任务、拿结果」就发布 Team 的 job。两者可以并存，共用同一个 slug 命名空间要另起名字。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. 看到 <code>completed</code> 就当成业务验收通过</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>调用成功、<code>result</code> 也有内容，但交付物缺了一部分。</dd>
+            <dt>因为</dt>
+            <dd><code>partial_succeeded</code> 也会映射成 <code>completed</code><span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1832-1843">agent_endpoint_handler.go:1832-1843</span>；官方明确说部分成功是否足够由业务决定<span class="src" data-src="docs/v2/zh/service/sse-events.md:110">sse-events.md:110</span>。</dd>
+            <dt>改成</dt>
+            <dd>把 <code>completed</code> 当「调用结束」，再按 output schema 与业务标准校验 <code>result</code>；必要时结合 issue 摘要与 artifacts 列表确认。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>为什么 SSE 的 <code>id</code> 不能用 <code>data</code> 里那个 JSON <code>id</code> 来做续传？</summary>
+          <p>
+            因为两者不是一回事：SSE <code>id</code> 是这条流的顺序游标（Conversation 对应 <code>seq</code>，Job 对应
+            <code>sequence</code>），而 JSON 里的 <code>id</code> 是存储记录标识<span
+              class="src"
+              data-src="docs/v2/zh/service/sse-events.md:32-35"
+              >sse-events.md:32-35</span
+            >。官方还专门写了一句：Conversation JSON 的 <code>id</code> 不能用于续传，Job JSON 的 <code>id</code>
+            也不能代替 <code>sequence</code><span
+              class="src"
+              data-src="docs/v2/zh/service/sse-events.md:59"
+              >sse-events.md:59</span
+            >。
+          </p>
+        </details>
+        <details>
+          <summary>同一个 <code>Idempotency-Key</code> 再发一次，服务端会做哪些判断？</summary>
+          <p>
+            先按 key 找已有 invocation：找不到就新建；找到且内容一致，直接返回原来那次（202），不重复执行；内容不一致则
+            409<span
+              class="src"
+              data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1463-1479"
+              >agent_endpoint_handler.go:1463-1479</span
+            >。判断「一致」时会规范化 JSON 的 key 顺序<span
+              class="src"
+              data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:171-189"
+              >agent_endpoint_handler.go:171-189</span
+            >，所以字段顺序变了不算冲突。
+          </p>
+        </details>
+        <details>
+          <summary>为什么查询别人的 job 得到的是 404，而不是 403？</summary>
+          <p>
+            因为读取 job 时会先认证 Endpoint，再把 <code>invocation.PrincipalRef</code> 与当前 principal 比对，
+            不一致直接返回 <code>job is unavailable</code><span
+              class="src"
+              data-src="agentscope-service/aistio/internal/httpapi/agent_endpoint_handler.go:1805-1812"
+              >agent_endpoint_handler.go:1805-1812</span
+            >。这是一种「不泄露存在性」的做法：你无法通过状态码判断这个 invocationId 到底存不存在。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <p>目标：把「提交、订阅、断线、续传、查结果」这五步亲手走一遍，中间故意断一次线。</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">发布一个 job Endpoint</span>
+            <div>
+              选第 19 章那个「资料助手」，创建一个 slug 为 <code>report</code> 的 job Endpoint，
+              <code>timeoutSeconds</code> 设为 <code>120</code>，认证保持默认的 <code>api_key</code>。发布前先看 Readiness，
+              应该是 <code>ready</code>；发布后把返回的 key 存进环境变量。
+            </div>
+          </li>
+          <li>
+            <span class="sh">提交并保存四个值</span>
+            <div>
+              用本章的 curl 提交，带上 <code>Idempotency-Key: report-001</code>。把响应里的 <code>invocationId</code>、
+              <code>statusUrl</code>、<code>eventsUrl</code> 抄下来——后面每一步都只靠这三个值。
+            </div>
+          </li>
+          <li>
+            <span class="sh">订阅事件，读到终态</span>
+            <div>
+              <code>curl -N</code> 打开 <code>eventsUrl</code>，观察 <code>id:</code> / <code>event:</code>
+              / <code>data:</code> 三行一组。如果中途出现 <code>: heartbeat</code>，确认它没有 JSON。
+            </div>
+          </li>
+          <li>
+            <span class="sh">中途 Ctrl+C，再续传</span>
+            <div>
+              记住最后一条成功处理的事件 <code>id</code>，Ctrl+C 断开；然后带
+              <code>Last-Event-ID: &lt;那个 id&gt;</code> 重新订阅，确认不会从头重播。
+            </div>
+          </li>
+          <li>
+            <span class="sh">同一个 key 再提交一次</span>
+            <div>
+              原样重发第 2 步的 curl，应该拿回同一个 <code>invocationId</code>；然后把 <code>input</code> 里的值改一个字再发，
+              应该得到 409。最后查一次 <code>statusUrl</code>，把 <code>invocation.status</code> 与
+              <code>result</code> 记下来。
+            </div>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <span class="ct">练习的验收标准</span>
+          <p>
+            你能不看文档说出：这条 job 的 Issue 在哪、为什么断线不需要重新提交、续传用的是哪个数字、以及
+            <code>completed</code> 之后还要检查什么。四个都答上来，这一章就算过关。
+          </p>
+        </div>
+
+        <h2 id="next">完成这一章之后</h2>
+        <p>
+          到这里，Agent 已经能被外部系统安全地调用了。但「发布出去」只是入口，真正决定它能不能干活的是
+          <strong>它绑了什么</strong>：Workspace 里有什么文件、Environment 能跑什么命令、Memory 里存了什么、
+          Vault 里放了哪些凭据。下一章把 Managed Agent 的四类资源拆开看。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方「应用接入：Endpoint 与 SSE」</td><td>发布表单的每个字段、Readiness 的判定、版本与回滚的完整口径<span class="src" data-src="docs/v2/zh/service/endpoints.md:14-64">endpoints.md:14-64</span></td></tr>
+              <tr><td>官方「SSE 格式与任务反馈」</td><td>帧格式、断线续传、最终结果与交付文件的完整示例<span class="src" data-src="docs/v2/zh/service/sse-events.md:12-112">sse-events.md:12-112</span></td></tr>
+              <tr><td>官方「API 参考」</td><td>认证身份总表、资源路径、Issue 验收与并发编辑<span class="src" data-src="docs/v2/zh/service/api-reference.md:12-84">api-reference.md:12-84</span></td></tr>
+              <tr><td><a href="19-service-basics.html">19 Service 入门</a></td><td>五个组件与端口的骨架；本章的所有路由都挂在那个 Gateway 上</td></tr>
+              <tr><td><a href="21-managed-agent-deep.html">21 Managed Agent 深入</a></td><td>契约背后的能力：Workspace / Environment / Memory / Vault 四类资源怎么绑</td></tr>
+              <tr><td><a href="../appendix/errors.html">附录 B · 报错速查</a></td><td>401/409/413 这类「客户端问题」的通用排查顺序</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          Service 文档在 2.0.4 仓库里仍带「预览」提示<span
+            class="src"
+            data-src="docs/v2/zh/service/endpoints.md:6-8"
+            >endpoints.md:6-8</span
+          >。本章的每个默认值、状态码与判定分支都对到了 <code>agent_endpoint_handler.go</code> 与
+          <code>service-gateway/application.yml</code>；文档更新后，以源码为准重新核对一遍。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

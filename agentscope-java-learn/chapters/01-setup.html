@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="这一章只解决两件事：编译不过和能写出第一行能跑的验证代码。看完你会明白为什么框架要拆成 core / harness / extensions-model-* 三层，以及每一个 ClassNotFoundException 该改哪一行 pom.xml。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="01 环境与依赖：装对模块、跑通第一行 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="这一章只解决两件事：编译不过和能写出第一行能跑的验证代码。看完你会明白为什么框架要拆成 core / harness / extensions-model-* 三层，以及每一个 ClassNotFoundException 该改哪一行 pom.xml。" />
+    <title>01 环境与依赖：装对模块、跑通第一行 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="01-setup" data-root="..">
+    <main>
+      <article class="article">
+        <h1>01 · 环境与依赖</h1>
+        <p class="lede">
+          这一章只解决两件事：<strong>编译不过</strong>和<strong>能写出第一行能跑的验证代码</strong>。看完你会明白为什么框架要拆成
+          <code>core</code> / <code>harness</code> / <code>extensions-model-*</code> 三层，以及每一个
+          <code>ClassNotFoundException</code> 该改哪一行 <code>pom.xml</code>。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>在自己的 Maven 工程里写出正确的三段依赖，并用 <code>mvn -q compile</code> 编译通过</li>
+          <li>
+            说清 <code>agentscope-core</code>、<code>agentscope-harness</code>、<code>agentscope-extensions-model-dashscope</code>
+            各自提供什么，以及什么时候<strong>不需要</strong> harness
+          </li>
+          <li>
+            看到 <code>Cannot resolve model: "..."</code> 或 <code>Failed to create model for id: ...</code> 时，能直接判断是
+            「模块没引」还是「环境变量没设」
+          </li>
+        </ul>
+
+        <h2 id="why">先说为什么：装依赖就是给框架「插能力」</h2>
+        <p>
+          把 AgentScope 想成一台<strong>模块化的咖啡机</strong>：机身（<code>agentscope-core</code>）负责「把豆子磨了、冲了」这个
+          循环本身；水箱、奶泡器、豆仓是可选配件，你买哪台机器就装哪个配件。配件不装并不是「配置错了」，而是<strong>整台机器
+          不认识那个名字</strong>——同理，你没引 <code>dashscope</code> 模块时，框架连 <code>"dashscope:qwen-plus"</code>
+          这个字符串都解析不了。
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">agentscope-harness（可选，官方推荐入口）</span>
+            <div class="ld">
+              工作区、会话落盘、长期记忆、对话压缩、子 agent、沙箱。<strong>它本身是包在 core 外面的一层</strong>，不是另一套
+              引擎。<span class="src" data-src="agentscope-harness/pom.xml:36">agentscope-harness/pom.xml:36</span>
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">agentscope-core（必需）</span>
+            <div class="ld">
+              <code>ReActAgent</code> 推理循环、<code>Msg</code>、事件、工具系统、权限、状态接口。自带 Reactor、Jackson、MCP
+              SDK、OkHttp 等基础设施。<span class="src" data-src="agentscope-core/pom.xml:55">agentscope-core/pom.xml:55</span>
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">agentscope-extensions-model-*（按厂商选）</span>
+            <div class="ld">
+              DashScope / OpenAI / Anthropic / Gemini / Ollama 各一个模块，通过 <code>ServiceLoader</code> 在
+              <strong>运行时</strong>被发现。代码里永远只出现字符串，不出现厂商类。
+            </div>
+          </div>
+        </div>
+        <div class="callout">
+          <span class="ct">为什么厂商要单独一个模块，而不是全塞进 core</span>
+          <p>
+            官方文档给的理由很直接：特定提供商的 Chat Model 与 formatter 位于独立的
+            <code>agentscope-extensions-model-*</code> 模块中<span
+              class="src"
+              data-src="docs/v2/zh/docs/quickstart.md:31"
+              >quickstart.md:31</span
+            >。落到工程上就是：不用的厂商不进你的 classpath，也就不会带来它的 SDK、传递依赖和漏洞面。
+          </p>
+        </div>
+
+        <h2 id="minimal">最小可跑：三段依赖 + 两个验证程序</h2>
+
+        <h3 id="step-deps">第 1 步：三段依赖</h3>
+        <p>
+          新建一个空 Maven 工程，<code>pom.xml</code> 里只留这三段（版本号来自仓库根
+          <span class="src" data-src="pom.xml:30">pom.xml:30</span> 的 <code>2.0.4</code>）：
+        </p>
+        <pre data-lang="xml" data-file="pom.xml">&lt;properties&gt;
+  &lt;maven.compiler.source&gt;17&lt;/maven.compiler.source&gt;
+  &lt;maven.compiler.target&gt;17&lt;/maven.compiler.target&gt;
+  &lt;agentscope.version&gt;2.0.4&lt;/agentscope.version&gt;
+&lt;/properties&gt;
+
+&lt;dependencies&gt;
+  &lt;!-- ① 入口：想要工作区 / 状态落盘 / 压缩 / 长期记忆就引它（会顺带拉进 core） --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;io.agentscope&lt;/groupId&gt;
+    &lt;artifactId&gt;agentscope-harness&lt;/artifactId&gt;
+    &lt;version&gt;${agentscope.version}&lt;/version&gt;
+  &lt;/dependency&gt;
+
+  &lt;!-- ② 只想用裸 ReActAgent 时，用这个替换 ①，别两个都引 --&gt;
+  &lt;!--
+  &lt;dependency&gt;
+    &lt;groupId&gt;io.agentscope&lt;/groupId&gt;
+    &lt;artifactId&gt;agentscope-core&lt;/artifactId&gt;
+    &lt;version&gt;${agentscope.version}&lt;/version&gt;
+  &lt;/dependency&gt;
+  --&gt;
+
+  &lt;!-- ③ 模型厂商：用哪个引哪个。不引 = "dashscope:xxx" 解析不出来 --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;io.agentscope&lt;/groupId&gt;
+    &lt;artifactId&gt;agentscope-extensions-model-dashscope&lt;/artifactId&gt;
+    &lt;version&gt;${agentscope.version}&lt;/version&gt;
+  &lt;/dependency&gt;
+&lt;/dependencies&gt;</pre>
+        <p class="src-line">
+          harness 的坐标与「会带进 core」：<span class="src" data-src="docs/v2/zh/docs/quickstart.md:16">quickstart.md:16</span>；
+          模型扩展的坐标：<span class="src" data-src="docs/v2/zh/docs/quickstart.md:36">quickstart.md:36</span>；JDK 17
+          是硬要求：<span class="src" data-src="pom.xml:33">pom.xml:33</span>
+        </p>
+
+        <div class="callout warn">
+          <span class="ct">不要再去找一个叫 <code>agentscope-bom</code> 的东西来管版本</span>
+          <p>
+            仓库里确实有个 <code>agentscope-dependencies-bom</code>，但它管的是<strong>第三方</strong>依赖（Reactor、Jackson、
+            OkHttp 这些的版本对齐），里面<strong>没有</strong> <code>io.agentscope</code> 自己的构件。所以版本号请老老实实写死或
+            用属性，不要指望 <code>&lt;scope&gt;import&lt;/scope&gt;</code> 能替你管 harness 的版本。
+          </p>
+        </div>
+
+        <h3 id="step-classpath">第 2 步：验证「模块真的在 classpath 上」</h3>
+        <p>
+          先别急着调模型。用 <code>ModelRegistry.canResolve()</code> 检查字符串能不能被解析——它<strong>只查注册表，不创建实例、
+          不读 key</strong><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:173"
+            >ModelRegistry.java:173</span
+          >：
+        </p>
+        <pre data-lang="java" data-file="CheckEnv.java">import io.agentscope.core.model.ModelRegistry;
+
+public class CheckEnv {
+    public static void main(String[] args) {
+        System.out.println("dashscope:qwen-plus → " + ModelRegistry.canResolve("dashscope:qwen-plus"));
+        System.out.println("qwen-plus（短写）   → " + ModelRegistry.canResolve("qwen-plus"));
+        System.out.println("openai:gpt-5.5      → " + ModelRegistry.canResolve("openai:gpt-5.5"));
+        System.out.println("DASHSCOPE_API_KEY   → " + (System.getenv("DASHSCOPE_API_KEY") != null));
+    }
+}</pre>
+        <p>引了 dashscope 模块但没引 openai 模块时，你会看到第 1、2 行为 <code>true</code>，第 3 行为 <code>false</code>。这就是「模块决定能不能解析」的最直观证明。</p>
+
+        <h3 id="step-first-model">第 3 步：真正创建一次模型</h3>
+        <pre data-lang="java" data-file="ResolveModel.java">import io.agentscope.core.model.Model;
+import io.agentscope.core.model.ModelRegistry;
+
+public class ResolveModel {
+    public static void main(String[] args) {
+        Model model = ModelRegistry.resolve("dashscope:qwen-plus");
+        System.out.println(model.getClass().getName());
+    }
+}</pre>
+        <p>
+          <code>resolve</code> 比 <code>canResolve</code> 多做一步：它会让 provider 真的把模型对象造出来<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:104"
+            >ModelRegistry.java:104</span
+          >，所以这一步会检查 <code>DASHSCOPE_API_KEY</code>。设好环境变量后再跑，应该打印出 DashScope 模型类的全名。
+        </p>
+        <div class="tabs">
+          <pre data-lang="bash" data-file="PowerShell" class="tab-panel" data-label="PowerShell">$env:DASHSCOPE_API_KEY = "sk-你的key"
+mvn -q compile exec:java -Dexec.mainClass=ResolveModel</pre>
+          <pre data-lang="bash" data-file="bash / zsh" class="tab-panel" data-label="bash / zsh">export DASHSCOPE_API_KEY=sk-你的key
+mvn -q compile exec:java -Dexec.mainClass=ResolveModel</pre>
+        </div>
+
+        <h3 id="step-dep-tree">第 4 步：确认依赖树没有打歪</h3>
+        <pre data-lang="bash" data-file="检查命令">mvn -q dependency:tree -Dincludes=io.agentscope</pre>
+        <p>
+          期望看到三行 <code>io.agentscope:agentscope-*:jar:2.0.4</code>。如果 harness 那行后面没有跟着 core，说明你引的不是
+          harness 而是别的 <code>artifactId</code>（拼写错误在 IDE 里往往只报「找不到符号」，很难第一眼归因）。
+        </p>
+
+        <h2 id="line-by-line">逐行解读：容易懵的地方</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>这一行</th>
+                <th>容易懵的点</th>
+                <th>实际上</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>&lt;groupId&gt;io.agentscope&lt;/groupId&gt;</code></td>
+                <td>和包名 <code>io.agentscope.core</code> 什么关系？</td>
+                <td>groupId 与 Java 包名只共享前缀，不是同一件事；但<strong>所有</strong>官方模块都用这个 groupId，包括扩展。</td>
+              </tr>
+              <tr>
+                <td>只引 <code>agentscope-core</code></td>
+                <td>那 <code>HarnessAgent</code> 为什么编译不过？</td>
+                <td>
+                  <code>HarnessAgent</code> 在 <code>agentscope-harness</code> 里，而 harness 依赖 core（反向不成立）。
+                  依赖方向是 harness → core，不是互相依赖。
+                </td>
+              </tr>
+              <tr>
+                <td><code>agentscope-extensions-model-dashscope</code></td>
+                <td>为什么代码里完全看不到这个包名？</td>
+                <td>
+                  它通过 <code>ServiceLoader</code> 自动注册：模块里有一份
+                  <code>META-INF/services/io.agentscope.core.model.spi.ModelProvider</code>，里面写着实现类全名。
+                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:367"
+                    >ModelRegistry.java:367</span
+                  >
+                </td>
+              </tr>
+              <tr>
+                <td><code>"dashscope:qwen-plus"</code></td>
+                <td>能不能只写 <code>"qwen-plus"</code>？</td>
+                <td>
+                  能。DashScope 的 provider 同时接受 <code>dashscope:模型名</code> 和以 <code>qwen</code> 开头的短写<span
+                    class="src"
+                    data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeModelProvider.java:59"
+                    >DashScopeModelProvider.java:59</span
+                  >；带前缀时会把前缀剥掉再当模型名用<span
+                    class="src"
+                    data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeModelProvider.java:75"
+                    >DashScopeModelProvider.java:75</span
+                  >。为了可读性，仍然推荐带前缀。
+                </td>
+              </tr>
+              <tr>
+                <td><code>DASHSCOPE_API_KEY</code></td>
+                <td>为什么不是写在代码里？</td>
+                <td>
+                  provider 的取值顺序是「显式传入的 key → 环境变量」<span
+                    class="src"
+                    data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeModelProvider.java:77"
+                    >DashScopeModelProvider.java:77</span
+                  >；两个都没有就抛错。所以用字符串 model id 时，key 只能来自环境变量。
+                </td>
+              </tr>
+              <tr>
+                <td><code>maven.compiler.source/target=17</code></td>
+                <td>我用 JDK 21 编译行不行？</td>
+                <td>行。框架要求的是<strong>最低</strong> 17，用 21 编译、把 target 设成 17 都能跑。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="end-to-end">端到端：从字符串到模型实例，中间发生了什么</h2>
+        <p>这一节把「写一个字符串」到「真的拿到模型对象」的链路摊开，后面 05 章会在此基础上加参数、换厂商、加重试。</p>
+        <ul class="timeline">
+          <li>
+            <div class="who">编译期</div>
+            <div class="what">Maven 把 harness（连带 core）与 dashscope 扩展打进 classpath；此时框架<strong>还不知道</strong>有哪些厂商</div>
+          </li>
+          <li>
+            <div class="who">首次解析</div>
+            <div class="what">你调用 <code>ModelRegistry.resolve("dashscope:qwen-plus")</code>，注册表按顺序查：具名模型 → 缓存 → 你注册的工厂 → SPI 提供者<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:99">ModelRegistry.java:99</span></div>
+          </li>
+          <li>
+            <div class="who">SPI 发现</div>
+            <div class="what">
+              扫描 classpath 上所有 <code>META-INF/services/io.agentscope.core.model.spi.ModelProvider</code>，把 provider 实例收集起来
+              <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:365">ModelRegistry.java:365</span>
+            </div>
+          </li>
+          <li>
+            <div class="who">匹配</div>
+            <div class="what">逐个问 provider「你支持这个 id 吗」；DashScope 用两条正则判断：<code>dashscope:.+</code> 或 <code>qwen.+</code></div>
+          </li>
+          <li>
+            <div class="who">创建</div>
+            <div class="what">provider 取 key（显式 → <code>DASHSCOPE_API_KEY</code>），构造 <code>DashScopeChatModel</code>，默认开流式（<code>stream=true</code>）<span class="src" data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeModelProvider.java:84">DashScopeModelProvider.java:84</span></div>
+          </li>
+          <li>
+            <div class="who">回填缓存</div>
+            <div class="what">命中的模型实例进缓存，同一 id 再解析不再重建<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:159">ModelRegistry.java:159</span></div>
+          </li>
+        </ul>
+        <div class="callout danger">
+          <span class="ct">两个失败点，报错长什么样</span>
+          <p>
+            ① 模块没引：<code>IllegalArgumentException: Cannot resolve model: "dashscope:qwen-plus"</code>，后面跟一整段 Possible
+            causes 提示<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:402"
+              >ModelRegistry.java:402</span
+            >；② key 没设：provider 抛的 <code>IllegalStateException</code> 会被<strong>包一层</strong>再抛出，所以你看到的是
+            <code>Failed to create model for id: dashscope:qwen-plus: Environment variable DASHSCOPE_API_KEY is
+            required...</code
+            ><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:163"
+              >ModelRegistry.java:163</span
+            >。看到 <code>Failed to create</code> 就该想到「模块已经到了，是创建过程失败」。
+          </p>
+        </div>
+
+        <h2 id="cheatsheet">依赖选择速查</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>你的场景</th>
+                <th>引什么</th>
+                <th>不引会怎样</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>要工作区 / 状态落盘 / 压缩 / 长期记忆</td>
+                <td><code>agentscope-harness</code> + 模型扩展</td>
+                <td>编译期就找不到 <code>HarnessAgent</code></td>
+              </tr>
+              <tr>
+                <td>只要「把消息发给模型 + 让它调工具」</td>
+                <td><code>agentscope-core</code> + 模型扩展</td>
+                <td>多引 harness 只会让 classpath 变胖，功能不受影响</td>
+              </tr>
+              <tr>
+                <td>用通义千问 / DashScope</td>
+                <td><code>agentscope-extensions-model-dashscope</code></td>
+                <td><code>Cannot resolve model</code></td>
+              </tr>
+              <tr>
+                <td>用 OpenAI / Anthropic / Gemini</td>
+                <td>对应 <code>agentscope-extensions-model-openai</code> 等</td>
+                <td>同上，且提示信息会点名缺哪个模块</td>
+              </tr>
+              <tr>
+                <td>想完全本地、不花钱</td>
+                <td><code>agentscope-extensions-model-ollama</code></td>
+                <td>没有默认 key 可读，但默认连 <code>http://localhost:11434</code></td>
+              </tr>
+              <tr>
+                <td>要用 MCP 工具</td>
+                <td>
+                  官方 MCP SDK 已经在 <code>agentscope-core</code> 的依赖里了<span
+                    class="src"
+                    data-src="agentscope-core/pom.xml:96"
+                    >agentscope-core/pom.xml:96</span
+                  >；示例工程另有写法可参考 <code>agentscope-examples/documentation/pom.xml</code>
+                </td>
+                <td>—</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          官方安装说明原文：<span class="src" data-src="docs/v2/zh/docs/quickstart.md:9">quickstart.md:9</span>；
+          MCP 相关提示：<span class="src" data-src="docs/v2/zh/docs/quickstart.md:43">quickstart.md:43</span>
+        </p>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+
+        <div class="pitfall">
+          <div class="pf-h">1. <code>Cannot resolve model: "dashscope:qwen-plus"</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>启动即抛 <code>IllegalArgumentException</code>，消息里夹着 7~8 行 Possible causes。</dd>
+            <dt>因为</dt>
+            <dd>classpath 上没有任何 provider 认领这个 id：要么模型扩展没引，要么 id 拼错（比如写成 <code>dashscope:qwen_plus</code>）。</dd>
+            <dt>改成</dt>
+            <dd>先跑第 2 步的 <code>canResolve</code> 打印 <code>false</code> 就说明是依赖问题；依赖没问题再核对 id 大小写与连字符。</dd>
+            <dt>延伸</dt>
+            <dd>同一张错在 <a href="../appendix/errors.html#err-model-not-found">附录 B · Cannot resolve model</a> 有更完整的原因清单。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">2. <code>Failed to create model for id: ...: Environment variable DASHSCOPE_API_KEY is required</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>报错说缺环境变量，但你「明明已经设了」。</dd>
+            <dt>因为</dt>
+            <dd>
+              环境变量是<strong>进程级</strong>的：IDEA 的 Run Configuration 有自己的一份环境变量，Windows 上「改完系统变量不重开
+              终端/IDE」也不会生效。
+            </dd>
+            <dt>改成</dt>
+            <dd>
+              在 Run Configuration 的 Environment variables 里加一条；或者干脆用显式 key 的模型 builder（05 章），绕开环境变量。
+            </dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">3. <code>UnsupportedClassVersionError</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>class file version 61.0 ... this version of the Java Runtime only recognizes ... 55.0</code> 一类信息。</dd>
+            <dt>因为</dt>
+            <dd>框架用 JDK 17（class file 61）编译，你的运行环境是 JDK 11（55）。</dd>
+            <dt>改成</dt>
+            <dd>换 JDK 17+ 运行；同时把 <code>maven.compiler.source/target</code> 设成 17，避免自己代码编译目标不一致。</dd>
+            <dt>延伸</dt>
+            <dd><a href="../appendix/errors.html#err-unsupported-class-version">附录 B · UnsupportedClassVersionError</a>。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">4. 引了 harness，但代码里 <code>import io.agentscope.core.*</code> 全红</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>IDE 里 <code>io.agentscope.core</code> 下的类全部无法解析。</dd>
+            <dt>因为</dt>
+            <dd>多半是 <code>artifactId</code> 拼错成了 <code>agentscope-harness-core</code> 这类不存在的名字，Maven 其实下载失败，只是 IDE 没提示。</dd>
+            <dt>改成</dt>
+            <dd>跑一次 <code>mvn -q dependency:tree -Dincludes=io.agentscope</code>，看真实解析到了什么。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">5. 想省钱：先用 Ollama 把流程跑通</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>没有付费 key，不敢试任何例子。</dd>
+            <dt>因为</dt>
+            <dd>不是所有 provider 都必须有 key：Ollama 的默认地址是 <code>http://localhost:11434</code>，只需本地跑着 Ollama。</dd>
+            <dt>改成</dt>
+            <dd>
+              引 <code>agentscope-extensions-model-ollama</code>，<code>.model("ollama:llama3")</code>；注意 Ollama 的模型能力弱，
+              工具调用一类例子未必稳定，见 06 章的说明。
+            </dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>只引 <code>agentscope-harness</code> 不引 <code>agentscope-core</code>，能编译通过吗？</summary>
+          <p>
+            能。harness 以 compile 作用域依赖 core<span class="src" data-src="agentscope-harness/pom.xml:36">agentscope-harness/pom.xml:36</span>，
+            Maven 会把 core 作为传递依赖带进来。反过来只引 core 就不行——core 里没有 <code>HarnessAgent</code>。
+          </p>
+        </details>
+        <details>
+          <summary><code>canResolve</code> 返回 <code>true</code>，是不是就一定不会报错了？</summary>
+          <p>
+            不是。它只证明「有人认领这个 id」<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:169"
+              >ModelRegistry.java:169</span
+            >，不创建实例、不读 key、不联网。key 缺失、模型名不存在、网络不通都会在真正调用时才暴露。
+          </p>
+        </details>
+        <details>
+          <summary>为什么模型的 key 不放在 <code>pom.xml</code> 或代码里？</summary>
+          <p>
+            因为用字符串 model id 时，provider 只会从「显式传入的 key」和「环境变量」两处取<span
+              class="src"
+              data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeModelProvider.java:77"
+              >DashScopeModelProvider.java:77</span
+            >，配置文件不在取值路径上。这是刻意的：密钥不该进 git。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">把 openai 模块也引进来，观察 <code>canResolve</code> 的变化</span>
+            <div>
+              加 <code>agentscope-extensions-model-openai</code> 依赖后重跑第 2 步，第 3 行会从 <code>false</code> 变成
+              <code>true</code>——即使你没有 <code>OPENAI_API_KEY</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">故意写错模型名</span>
+            <div>
+              把 id 改成 <code>"dashscope:qwen-not-exist"</code>，观察 <code>canResolve</code> 仍是 <code>true</code>（因为正则匹配
+              <code>dashscope:.+</code>），但真正调用时会收到服务端的「模型不存在」。结论：解析层只做前缀匹配，模型是否存在由服务端判定。
+            </div>
+          </li>
+          <li>
+            <span class="sh">不设 key 跑 <code>ResolveModel</code></span>
+            <div>
+              把环境变量去掉再跑，确认报错是 <strong>两层</strong>嵌套：外层 <code>Failed to create model for id</code>，内层才是
+              <code>Environment variable ... is required</code>。以后见到外层消息就知道该往下看 <code>getCause()</code>。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          环境通了就直接进 <a href="02-first-agent.html">02 第一个 Agent</a>：用 <code>HarnessAgent</code> 跑一个「第二轮记得第一轮」
+          的对话，顺便把工作区与状态目录看清楚。想先理解「为什么所有 API 都返回 <code>Mono</code>/<code>Flux</code>」，可以跳到
+          <a href="03-reactor-essentials.html">03 响应式必修</a>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>想确认的事</th>
+                <th>去哪看</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>依赖坐标与最低版本</td>
+                <td>
+                  <span class="src" data-src="docs/v2/zh/docs/quickstart.md:7">quickstart.md:7</span> 安装节
+                </td>
+              </tr>
+              <tr>
+                <td>模块解析顺序与报错全文</td>
+                <td>
+                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:99"
+                    >ModelRegistry.java:99</span
+                  >
+                </td>
+              </tr>
+              <tr>
+                <td>DashScope 的 id 规则与 key 读取</td>
+                <td>
+                  <span
+                    class="src"
+                    data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeModelProvider.java:41"
+                    >DashScopeModelProvider.java:41</span
+                  >
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

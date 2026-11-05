@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AgentScope Java 2.0.4 学习站 · 面向初学者的小白视角教程</title>
+    <meta
+      name="description"
+      content="基于 agentscope-java 2.0.4 源码重写的中文学习站：SDK 地基 11 章 + Harness 工程能力 7 章 + 附录，全部示例为 Java，每个数字与默认值都标注源码出处。"
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="AgentScope Java 2.0.4 学习站 · 面向初学者的小白视角教程" />
+    <meta property="og:description" content="基于 agentscope-java 2.0.4 源码重写的中文学习站：SDK 地基 11 章 + Harness 工程能力 7 章 + 附录，全部示例为 Java，每个数字与默认值都标注源码出处。" />
+    <script>
+      // 主题要在样式之前定下来，否则暗色用户会看到一瞬白屏
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+    <link rel="stylesheet" href="assets/base.css" />
+    <link rel="stylesheet" href="assets/diagrams.css" />
+  </head>
+  <body data-page="index" data-root=".">
+    <main>
+      <article class="article">
+        <div class="hero">
+          <h1>把 AgentScope Java 2.0.4 学到「能自己写」</h1>
+          <p class="lede">
+            这不是官方文档的搬运，而是一套按初学者阅读顺序重排、每个结论都能回源码验证的教程。示例全部是
+            Java；每一章都有能复制运行的代码、端到端的运行过程、以及「你会撞到什么错」。
+          </p>
+        </div>
+
+        <div id="progress-card" class="progress-card"></div>
+
+        <h2 id="start-here">我该从哪儿开始</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">先花 12 分钟读「学习地图」</span>
+            <div>
+              它会告诉你三条主线怎么用、章节为什么是 THIS 顺序、以及没有 API Key
+              能学到哪一步。<br /><a href="chapters/00-study-map.html">→ 00 学习地图</a>
+            </div>
+          </li>
+          <li>
+            <span class="sh">装好环境（约 25 分钟）</span>
+            <div>
+              JDK 17 + Maven，两个依赖：<code>agentscope-harness</code> 与
+              <code>agentscope-extensions-model-dashscope</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">跑通第一个 Agent（约 35 分钟）</span>
+            <div>
+              <a href="chapters/02-first-agent.html">→ 02 第一个 Agent</a
+              >：30 行代码，跑完能看到工作区与状态存储两棵目录树，第二轮对话记得第一轮。
+            </div>
+          </li>
+        </ol>
+
+        <div class="callout tip">
+          <span class="ct">如果你只想最快验证「这框架能不能跑」</span>
+          <p>
+            直接看 02 章的<a href="chapters/02-first-agent.html#minimal">最小可跑</a>那一段，复制、补两个
+            Maven 依赖、设一个 <code>DASHSCOPE_API_KEY</code>，其它全部先不管。
+          </p>
+        </div>
+
+        <h2 id="three-lines">三条学习主线</h2>
+        <div class="compare">
+          <div class="col pick">
+            <h4>① 跟做线：照抄能跑</h4>
+            <ul>
+              <li>每章「最小可跑」小节都是<strong>完整</strong> Java 文件，含 import</li>
+              <li>代码里出现的每个 API 都能在附录 C 的速查表里查到出处</li>
+              <li>目标是「先跑起来」，不追求先看懂</li>
+            </ul>
+          </div>
+          <div class="col">
+            <h4>② 理解线：知道它在干什么</h4>
+            <ul>
+              <li>每章「端到端一次运行发生了什么」把调用链摊开成时间轴</li>
+              <li>关键机制给分层图：谁包着谁、状态在哪、什么时候落盘</li>
+            </ul>
+          </div>
+          <div class="col">
+            <h4>③ 避坑线：出错时知道看哪儿</h4>
+            <ul>
+              <li>每章「陷阱与窍门」按「你会看到 X → 因为 Y → 改成 Z」写</li>
+              <li>附录 B 是报错速查，每条都能定位到源码抛出点</li>
+            </ul>
+          </div>
+        </div>
+
+        <h2 id="chapters">章节</h2>
+        <p>第 01–24 章与五个附录（A–E）已可读；Service 与集成生态按章节顺序推进，灰显的是规划中、尚未开写的章节。</p>
+
+        <div class="card-grid" data-cards="开始"></div>
+        <h3>SDK 地基（第 01–11 章）</h3>
+        <div class="card-grid" data-cards="SDK 地基"></div>
+        <h3>Harness 工程能力（第 12–18 章）</h3>
+        <div class="card-grid" data-cards="Harness 工程能力"></div>
+        <h3>Service 服务化（第 19 章起）</h3>
+        <div class="card-grid" data-cards="Service 服务化"></div>
+        <h3>附录</h3>
+        <div class="card-grid" data-cards="附录"></div>
+        <h3>集成生态（第 27 章起）</h3>
+        <div class="card-grid" data-cards="集成生态"></div>
+
+        <h2 id="truth">事实来源与版本承诺</h2>
+        <p>
+          本站所有内容严格对应 <strong>AgentScope Java 2.0.4</strong>，写作时逐条回源核对，来源只有三类：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>类型</th>
+                <th>路径</th>
+                <th>用来确认什么</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Java 源码</td>
+                <td><code>agentscope-core/src/main/java/io/agentscope/core/**</code></td>
+                <td>方法签名、默认值、抛错点、判定分支</td>
+              </tr>
+              <tr>
+                <td>Java 源码</td>
+                <td><code>agentscope-harness/src/main/java/io/agentscope/harness/**</code></td>
+                <td><code>HarnessAgent</code> 的编排、工作区与状态目录解析</td>
+              </tr>
+              <tr>
+                <td>官方 Java 文档源</td>
+                <td><code>docs/v2/zh/docs/**</code></td>
+                <td>设计意图、能力边界、术语原文</td>
+              </tr>
+              <tr>
+                <td>可编译示例</td>
+                <td><code>agentscope-examples/documentation/src/main/java/**/documentation2/**</code></td>
+                <td>示例代码是否真的能编译、import 是否完整</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          页面上所有 <span class="src">文件名:行号</span> 形的胶囊都是出处标签：单击复制完整路径，Ctrl/Cmd
+          + 点击在 GitHub 上打开对应文件。
+        </p>
+
+        <div class="callout warn">
+          <span class="ct">已知边界</span>
+          <ul>
+            <li>官方站点上部分部署页（<code>/deploy/**</code>）示例是 Python 的，与本站无关，本站不引用。</li>
+            <li>Harness 工程能力七章（第 12–18 章）已全部完成；Service（第 19–26 章，19–24 已可读）与集成生态（第 27–36 章）按章节顺序推进，灰显为尚未开写的章节。</li>
+            <li>进度与主题只保存在本机浏览器 <code>localStorage</code>，不会上传任何数据；首页进度卡可导出/导入 JSON，换机不丢。</li>
+          </ul>
+        </div>
+
+        <h2 id="shortcuts">键盘快捷键</h2>
+        <div class="table-wrap">
+          <table>
+            <tbody>
+              <tr>
+                <td><kbd>/</kbd></td>
+                <td>聚焦搜索</td>
+              </tr>
+              <tr>
+                <td><kbd>↑</kbd> <kbd>↓</kbd> <kbd>Enter</kbd></td>
+                <td>在搜索结果里移动、打开</td>
+              </tr>
+              <tr>
+                <td><kbd>←</kbd> <kbd>→</kbd></td>
+                <td>上一章 / 下一章（焦点不在按钮、链接或输入框上时）</td>
+              </tr>
+              <tr>
+                <td><kbd>Esc</kbd></td>
+                <td>关闭搜索、侧栏或目录抽屉</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="about">关于这个站</h2>
+        <p>
+          零构建：整个站就是一堆 <code>.html</code> 加五个手写的 <code>.js</code>/<code>.css</code>，再加一个自动生成的
+          <code>assets/search-index.js</code>（由 <code>node tools/build-search-index.cjs</code> 从各页正文抽取，
+          首次聚焦搜索框才加载）。双击 <code>index.html</code> 就能看，不装 npm、不联网、不依赖 CDN。加一章只需要
+          复制任一章节页改正文，再在 <code>assets/nav.js</code> 里补一行目录，最后重跑一次索引脚本。
+        </p>
+
+        <h2 id="changelog">更新记录</h2>
+        <p class="footnote">
+          站点版本 <strong>v1.0.0</strong>（2026-11-05 发布）· 内容对应 AgentScope Java 2.0.4 · 完整记录见仓库
+          <code>CHANGELOG.md</code>。
+        </p>
+        <ul>
+          <li><strong>内容</strong>：第 00–24 章与五个附录全部可读；每处数字、默认值、抛错点都带 <code>file:line</code> 出处。</li>
+          <li><strong>Service</strong>：第 19 章从 docker compose 起站讲到第一个 Managed Agent 对话；第 20 章把 Agent 发布成 Endpoint，跑通 job、幂等键、SSE 续传与状态查询；第 21 章拆开 Agent 定义与 Workspace / Environment / Memory / Vault 四类资源；第 22 章把已有 Java 应用注册成 External Agent，讲清 HTTP 合约与 ASDP 派发的分工；第 23 章把一台已登录 Coding Agent provider 的主机接进控制面，拆开 claim 主循环、能力矩阵、工作目录与恢复条件；第 24 章把多个 Agent 组织成 Team，拆开 Leader 回合、成员委派、策略默认值与 Issue / Run / Node / Task / Attempt 的收敛分层。</li>
+          <li><strong>核对</strong>：<a href="appendix/errata.html">附录 E</a> 把 11 章里 60 条「文档这么说、源码那么写」抽成一张表，每条带文档与源码双出处。</li>
+          <li><strong>检索</strong>：全文搜索覆盖 620 段正文，标题锚点可直达小节与单条报错。</li>
+          <li><strong>阅读</strong>：字号 / 宽度 / 代码换行 / 目录精简、阅读进度条、暗色主题、手机抽屉。</li>
+          <li><strong>闭环</strong>：练习勾选与读完时间跨页保存，超过 7 天提醒复习，首页待办最多 3 条；进度可导出 / 导入 JSON。</li>
+          <li><strong>发布</strong>：404 页、favicon、robots、GitHub Pages 工作流；发布前自动重建索引并跑静态检查。</li>
+        </ul>
+      </article>
+    </main>
+
+    <script src="assets/nav.js"></script>
+    <script src="assets/mini-highlight.js"></script>
+    <script src="assets/site.js"></script>
+  </body>
+</html>

@@ -1,0 +1,982 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 20 章把 Agent 发布成 Endpoint，调用方只看见契约。但契约背后它能干什么，由绑定决定。这一章拆开 Managed Agent 的定义：Workspace 定义怎么做、Environment 决定在哪做、Memory 提供知道什么、Vault 提供能连什么；顺带说清 maxIters 的两个默认值、共享知识为什么只读、会话覆盖为什么有「三态」，以及任务结果的四种意图。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="21 Managed Agent 深入：一个定义，四类资源，两种结果 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 20 章把 Agent 发布成 Endpoint，调用方只看见契约。但契约背后它能干什么，由绑定决定。这一章拆开 Managed Agent 的定义：Workspace 定义怎么做、Environment 决定在哪做、Memory 提供知道什么、Vault 提供能连什么；顺带说清 maxIters 的两个默认值、共享知识为什么只读、会话覆盖为什么有「三态」，以及任务结果的四种意图。" />
+    <title>21 Managed Agent 深入：一个定义，四类资源，两种结果 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="21-managed-agent-deep" data-root="..">
+    <main>
+      <article class="article">
+        <h1>21 · Managed Agent 深入：一个定义，四类资源，两种结果</h1>
+        <p class="lede">
+          上一章把 Agent 发布成了一条带凭据的调用契约，调用方只看见 <code>/invoke/v1/**</code>。但契约只能保证「调得到」，
+          保证不了「干得成」——真正决定它能不能读文件、跑命令、查知识、连工具的是<strong>绑在它身上的四类资源</strong>。
+          这一章把 Agent 定义拆开，逐个说清 Workspace、Environment、Memory、Vault 各管哪一段，以及为什么同一个 Agent
+          换个环境就像换了一双手。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>分清定义里哪些字段是「职责」，哪些是「对资源的引用」，不再把 Instructions 当万能开关</li>
+          <li>用一句话说清四类资源的分工，并知道绑错时分别会表现成什么故障</li>
+          <li>解释 <code>maxIters</code> 为什么文档说 12、源码里却兜底 20</li>
+          <li>说清 <code>local</code> 环境为什么默认关闭，以及四种 Environment 各自能不能跑 Shell</li>
+          <li>用 <code>read_only</code> 解释「共享知识只读」，用 <code>mergeSessionMounts</code> 解释「省略」与「<code>[]</code>」为什么不是一回事</li>
+        </ul>
+
+        <h2 id="why">先说为什么：定义只是职责，资源才是能力</h2>
+        <p>
+          官方对 Managed Agent 的定义很克制：Service 管理 Harness、会话和模型执行，你配置的是<strong>职责、模型与资源</strong>，
+          不用为每个 Agent 部署独立应用<span class="src" data-src="docs/v2/zh/service/managed-agent.md:10">managed-agent.md:10</span>。
+          三样里只有「职责」是纯文本，另外两样都是外部依赖。
+        </p>
+        <p>
+          这解释了一个新手最常见的困惑：同一个 <code>system</code> 提示词，昨天让 Agent 读 <code>inputs/report.csv</code> 成功了，今天却报文件不存在。
+          提示词一个字没改，变的是它背后的执行位置或挂载。把三层分开看就清楚了：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>层次</th><th>存的是什么</th><th>改一次影响谁</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Agent 定义</strong></td>
+                <td>名称、Instructions、模型、迭代上限、工具声明</td>
+                <td>下一次建立运行上下文时生效；已在进行中的会话仍用旧快照</td>
+              </tr>
+              <tr>
+                <td><strong>四类资源</strong></td>
+                <td>能力文件、执行环境、共享知识、工具凭据</td>
+                <td>只影响引用它的 Agent；各自有独立的生命周期与版本</td>
+              </tr>
+              <tr>
+                <td><strong>会话</strong></td>
+                <td>这一次执行实际解析到的环境、知识、凭据</td>
+                <td>只影响这一条会话；会话可以显式覆盖默认绑定</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">一句话分工</span>
+          <p>
+            Workspace 定义「<strong>怎么做</strong>」，Environment 决定「<strong>在哪做</strong>」，
+            Memory 提供「<strong>知道什么</strong>」，Vault 提供「<strong>能连什么</strong>」。
+            四者缺一，Agent 都还能说话，但会以不同方式「干不成活」。
+          </p>
+        </div>
+        <p>
+          官方还特意提醒：模型凭据、工具凭据和用户登录凭据用途不同，服务安装包不包含模型额度，配了 Vault 也不会自动替代模型 provider 的连接配置<span
+            class="src"
+            data-src="docs/v2/zh/service/managed-agent.md:36"
+            >managed-agent.md:36</span
+          >。这句话几乎预告了后面所有「明明配了却不通」的故障。
+        </p>
+
+        <h2 id="definition">定义里到底有什么：一张字段表</h2>
+        <p>
+          下表用的是 API 字段名，控制台则在 Behavior、Workspace 和 Runtime/资源设置里分别编辑它们<span
+            class="src"
+            data-src="docs/v2/zh/service/managed-agent-configuration.md:12-27"
+            >managed-agent-configuration.md:12-27</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>用途</th><th>容易踩的地方</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>name</code> / <code>description</code></td>
+                <td>显示名称与职责说明</td>
+                <td>写清输入、输出和适用任务，别写成宣传语</td>
+              </tr>
+              <tr>
+                <td><code>system</code></td>
+                <td>Instructions，拼进 Agent 指令</td>
+                <td>明确边界与验收标准；<strong>不保存 secret</strong></td>
+              </tr>
+              <tr>
+                <td><code>model</code></td>
+                <td>模型注册名或 <code>provider:model</code></td>
+                <td>留空用 Dataplane 默认模型</td>
+              </tr>
+              <tr>
+                <td><code>maxIters</code></td>
+                <td>单次推理/工具迭代上限</td>
+                <td>不是 token 预算；见下面的双默认值</td>
+              </tr>
+              <tr>
+                <td><code>workspaceId</code></td>
+                <td>关联共享能力定义</td>
+                <td>改变关联会发布并绑定所选草稿</td>
+              </tr>
+              <tr>
+                <td><code>workspaceBinding</code></td>
+                <td>版本选择、覆盖项、附加指令</td>
+                <td>与 <code>workspaceId</code> 是两件事</td>
+              </tr>
+              <tr>
+                <td><code>defaultEnvironmentId</code></td>
+                <td>新会话默认执行环境</td>
+                <td>先创建并验证环境，再绑</td>
+              </tr>
+              <tr>
+                <td><code>defaultMemoryStoreIds</code></td>
+                <td>新会话默认知识 Store</td>
+                <td>用 Store ID，不是显示名称</td>
+              </tr>
+              <tr>
+                <td><code>defaultVaultIds</code></td>
+                <td>新会话默认凭据集合</td>
+                <td>只绑该 Agent 真正需要的 Vault</td>
+              </tr>
+              <tr>
+                <td><code>tools</code> / <code>mcpServers</code> / <code>skills</code></td>
+                <td>工具权限、MCP 连接、技能选择</td>
+                <td>逐项加、逐项验证</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          源码里这份定义就是一个结构体，字段与上表一一对应<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/managed_definition.go:41-61"
+            >managed_definition.go:41-61</span
+          >。注意注释里那句「Managed 与 Hosted 运行时共享这份定义」——所以别把它当成某个运行时的私有配置。
+        </p>
+
+        <h3><code>maxIters</code> 为什么有两个默认值</h3>
+        <p>
+          文档写的是「控制台范围 1–64，未配置时表单显示 12」<span
+            class="src"
+            data-src="docs/v2/zh/service/managed-agent-configuration.md:21"
+            >managed-agent-configuration.md:21</span
+          >；而 Go 侧落库前对 <code>maxIters &lt;= 0</code> 的处理是直接赋 <strong>20</strong><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/managed_definition.go:91-94"
+            >managed_definition.go:91-94</span
+          >。两者不矛盾，但必须分清：
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h4>12 是「界面预填」</h4>
+            <ul>
+              <li>控制台新建时的表单初值</li>
+              <li>用户看见的是 12，提交时也带着 12</li>
+              <li>它属于前端体验，不是协议默认值</li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4>20 是「后端兜底」</h4>
+            <ul>
+              <li>只在你传了 0 或负数时触发</li>
+              <li>API 直接调用、绕过表单时就会遇到</li>
+              <li>所以「不填」和「填 12」在 API 上结果不同</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          要写脚本创建 Agent 的话，把 <code>maxIters</code> 显式写上，别指望默认值——这是文档与源码之间最容易误解的一处。
+        </p>
+
+        <h3>定义了，就有版本</h3>
+        <p>
+          保存定义不是就地改一行。写入时会同时落一条 <code>agent_versions</code> 快照<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/managed_definition.go:128-139"
+            >managed_definition.go:128-139</span
+          >，版本列表接口的注释说得更直接：返回的是<strong>不可变的控制面快照</strong>，新的在前<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/managed_definition.go:210-211"
+            >managed_definition.go:210-211</span
+          >。官方描述同一件事：「保存 Agent 配置不等于修改正在执行的所有实例」<span
+            class="src"
+            data-src="docs/v2/zh/service/managed-agent-execution.md:25"
+            >managed-agent-execution.md:25</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">改完配置，用「新」会话验证</span>
+          <p>
+            运行上下文用的是<strong>解析后的定义快照</strong>，所以已存在的会话不会因为你改了草稿就换行为。
+            这也意味着「我改了但没生效」多数时候不是 bug——只是你在用旧会话看新配置。
+          </p>
+        </div>
+
+        <h2 id="four-resources">四类资源各管一段</h2>
+        <p>
+          官方在「工作原理」里用一句话把四者并列：Workspace 保存能力定义，Environment 决定文件和命令在哪执行，
+          Memory Store 是共享知识，Vault 在连接工具前解析凭据<span
+            class="src"
+            data-src="docs/v2/zh/service/managed-agent-execution.md:27"
+            >managed-agent-execution.md:27</span
+          >。展开成表更直观：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>资源</th><th>里面存什么</th><th>决定什么</th><th>绑错时的典型表现</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Workspace</strong></td>
+                <td><code>AGENTS.md</code>、Skills、工具声明、Subagents</td>
+                <td>Agent 按什么流程干活、能发现哪些技能</td>
+                <td>Agent 说得出流程，却找不到技能文件</td>
+              </tr>
+              <tr>
+                <td><strong>Environment</strong></td>
+                <td>执行位置与连接参数</td>
+                <td>文件读写、Shell、工具在哪跑</td>
+                <td>能回复，但一碰文件就报错或路径不对</td>
+              </tr>
+              <tr>
+                <td><strong>Memory</strong></td>
+                <td>已核对的共享文档</td>
+                <td>Agent 能按需读到哪些长期知识</td>
+                <td>回答像「凭常识猜的」，引不出来源</td>
+              </tr>
+              <tr>
+                <td><strong>Vault</strong></td>
+                <td>凭据元数据与密文</td>
+                <td>工具连接时用什么身份</td>
+                <td>工具能列出，但一调用就 401</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          这张表最有用的不是前三列，而是最后一列：<strong>故障现象能反推是哪类资源没绑好</strong>。
+          第 19 章区分「模型问题 / 工具问题 / 环境问题」时用到的思路，在这里有了更细的落点。
+        </p>
+
+        <h2 id="workspace">Workspace：能力定义，以及它的版本</h2>
+        <p>
+          先把一个常见误解排掉：Workspace 是资源，<strong>不是</strong>账号的 Namespace，也<strong>不是</strong>一次执行的临时目录<span
+            class="src"
+            data-src="docs/v2/zh/service/workspaces.md:10"
+            >workspaces.md:10</span
+          >。它装的是可复用的「说明书 + 能力文件」：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>内容</th><th>用途</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>AGENTS.md</code></td><td>项目操作说明与共同约束</td></tr>
+              <tr><td>Skills</td><td>可复用任务步骤及辅助文件</td></tr>
+              <tr><td>Tools / MCP 配置</td><td>声明外部能力连接</td></tr>
+              <tr><td>Subagents</td><td>专项委派定义</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          四行来自 <span class="src" data-src="docs/v2/zh/service/workspaces.md:44-51">workspaces.md:44-51</span>。
+          可长期共享的知识文档应放 Memory，密钥放 Vault<span
+            class="src"
+            data-src="docs/v2/zh/service/workspaces.md:53"
+            >workspaces.md:53</span
+          >——四类资源各归其位，别把 Vault 的活塞进 <code>AGENTS.md</code>。
+        </p>
+        <p>
+          绑定分两步，这是本章最值得记住的机制之一<span
+            class="src"
+            data-src="docs/v2/zh/service/workspaces.md:36-42"
+            >workspaces.md:36-42</span
+          >：
+        </p>
+        <ul class="steps">
+          <li>
+            <span class="sh">第一步：选 Workspace 本身</span>
+            在 Agent 设置里关联 Workspace，对应 <code>workspaceId</code>。改变这个关联会<strong>发布并绑定所选 Workspace 的草稿</strong>。
+          </li>
+          <li>
+            <span class="sh">第二步：选版本与覆盖</span>
+            进入 Definition → Workspace，<code>workspaceBinding</code> 保存版本选择、覆盖项和附加指令。要选已有发布版本、调整继承范围，都在这一步。
+          </li>
+          <li>
+            <span class="sh">第三步：用一条可检查的约定验证</span>
+            新建 Chat，要求输出必须包含「来源」和「待确认事项」，再看所选 Skill 或工具是否真的被用到。
+          </li>
+        </ul>
+        <p>
+          「改草稿」和「更新绑定的发布版本」是两个动作。运行上下文用的是解析后的定义快照，所以改草稿不会立刻改变已有 Session；
+          多个 Agent 复用同一个 Workspace 时，还要分别确认它们绑的是哪个版本<span
+            class="src"
+            data-src="docs/v2/zh/service/workspaces.md:42"
+            >workspaces.md:42</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">Workspace 不会替你装东西</span>
+          <p>
+            Workspace 提供能力定义，Environment 提供实际文件与 Shell 执行位置；创建 Workspace 不会为 Agent 自动启动 Worker 或安装程序<span
+              class="src"
+              data-src="docs/v2/zh/service/workspaces.md:57"
+              >workspaces.md:57</span
+            >。Skill 描述的是流程，系统依赖得装在真正执行的那个环境里。
+          </p>
+        </div>
+
+        <h2 id="environment">Environment：四种执行位置</h2>
+        <p>
+          环境回答的是「文件和命令在哪跑」。官方把它和 Workspace 的分工说得很清楚，还特意加了一句：它不是 Hosted Agent 的 Runtime Host<span
+            class="src"
+            data-src="docs/v2/zh/service/environments.md:10"
+            >environments.md:10</span
+          >。四种类型的能力边界差别很大：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>类型</th><th>在哪执行</th><th>Shell</th><th>典型用途</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>local</code></td>
+                <td>Dataplane 所在环境</td>
+                <td>有</td>
+                <td>本机开发、快速验证；管理员必须显式启用</td>
+              </tr>
+              <tr>
+                <td><code>sandbox</code></td>
+                <td>E2B 云沙箱</td>
+                <td>有</td>
+                <td>需要隔离的 Shell / 文件操作</td>
+              </tr>
+              <tr>
+                <td><code>remote</code></td>
+                <td>共享 BaseStore 文件系统</td>
+                <td><strong>无</strong></td>
+                <td>只读写文件，不当远程 Shell 用</td>
+              </tr>
+              <tr>
+                <td><code>self_hosted</code></td>
+                <td>你自己的 Worker</td>
+                <td>有（Worker 执行）</td>
+                <td>工具必须跑在内网或自有机器时</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          类型表来自 <span class="src" data-src="docs/v2/zh/service/environments.md:20-27">environments.md:20-27</span>。
+          「Docker 下 Local 指 Dataplane 容器内部，并不是宿主机的任意目录」<span
+            class="src"
+            data-src="docs/v2/zh/service/environments.md:29"
+            >environments.md:29</span
+          >——这句话能省掉很多「为什么我挂载的宿主目录看不到」的排查。
+        </p>
+
+        <h3>local 为什么要两道开关</h3>
+        <p>
+          第 19 章讲过 <code>BUILDER_ALLOW_LOCAL_ENVIRONMENT</code> 默认是 <code>false</code>。源码把它实现成一道硬拦截：
+          类型合法但 <code>local</code> 未启用时，直接返回 <strong>403</strong><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/handlers_env.go:124-132"
+            >handlers_env.go:124-132</span
+          >。也就是说，环境存在与否是「资源层」的事，能不能建 <code>local</code> 是「部署层」的事——两层都过才建得出来。
+        </p>
+        <p>
+          另一条容易被忽略的约束：<strong>类型创建后只读</strong>。更新接口只改名称和 Config，源码注释给的理由是「运行中的会话会从类型解析自己的 sandbox」<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/handlers_env.go:165-166"
+            >handlers_env.go:165-166</span
+          >。想把 <code>remote</code> 改成 <code>self_hosted</code>，只能新建一个环境再重新绑定。
+        </p>
+
+        <h3>sandbox 的常用参数</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>缺省值</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>templateId</code></td><td><code>base</code></td><td>E2B 模板；需要额外程序就选自定义模板</td></tr>
+              <tr><td><code>workspaceRoot</code></td><td><code>/home/user</code></td><td>沙箱工作路径</td></tr>
+              <tr><td><code>sandboxTimeoutSeconds</code></td><td><code>300</code></td><td>沙箱存活超时秒数</td></tr>
+              <tr><td><code>isolationScope</code></td><td><code>SESSION</code></td><td>Harness 文件系统隔离范围</td></tr>
+              <tr><td><code>persistenceMode</code></td><td><code>TAR</code></td><td>或 <code>NATIVE_SNAPSHOT</code>，按模板能力验证保存恢复</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          五行的缺省值来自 <span class="src" data-src="docs/v2/zh/service/environments.md:63-75">environments.md:63-75</span>。
+          管理员需要先提供 <code>BUILDER_E2B_API_KEY</code><span
+            class="src"
+            data-src="docs/v2/zh/service/environments.md:51"
+            >environments.md:51</span
+          >；在 Config 里写 <code>packages</code> 或网络参数不会自动装依赖、也不会落实网络限制<span
+            class="src"
+            data-src="docs/v2/zh/service/environments.md:77"
+            >environments.md:77</span
+          >。
+        </p>
+
+        <h3>self_hosted：Worker 只做出站连接</h3>
+        <p>
+          创建 <code>self_hosted</code> 环境时会生成一把 <code>ek_</code> 开头的环境 key，明文<strong>只在创建和轮换的响应里返回一次</strong>，
+          库里存的是 SHA-256 哈希<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/handlers_env.go:136-148"
+            >handlers_env.go:136-148</span
+          ><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/handlers_env.go:245-266"
+            >handlers_env.go:245-266</span
+          >。这与第 20 章 Endpoint 的 <code>asep_</code> key 是同一套设计：平台只回显一次，之后只说「前缀 + 哈希」。
+        </p>
+        <p>Worker 侧启动命令不长，关键在三处参数：key、Gateway 地址、工作目录<span class="src" data-src="docs/v2/zh/service/environments.md:84-94">environments.md:84-94</span>：</p>
+        <pre data-lang="bash" data-file="service environments（节选）">docker run --rm \
+  --name agentscope-hands \
+  -v agentscope-hands:/data \
+  --entrypoint java "$SCHEDULER_IMAGE" \
+  -Dloader.main=io.agentscope.builder.worker.HandsWorkerMain \
+  -cp /app.jar org.springframework.boot.loader.launch.PropertiesLauncher \
+  --base-url "$BASE_URL" \
+  --environment-id "$ENVIRONMENT_ID" \
+  --environment-key "$ENVIRONMENT_KEY" \
+  --hands-root /data/hands \
+  --worker-id hands-1</pre>
+        <p>
+          这个进程只向 Gateway 发起<strong>出站</strong>请求，不需要暴露端口<span
+            class="src"
+            data-src="docs/v2/zh/service/environments.md:97"
+            >environments.md:97</span
+          >。多个 Worker 用不同 <code>worker-id</code>；正式运行由你的进程管理器负责重启<span
+            class="src"
+            data-src="docs/v2/zh/service/environments.md:99"
+            >environments.md:99</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">self_hosted 也改变不了模型在哪跑</span>
+          <p>
+            官方原话是「即使使用 self_hosted，Managed 的模型推理仍在 Dataplane 中运行」<span
+              class="src"
+              data-src="docs/v2/zh/service/environments.md:37"
+              >environments.md:37</span
+            >。Worker 只负责接收工具工作并回传结果。所以「Worker 离线」表现为工具一直挂着，而不是模型没响应——这两类故障要分开查<span
+              class="src"
+              data-src="docs/v2/zh/service/managed-agent-execution.md:33"
+              >managed-agent-execution.md:33</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="memory">Memory：共享知识为什么是只读的</h2>
+        <p>
+          Memory 管的是「已核对、可复用的共享文档」，和 Chat 历史、Session 工作记忆、Issue 评论都不是一回事<span
+            class="src"
+            data-src="docs/v2/zh/service/memory.md:10"
+            >memory.md:10</span
+          >。它的使用方式和普通文件工具有个关键区别：<strong>按需读取，不整包塞进提示</strong>。
+        </p>
+        <p>托管场景下，Dataplane 会注册四个 memory 工具<span class="src" data-src="agentscope-service/service-dataplane/src/main/java/io/agentscope/builder/web/managed/ManagedMemoryTools.java:49-94">ManagedMemoryTools.java:49-94</span>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>工具</th><th>作用</th><th>托管挂载下的实际可用性</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>memory_store_list</code></td><td>列出 Store 里的文档</td><td>可用（<code>readOnly = true</code>）</td></tr>
+              <tr><td><code>memory_store_read</code></td><td>读取指定路径正文</td><td>可用（<code>readOnly = true</code>）</td></tr>
+              <tr><td><code>memory_store_write</code></td><td>新建文档</td><td>工具存在，但只读挂载会拒绝写入</td></tr>
+              <tr><td><code>memory_store_edit</code></td><td>替换唯一匹配文本</td><td>工具存在，并发修改会失败并要求重读</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          为什么后两个「存在却写不进去」？因为托管构建时，每个挂载的 Store 都被显式设成 <code>read_only</code>：
+        </p>
+        <pre data-lang="java" data-file="service HarnessAgentBuildService（节选）">/** Shared knowledge is read-only during execution; session files hold private working memory. */
+static Map&lt;String, String&gt; sharedKnowledgeAccess(List&lt;String&gt; memoryStoreIds) {
+    Map&lt;String, String&gt; access = new LinkedHashMap&lt;&gt;();
+    if (memoryStoreIds != null) {
+        for (String id : memoryStoreIds) {
+            access.put(id, "read_only");
+        }
+    }
+    return access;
+}</pre>
+        <p>
+          同时系统提示里会追加一句明确的约束：用 <code>memory_store_list</code> 与 <code>memory_store_read</code> 访问这些只读共享库，
+          <strong>不要写或改共享知识</strong>，Shell 与 Worker 的文件工具也访问不到这些实时挂载<span
+            class="src"
+            data-src="agentscope-service/service-dataplane/src/main/java/io/agentscope/builder/web/catalog/HarnessAgentBuildService.java:671-678"
+            >HarnessAgentBuildService.java:671-678</span
+          >。上一节那张「只读」注释就是这段逻辑的标题<span
+            class="src"
+            data-src="agentscope-service/service-dataplane/src/main/java/io/agentscope/builder/web/catalog/HarnessAgentBuildService.java:692-700"
+            >HarnessAgentBuildService.java:692-700</span
+          >。
+        </p>
+        <div class="callout tip">
+          <span class="ct">storeId 从哪来</span>
+          <p>
+            工具参数写着「Mounted store ID from the system prompt」<span
+              class="src"
+              data-src="agentscope-service/service-dataplane/src/main/java/io/agentscope/builder/web/managed/ManagedMemoryTools.java:56"
+              >ManagedMemoryTools.java:56</span
+            >。也就是说，Agent 不需要你告诉它 ID，系统提示里已经列好了本次挂载的 Store。这也解释了为什么「只在 Instructions 里写 Store 名字」没用——名字不是绑定。
+          </p>
+        </div>
+        <p>
+          还有两条与「实时」有关的语义：共享文档是按需实时读取的，不是把正文固定复制进每个 Session<span
+            class="src"
+            data-src="docs/v2/zh/service/memory.md:34"
+            >memory.md:34</span
+          >；更新测试事实后要重新调用读取工具才能看到新内容，已有对话里引用过的旧内容不会自动改写。资源绑定变了，用<strong>新</strong> Session 验证<span
+            class="src"
+            data-src="docs/v2/zh/service/memory.md:34"
+            >memory.md:34</span
+          >。
+        </p>
+        <p>
+          维护侧的动作也有讲究：Edit 改文档，Redact 脱敏，Delete 删条目；Archive 掉 Store 后新 Session 不再挂载它，而删除整个 Store 会连同文档一起删<span
+            class="src"
+            data-src="docs/v2/zh/service/memory.md:42"
+            >memory.md:42</span
+          >。删之前先看消费者。
+        </p>
+
+        <h2 id="vault">Vault：凭据在连工具前才被解析</h2>
+        <p>
+          Vault 存的是工具连接要用的凭据。写入后页面只展示类型、标签和目标等元数据，<strong>不再回显明文</strong><span
+            class="src"
+            data-src="docs/v2/zh/service/vault.md:10"
+            >vault.md:10</span
+          >。四种类型的行为差别很大：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>类型（API 值）</th><th>怎么被用上</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>static_bearer</code></td>
+                <td>Target 匹配连接名或完整 endpoint URL，解析器自动设置 <code>Authorization: Bearer ...</code></td>
+              </tr>
+              <tr>
+                <td><code>mcp_oauth</code></td>
+                <td>内容需含 <code>access_token</code>，按连接需要可带刷新信息</td>
+              </tr>
+              <tr>
+                <td><code>environment_variable</code></td>
+                <td>只替换 MCP header、环境或 query 中明确引用的 <code>${VARIABLE}</code></td>
+              </tr>
+              <tr>
+                <td><code>api_key</code></td>
+                <td>通用存储类型，<strong>不会</strong>自动配置模型认证或注入工具</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          类型与对应 API 值见 <span class="src" data-src="docs/v2/zh/service/vault.md:36">vault.md:36</span>，
+          行为表见 <span class="src" data-src="docs/v2/zh/service/vault.md:24-28">vault.md:24-28</span>。
+          解析逻辑在 Dataplane 侧：环境变量类型按 <code>environment_variable</code> 或 <code>env</code> 命中<span
+            class="src"
+            data-src="agentscope-service/service-dataplane/src/main/java/io/agentscope/builder/web/managed/VaultCredentialResolver.java:102"
+            >VaultCredentialResolver.java:102</span
+          >，Bearer 类写入 header <span
+            class="src"
+            data-src="agentscope-service/service-dataplane/src/main/java/io/agentscope/builder/web/managed/VaultCredentialResolver.java:119-143"
+            >VaultCredentialResolver.java:119-143</span
+          >，OAuth 则取 <code>access_token</code> 拼成同样的 header <span
+            class="src"
+            data-src="agentscope-service/service-dataplane/src/main/java/io/agentscope/builder/web/managed/VaultCredentialResolver.java:248-258"
+            >VaultCredentialResolver.java:248-258</span
+          >。
+        </p>
+        <p>最常见的用法是环境变量占位：</p>
+        <pre data-lang="json" data-file="service vault（节选）">{
+  "name": "reports",
+  "url": "https://reports.example.com/mcp",
+  "headers": {
+    "Authorization": "Bearer ${REPORTS_TOKEN}"
+  }
+}</pre>
+        <p>
+          前提是有一条 Target 为 <code>REPORTS_TOKEN</code> 的 <code>environment_variable</code> 凭据，并且这个 Vault 已绑定到该 Agent<span
+            class="src"
+            data-src="docs/v2/zh/service/vault.md:38-47"
+            >vault.md:38-47</span
+          >。一个连接只选一种清晰的认证方式，避免多个凭据竞争同一目标；用 <code>static_bearer</code> 时 Target 直接写连接名或完整 endpoint，就<strong>不用</strong>再配同名占位符<span
+            class="src"
+            data-src="docs/v2/zh/service/vault.md:50"
+            >vault.md:50</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">Vault 不是万能凭据池</span>
+          <p>
+            它解析的是<strong>工具连接</strong>凭据，不会自动配置所有模型连接<span
+              class="src"
+              data-src="docs/v2/zh/service/managed-agent-capabilities.md:47"
+              >managed-agent-capabilities.md:47</span
+            >；环境变量类型也不会全局导出到 Dataplane 或任意 Shell 进程<span
+              class="src"
+              data-src="docs/v2/zh/service/vault.md:36"
+              >vault.md:36</span
+            >。另外，Vault 密文依赖部署的 master key，备份必须同时保存数据库和原密钥，单独恢复数据库不足以恢复连接<span
+              class="src"
+              data-src="docs/v2/zh/service/vault.md:56"
+              >vault.md:56</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="mounts">会话级覆盖：省略、<code>[]</code> 和显式列表是三件事</h2>
+        <p>
+          普通 Chat 和 Issue 走 Agent 的资源默认值；通过 Managed Session API 建会话时，还能指定 <code>environmentId</code>、
+          <code>memoryStoreIds</code> 和 <code>vaultIds</code>。文档把语义写得非常明确：<strong>省略</strong>资源列表与<strong>显式传入空列表</strong>含义不同——省略用默认绑定，空列表表示不挂载该类默认资源<span
+            class="src"
+            data-src="docs/v2/zh/service/managed-agent-configuration.md:49"
+            >managed-agent-configuration.md:49</span
+          >。
+        </p>
+        <p>
+          源码用「指针 + 是否提供」两个信息来表达这个三态。请求结构里两个字段都是指针类型，<code>nil</code> 才代表没传<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/handlers_sessions.go:57-59"
+            >handlers_sessions.go:57-59</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>请求里写成</th><th>JSON 语义</th><th>实际挂载</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>不写该字段</td>
+                <td><code>null</code> / 缺失 → 指针为 <code>nil</code></td>
+                <td>继承 Agent 的 <code>defaultMemoryStoreIds</code> / <code>defaultVaultIds</code></td>
+              </tr>
+              <tr>
+                <td><code>"memoryStoreIds": []</code></td>
+                <td>非 <code>nil</code> 的空切片</td>
+                <td>这一类资源<strong>一个都不挂</strong>，默认值被显式关掉</td>
+              </tr>
+              <tr>
+                <td><code>"memoryStoreIds": ["ms_..."]</code></td>
+                <td>非 <code>nil</code> 且有元素</td>
+                <td>只用你给的列表，默认值不参与</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          这段判断就是 <code>mergeSessionMounts</code> 的全部逻辑：环境为空才回退默认；Vault / Memory 只有在「没提供」时才用默认值，提供了（哪怕是空列表）就保留调用方的值<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/agent_defaults.go:19-24"
+            >agent_defaults.go:19-24</span
+          ><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/product/agent_defaults.go:31-45"
+            >agent_defaults.go:31-45</span
+          >。
+        </p>
+        <div class="callout tip">
+          <span class="ct">为什么要设计成三态</span>
+          <p>
+            因为「用默认值」和「明确不要」是两个业务意图。前者是「照旧」，后者是「这次任务不允许读公司知识库 / 不允许用这套凭据」。
+            如果 <code>[]</code> 也被当成「没传」，你就没办法在单次会话里做权限收窄。对应的实现细节：请求解析时先记住
+            <code>memProvided</code> / <code>vaultProvided</code>，再交给合并函数<span
+              class="src"
+              data-src="agentscope-service/aistio/internal/product/handlers_sessions.go:210-219"
+              >handlers_sessions.go:210-219</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="outcomes">两种结果：调用结束，和任务被接受</h2>
+        <p>
+          资源都绑对了，最后一步是「怎么算完成」。Managed 把执行结果归纳成四种意图，它描述的是<strong>任务状态</strong>，不是某轮模型回复的语气<span
+            class="src"
+            data-src="docs/v2/zh/service/managed-harness-task-outcomes.md:12-19"
+            >managed-harness-task-outcomes.md:12-19</span
+          >：
+        </p>
+        <div class="timeline">
+          <li>
+            <span class="who">succeeded</span>
+            <span class="what">有明确交付且执行可完成。下一步是检查产物并按 Issue 策略验收。</span>
+          </li>
+          <li>
+            <span class="who">waiting</span>
+            <span class="what">等待一个已存在、可追踪的依赖任务。要看依赖 ID 和它的真实状态。</span>
+          </li>
+          <li>
+            <span class="who">blocked</span>
+            <span class="what">缺少信息或条件，但保留已完成部分。补充具体输入后可沿流程继续。</span>
+          </li>
+          <li>
+            <span class="who">failed</span>
+            <span class="what">执行失败。读错误与部分结果，修复后再决定是否重试。</span>
+          </li>
+        </div>
+        <p>
+          官方在这里划了一条很硬的线：「稍后继续」「正在等待」这类普通文本<strong>不构成成功</strong>；还有未结束的后台任务或异常停止时，也不能据此判定成功<span
+            class="src"
+            data-src="docs/v2/zh/service/managed-harness-task-outcomes.md:21"
+            >managed-harness-task-outcomes.md:21</span
+          >。Runtime 会为续轮和等待设置预算，超限就停止自动推进——所以「一直等」不是一种可持续的状态。
+        </p>
+        <div class="callout warn">
+          <span class="ct">完成不等于验收</span>
+          <p>
+            Chat 的一轮回复结束，与 Issue 的业务验收是两件事<span
+              class="src"
+              data-src="docs/v2/zh/service/managed-agent-execution.md:41-45"
+              >managed-agent-execution.md:41-45</span
+            >。Run 或 Task 成功也不等于报告事实正确，用户要在 Inbox 对照标准检查完整结果<span
+              class="src"
+              data-src="docs/v2/zh/service/managed-harness-task-outcomes.md:33"
+              >managed-harness-task-outcomes.md:33</span
+            >。这与第 20 章那条 <code>partial_succeeded → completed</code> 的映射是同一个道理：状态机说「没整体失败」，业务说「能不能用」。
+          </p>
+        </div>
+        <p>
+          还有一条影响排障方向的规则：子任务使用独立执行上下文，<strong>创建子 Agent 不会自动增加它没有的网络、工具或权限</strong><span
+            class="src"
+            data-src="docs/v2/zh/service/managed-harness-task-outcomes.md:25"
+            >managed-harness-task-outcomes.md:25</span
+          >。子 Agent 报 403，先回头看绑定，而不是怀疑子 Agent 的实现。
+        </p>
+
+        <h2 id="line">一次任务怎么把这些资源装配起来</h2>
+        <p>把前面几节按执行顺序串起来，每一步都能对应到一处可检查的配置：</p>
+        <ul class="timeline">
+          <li>
+            <span class="who">Chat / Issue 提交工作</span>
+            <span class="what">浏览器只提交工作和查看事件，不参与模型循环<span class="src" data-src="docs/v2/zh/service/managed-agent-execution.md:10">managed-agent-execution.md:10</span>。</span>
+          </li>
+          <li>
+            <span class="who">Control：解析身份与绑定</span>
+            <span class="what">解析 Agent 定义、版本、环境及知识与凭据引用<span class="src" data-src="docs/v2/zh/service/managed-agent-execution.md:14-25">managed-agent-execution.md:14-25</span>。会话级覆盖就在这一步生效。</span>
+          </li>
+          <li>
+            <span class="who">Dataplane：构建 Harness</span>
+            <span class="what">把定义文件准备到会话目录、构建 Harness、连接持久状态存储；模型循环在 Dataplane 里跑<span class="src" data-src="docs/v2/zh/service/managed-agent-execution.md:25">managed-agent-execution.md:25</span>。</span>
+          </li>
+          <li>
+            <span class="who">Dataplane：挂载共享知识</span>
+            <span class="what">按 <code>read_only</code> 建 Memory 挂载并注册 <code>memory_store_*</code> 工具<span class="src" data-src="agentscope-service/service-dataplane/src/main/java/io/agentscope/builder/web/catalog/HarnessAgentBuildService.java:653-659">HarnessAgentBuildService.java:653-659</span>。</span>
+          </li>
+          <li>
+            <span class="who">工具执行 → Environment</span>
+            <span class="what">Local 在 Dataplane、sandbox 用 E2B、remote 用共享存储、self_hosted 交给 Worker<span class="src" data-src="docs/v2/zh/service/managed-agent-execution.md:33">managed-agent-execution.md:33</span>。</span>
+          </li>
+          <li>
+            <span class="who">Vault：连接前解析凭据</span>
+            <span class="what">工具真正发起连接时才取凭据，替换 <code>${VAR}</code> 或直接写 Bearer header<span class="src" data-src="docs/v2/zh/service/managed-agent-execution.md:27">managed-agent-execution.md:27</span>。</span>
+          </li>
+          <li>
+            <span class="who">结果：事件、状态与交付</span>
+            <span class="what">产出事件、状态与交付结果，最后落到 Chat 回复或 Issue 验收<span class="src" data-src="docs/v2/zh/service/managed-agent-execution.md:14-20">managed-agent-execution.md:14-20</span>。</span>
+          </li>
+        </ul>
+        <p>
+          第 4、5、6 步合起来解释了一个现象：模型可以正常回复，工具却接连失败。因为模型在 Dataplane，文件在 Environment，凭据在 Vault——
+          <strong>三者是三条独立的链路</strong>，任何一条断了都只影响工具，不影响「说话」。
+        </p>
+
+        <h2 id="cheatsheet">速查：字段默认值、环境能力、结果语义</h2>
+        <p>先看几个「不填会怎样」：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>不填的字段</th><th>实际行为</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>model</code></td>
+                <td>用部署默认模型；部署配置的默认值是 <code>qwen-max</code>，由 <code>BUILDER_MODEL_NAME</code> 选择</td>
+                <td><span class="src" data-src="docs/v2/zh/service/managed-agent-configuration.md:33-35">managed-agent-configuration.md:33-35</span></td>
+              </tr>
+              <tr>
+                <td><code>maxIters</code></td>
+                <td>表单预填 12；API 传 0 或负数时后端兜底 20</td>
+                <td><span class="src" data-src="docs/v2/zh/service/managed-agent-configuration.md:21">managed-agent-configuration.md:21</span><span class="src" data-src="agentscope-service/aistio/internal/product/managed_definition.go:91-94">managed_definition.go:91-94</span></td>
+              </tr>
+              <tr>
+                <td><code>environmentId</code></td>
+                <td>回退到 Agent 的 <code>defaultEnvironmentId</code></td>
+                <td><span class="src" data-src="agentscope-service/aistio/internal/product/agent_defaults.go:31-33">agent_defaults.go:31-33</span></td>
+              </tr>
+              <tr>
+                <td><code>memoryStoreIds</code> / <code>vaultIds</code></td>
+                <td>继承默认；传 <code>[]</code> 则一个都不挂</td>
+                <td><span class="src" data-src="agentscope-service/aistio/internal/product/agent_defaults.go:34-39">agent_defaults.go:34-39</span></td>
+              </tr>
+              <tr>
+                <td><code>workspaceBinding</code></td>
+                <td>只绑 <code>workspaceId</code> 时使用所选草稿</td>
+                <td><span class="src" data-src="docs/v2/zh/service/workspaces.md:38">workspaces.md:38</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>再看四种环境的能力边界，一张矩阵就够：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th></th><th>文件读写</th><th>Shell</th><th>模型在哪跑</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>local</code></td><td>有</td><td>有</td><td>Dataplane</td></tr>
+              <tr><td><code>sandbox</code></td><td>有（E2B 沙箱）</td><td>有</td><td>Dataplane</td></tr>
+              <tr><td><code>remote</code></td><td>有（共享存储）</td><td><strong>无</strong></td><td>Dataplane</td></tr>
+              <tr><td><code>self_hosted</code></td><td>有（Worker 工作目录）</td><td>有（Worker）</td><td>Dataplane</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          「模型在哪跑」这一列对四行都相同，正是 self_hosted 那节的结论 <span class="src" data-src="docs/v2/zh/service/environments.md:37">environments.md:37</span>；
+          文件与 Shell 能力来自类型表 <span class="src" data-src="docs/v2/zh/service/environments.md:20-27">environments.md:20-27</span>。
+        </p>
+        <p>最后是结果四态与「该做什么」的对照：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Outcome</th><th>下一步动作</th><th>别做什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>succeeded</code></td><td>检查产物，按 Issue 策略验收</td><td>别把「跑完了」当成「合格了」</td></tr>
+              <tr><td><code>waiting</code></td><td>查依赖 ID 的真实状态</td><td>别重复发同一份工作</td></tr>
+              <tr><td><code>blocked</code></td><td>补充具体输入，引用原 Issue / Task / 缺失项</td><td>别用「请继续」这种空话解阻塞</td></tr>
+              <tr><td><code>failed</code></td><td>读错误与部分结果，修复后决定重试</td><td>别在原执行上反复催促</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">五个坑，每个都能从现象反推资源</h2>
+        <p>
+          <strong>坑一：只在 Instructions 里写 Store 名称。</strong>指令里提到一个 Store 不会建立绑定
+          <span class="src" data-src="docs/v2/zh/service/memory.md:32">memory.md:32</span>，Agent 也不会凭空知道路径。现象是「它答得像在猜」。
+          修法是去 <code>defaultMemoryStoreIds</code> 或会话的 <code>memoryStoreIds</code> 真正挂上。
+        </p>
+        <p>
+          <strong>坑二：把 <code>[]</code> 当成「没传」。</strong>如果你为了「省事」在请求里统一写空数组，默认资源会被全部关掉
+          <span class="src" data-src="docs/v2/zh/service/managed-agent-configuration.md:49">managed-agent-configuration.md:49</span>。
+          现象是「同样的 Agent，为什么这个接口调起来没知识、没凭据」。
+        </p>
+        <p>
+          <strong>坑三：以为改草稿会立刻影响老会话。</strong>运行上下文用解析后的定义快照，已有 Session 不会重读
+          <span class="src" data-src="docs/v2/zh/service/workspaces.md:42">workspaces.md:42</span>。现象是「配置明明改了」。修法是新开 Chat 或新 Session 复验。
+        </p>
+        <p>
+          <strong>坑四：指望 <code>remote</code> 跑 Shell。</strong>remote 类型只有文件系统能力，不能当远程 Shell Worker 用
+          <span class="src" data-src="docs/v2/zh/service/environments.md:61">environments.md:61</span>。现象是文件工具正常、命令工具永远拿不到结果。
+        </p>
+        <p>
+          <strong>坑五：把 Environment 的 <code>ek_</code> key 当 Endpoint 的 key。</strong>两者都是平台凭据、都只回显一次，但用途完全不同：
+          <code>ek_</code> 是 Worker 连 Gateway 的环境凭据，<code>asep_</code> 才是调用 Endpoint 的凭据。现象是 401，而且换多少次 key 都没用——
+          因为你在拿错的凭据打错的接口。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>不填 <code>maxIters</code> 直接调 API，Agent 最多迭代几次？</summary>
+          <p>
+            20 次。后端对 <code>&lt;= 0</code> 一律赋 20 <span class="src" data-src="agentscope-service/aistio/internal/product/managed_definition.go:91-94">managed_definition.go:91-94</span>；
+            控制台表单里的 12 只是界面预填值 <span class="src" data-src="docs/v2/zh/service/managed-agent-configuration.md:21">managed-agent-configuration.md:21</span>，不代表协议默认值。
+          </p>
+        </details>
+        <details>
+          <summary>会话请求里写 <code>"vaultIds": []</code>，会发生什么？</summary>
+          <p>
+            这一次会话<strong>不挂任何默认 Vault</strong>——提供了空列表就保留调用方的值，不再继承默认绑定 <span class="src" data-src="agentscope-service/aistio/internal/product/agent_defaults.go:34-39">agent_defaults.go:34-39</span>。
+            工具本身能列出来，但连接外部服务时没有凭据可解析，通常表现为 401。
+          </p>
+        </details>
+        <details>
+          <summary>Agent 说「文件已读取」，能不能据此判断 Environment 配好了？</summary>
+          <p>
+            不能。模型回复只证明模型链路通；文件与 Shell 是另一条链路。官方建议上传大文件后让 Agent 给出<strong>可核对的片段或统计</strong>，
+            避免只凭「已读取」的回复判断成功 <span class="src" data-src="docs/v2/zh/service/managed-agent.md:42">managed-agent.md:42</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：给一个 Agent 逐层加能力</h2>
+        <p>不要一次配完。按官方建议「一次调整一个层次」<span class="src" data-src="docs/v2/zh/service/managed-agent-configuration.md:61-68">managed-agent-configuration.md:61-68</span>，每步都用新会话验证：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先只验模型</span>
+            <div><code>model</code> 留空，问一个纯知识问题。答不出来先查 Dataplane 的 <code>DASHSCOPE_API_KEY</code> 与默认模型，别急着绑资源。</div>
+          </li>
+          <li>
+            <span class="sh">再加 Instructions 与迭代上限</span>
+            <div>写清输入、输出与「缺材料时列问题」的边界；把 <code>maxIters</code> 显式设成一个小值（如 8），观察它何时停。</div>
+          </li>
+          <li>
+            <span class="sh">绑 Workspace 与 Environment</span>
+            <div>放一个 <code>AGENTS.md</code> 约定「输出必须包含来源」，再让 Agent 读一个已知文件。读不到就查环境类型与工作目录，而不是改提示词。</div>
+          </li>
+          <li>
+            <span class="sh">加 Memory，并验证「按需读取」</span>
+            <div>在 Store 里写一条便于核对的事实（如「本项目把 Lark 定义为周报归档任务」），提问后检查工具记录里有没有 <code>memory_store_list</code> / <code>memory_store_read</code>。</div>
+          </li>
+          <li>
+            <span class="sh">最后加 Vault</span>
+            <div>建一条 <code>environment_variable</code> 凭据，在 MCP header 里用 <code>${VARIABLE}</code> 引用，先执行一次只读调用。失败时依次查 Target 是否完整匹配、变量是否被明确引用、Vault 是否绑定。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          到这里，Managed Agent 的「内部」已经拆完了：定义有版本，资源有四类，会话可覆盖，结果有四态。
+          但平台里还有另一类 Agent——它根本不由 Service 托管，而是你自己的应用，通过 aistio 依赖注册进目录，用会话合约接收工作。
+          下一章讲 <strong>External Agent</strong>：怎么把已有应用接进来，以及它和 Managed 在责任边界上差在哪。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方「Managed Agent：概览与用法」</td><td>从创建到交付的完整操作路径<span class="src" data-src="docs/v2/zh/service/managed-agent.md:24-59">managed-agent.md:24-59</span></td></tr>
+              <tr><td>官方「参数与模型配置」</td><td>字段表与会话资源的完整语义<span class="src" data-src="docs/v2/zh/service/managed-agent-configuration.md:12-59">managed-agent-configuration.md:12-59</span></td></tr>
+              <tr><td>官方「支持的能力与接入类型」</td><td>模型、MCP、Skill、Subagent、Team 的接入条件<span class="src" data-src="docs/v2/zh/service/managed-agent-capabilities.md:12-50">managed-agent-capabilities.md:12-50</span></td></tr>
+              <tr><td><a href="20-endpoints-sse.html">20 Endpoint 与 SSE</a></td><td>发布契约与调用侧协议；本章讲的是契约背后的能力</td></tr>
+              <tr><td><a href="22-external-agent.html">22 External Agent</a></td><td>换到「你自己的进程」那一侧：注册、合约与派发边界</td></tr>
+              <tr><td><a href="../appendix/errors.html">附录 B · 报错速查</a></td><td>401 / 403 / 409 的通用排查顺序</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的 Service 文档在 2.0.4 仓库里仍带「预览」提示 <span class="src" data-src="docs/v2/zh/service/managed-agent.md:6-8">managed-agent.md:6-8</span>。
+          凡文档与实现有出入的地方（如 <code>maxIters</code> 的两个默认值），正文都以源码为准并标了出来。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

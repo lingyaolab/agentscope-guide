@@ -1,0 +1,865 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 07 章结尾留了个伏笔：AgentState 里有个 permissionContext 一直没展开。这一章回答「模型说要用工具，谁有权说不」。答案是五步判定加一条会话级模式，而「问人」不是回调——它会让 call 提前返回，等你第二次带着 ConfirmResult 回来。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="08 权限与人机交互：模式、规则、确认流 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 07 章结尾留了个伏笔：AgentState 里有个 permissionContext 一直没展开。这一章回答「模型说要用工具，谁有权说不」。答案是五步判定加一条会话级模式，而「问人」不是回调——它会让 call 提前返回，等你第二次带着 ConfirmResult 回来。" />
+    <title>08 权限与人机交互：模式、规则、确认流 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="08-permission-hitl" data-root="..">
+    <main>
+      <article class="article">
+        <h1>08 · 权限与人机交互</h1>
+        <p class="lede">
+          第 07 章结尾留了个伏笔：<code>AgentState</code> 里有个 <code>permissionContext</code> 一直没展开。这一章回答
+          <strong>「模型说要用工具，谁有权说不」</strong>。答案是五步判定加一条会话级模式，而「问人」不是回调——
+          它会让 <code>call</code> 提前返回，等你第二次带着 <code>ConfirmResult</code> 回来。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>背出权限判定的先后顺序，说清为什么 <code>allow</code> 规则排在第 4 位而不是第 1 位</li>
+          <li>选对 5 种模式，知道 <code>EXPLORE</code> / <code>ACCEPT_EDITS</code> 只认 <code>isReadOnly()</code></li>
+          <li>写出完整 HITL 回路：<code>PERMISSION_ASKING</code> → 取出 ASKING 的 <code>ToolUseBlock</code> → <code>ConfirmResult</code> → 第二次 <code>call</code></li>
+          <li>知道哪类工具<strong>压根不走</strong>权限系统（不继承 <code>ToolBase</code> 的 <code>AgentTool</code>）</li>
+          <li>识别 2.0.4 里三处「文档说有、代码没接线」的能力，不把时间浪费在调不通的 API 上</li>
+        </ul>
+
+        <h2 id="why">先说为什么：模型的手比嘴危险</h2>
+        <p>
+          sysPrompt 只能影响模型<strong>想</strong>做什么，管不住它<strong>能</strong>做什么。一段被污染的网页、一个恶意
+          MCP server、一次「帮我把这个目录清空」的误判，都可能让它去读 <code>.env</code>、覆盖配置、执行
+          <code>rm -rf</code>。权限系统就是工具执行前的最后一道闸。
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h4>只靠 sysPrompt（不要这么做）</h4>
+            <ul>
+              <li>「不要删除重要文件」——模型可以不听</li>
+              <li>提示注入可以覆盖任何口头约定</li>
+              <li>出了问题没有审计点，只能看日志猜</li>
+              <li>所有工具一视同仁，读和写没有区别</li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4>权限引擎（2.0）</h4>
+            <ul>
+              <li>三道闸：<strong>静态规则</strong> + <strong>模式</strong> + <strong>工具自检</strong></li>
+              <li>DENY 写死在代码里，模型再会说也过不去</li>
+              <li>ASK 会把控制权交回你的 UI，由人拍板</li>
+              <li>每次决策都有 <code>PermissionDecision</code>，可记可审计</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          三者分工：<strong>模式</strong>是全局默认（这个会话是探索还是放行），<strong>规则</strong>是按工具名的例外
+          （这个工具永远拒），<strong>工具自检</strong>是运行时的动态判断（这条命令里带了 <code>rm -rf</code> 吗）。
+          下面先跑通一条最完整的链路。
+        </p>
+        <p class="src-line">
+          权限包入口：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionEngine.java:47">PermissionEngine.java:47</span>；<code>AgentState</code> 里的权限子状态：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:207">AgentState.java:207</span>
+        </p>
+
+        <h2 id="minimal">最小可跑：一次 ASK，一次人工放行</h2>
+        <p>
+          这段是本章唯一必须亲手跑通的代码。它展示了 HITL 的全部四个动作：<strong>暂停 → 取单 → 回复 → 继续</strong>。
+        </p>
+        <p>
+          注意两次 <code>call</code> 用的是<strong>同一个</strong> <code>RuntimeContext</code>——换成别的就是另一个槽位，
+          找不到挂起的那批工具调用。
+        </p>
+        <pre data-lang="java" data-file="HitlDemo.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.event.ConfirmResult;
+import io.agentscope.core.message.GenerateReason;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.ToolCallState;
+import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.message.UserMessage;
+import io.agentscope.core.permission.PermissionBehavior;
+import io.agentscope.core.permission.PermissionContextState;
+import io.agentscope.core.permission.PermissionMode;
+import io.agentscope.core.permission.PermissionRule;
+import io.agentscope.core.tool.Tool;
+import io.agentscope.core.tool.ToolParam;
+import io.agentscope.core.tool.Toolkit;
+
+import java.util.List;
+import java.util.Map;
+
+public class HitlDemo {
+
+    public static class FileTools {
+        @Tool(name = "delete_file", description = "永久删除一个文件，无法撤销。")
+        public String delete(
+                @ToolParam(name = "path", description = "要删除的文件路径") String path) {
+            return "deleted: " + path;
+        }
+    }
+
+    public static void main(String[] args) {
+        Toolkit toolkit = new Toolkit();
+        toolkit.registerTool(new FileTools());
+
+        // 1) 声明规则：delete_file 每次都要问
+        PermissionContextState perm =
+                PermissionContextState.builder()
+                        .mode(PermissionMode.DEFAULT)
+                        .addAskRule(
+                                "delete_file",
+                                new PermissionRule(
+                                        "delete_file", null, PermissionBehavior.ASK, "session"))
+                        .build();
+
+        ReActAgent agent =
+                ReActAgent.builder()
+                        .name("Guarded")
+                        .sysPrompt("你是文件助手，按用户要求调用工具。")
+                        .model("dashscope:qwen-plus")
+                        .toolkit(toolkit)
+                        .permissionContext(perm)
+                        .build();
+
+        RuntimeContext ctx =
+                RuntimeContext.builder().userId("alice").sessionId("s-001").build();
+
+        // 2) 第一次 call：命中了 ASK，agent 暂停，不会真的删
+        Msg first = new UserMessage("user", "删掉 /tmp/a.txt");
+        Msg paused = agent.call(List.of(first), ctx).block();
+        if (paused == null
+                || paused.getGenerateReason() != GenerateReason.PERMISSION_ASKING) {
+            System.out.println("模型没有调用工具，或规则没命中：" + paused);
+            return;
+        }
+
+        // 3) 从返回的 Msg 里取出状态为 ASKING 的工具调用
+        List&lt;ToolUseBlock&gt; asking =
+                paused.getContent().stream()
+                        .filter(b -> b instanceof ToolUseBlock)
+                        .map(ToolUseBlock.class::cast)
+                        .filter(t -> t.getState() == ToolCallState.ASKING)
+                        .toList();
+        asking.forEach(t -&gt; System.out.println("待确认: " + t.getName() + " " + t.getInput()));
+
+        // 4) 用户点了「允许」；把 ConfirmResult 塞进下一条消息的 metadata
+        List&lt;ConfirmResult&gt; results =
+                asking.stream().map(t -&gt; new ConfirmResult(true, t)).toList();
+        Msg resumeMsg =
+                UserMessage.builder()
+                        .metadata(Map.of(Msg.METADATA_CONFIRM_RESULTS, results))
+                        .build();
+        Msg resumed = agent.call(List.of(resumeMsg), ctx).block();
+
+        System.out.println(resumed.getTextContent());
+    }
+}</pre>
+        <p class="src-line">
+          可编译参考：<span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/hitl/PermissionHITLExample.java:159">PermissionHITLExample.java:159</span>；metadata key：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:77">Msg.java:77</span>
+        </p>
+        <div class="callout tip">
+          <span class="ct">四个动作，一个都不能少</span>
+          <p>
+            暂停靠 <code>getGenerateReason() == PERMISSION_ASKING</code> 识别；取单必须筛
+            <code>getState() == ASKING</code>（同一批里可能有已被规则自动拒绝的）；回复靠第二次 <code>call</code>
+            携带 <code>ConfirmResult</code>；继续是框架在新一轮里自动执行那些被放行的工具。<strong>没有回调、没有 wait</strong>——
+            agent 是「返回了」，不是「卡住了」。
+          </p>
+        </div>
+        <div class="callout warn">
+          <span class="ct">暂停后不带确认再 call，会直接抛异常</span>
+          <p>
+            只要上下文里还有 ASKING 的工具调用，下一次 <code>call</code> 必须带
+            <code>ConfirmResult</code>，否则抛 <code>IllegalStateException</code>，错误信息里会列出待确认的
+            工具名和 id，并直接给你一段可复制的恢复代码<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1960"
+              >ReActAgent.java:1960</span
+            >。所以「忘了回确认、直接问下一句」是 HITL 里最常见的崩溃点。
+          </p>
+        </div>
+
+        <h2 id="line-by-line">逐行解读：五种模式、四种行为、六步判定</h2>
+        <h3 id="five-modes">1. 五种模式，差别比名字大</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模式</th><th>实际行为（按代码）</th><th>什么时候用</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>DEFAULT</code></td><td>规则不命中就 <code>ASK</code>；工具自检可以先拒或先放</td><td>默认值，人在场的交互式应用</td></tr>
+              <tr><td><code>ACCEPT_EDITS</code></td><td><strong>只放行 <code>isReadOnly()==true</code> 的工具</strong>，其余继续走规则 → 默认仍然是 <code>ASK</code></td><td>想减少只读确认的编码场景（别指望它自动允许写入）</td></tr>
+              <tr><td><code>EXPLORE</code></td><td><code>isReadOnly()==true</code> → 放行；<strong>否则直接 DENY</strong>，连 allow 规则都不看</td><td>代码探索、只读分析</td></tr>
+              <tr><td><code>BYPASS</code></td><td>规则与工具自检之后仍然没有结论时，一律放行</td><td>完全可信的沙箱；<strong>不是</strong>「关掉权限系统」</td></tr>
+              <tr><td><code>DONT_ASK</code></td><td>把本该 <code>ASK</code> 的结果降级成 <code>DENY</code></td><td>无人值守、CI、定时任务</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          五个取值与注释：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionMode.java:33">PermissionMode.java:33</span>；<code>EXPLORE</code> 的只读判定：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionEngine.java:229">PermissionEngine.java:229</span>
+        </p>
+
+        <h3 id="four-behaviors">2. 四种行为，<code>PASSTHROUGH</code> 是「我不管」</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>行为</th><th>含义</th><th>工具自检返回它时</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>ALLOW</code></td><td>放行</td><td>立即放行，<strong>跳过后续 allow 规则与 BYPASS 判定</strong></td></tr>
+              <tr><td><code>DENY</code></td><td>拒绝</td><td>立即拒绝，<strong>BYPASS 也救不回来</strong></td></tr>
+              <tr><td><code>ASK</code></td><td>问人</td><td>只有当 <code>decisionReason</code> 含 <code>"safety"</code> 时立即暂停；否则继续走 allow 规则</td></tr>
+              <tr><td><code>PASSTHROUGH</code></td><td>交给引擎</td><td>继续走 allow 规则 → BYPASS → 默认 <code>ASK</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          四个取值：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionBehavior.java:32">PermissionBehavior.java:32</span>；<code>ToolBase</code> 默认返回 <code>PASSTHROUGH</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolBase.java:235">ToolBase.java:235</span>
+        </p>
+
+        <h3 id="six-steps">3. 六步判定：allow 规则为什么排在后面</h3>
+        <ul class="timeline">
+          <li><span class="who">第 1 步</span><div class="what"><strong>deny 规则</strong>。命中即拒绝，最高优先级，任何模式都盖不住。</div></li>
+          <li><span class="who">第 2 步</span><div class="what"><strong>ask 规则</strong>。命中即暂停——<strong>ask 比 allow 更强势</strong>，同一个工具身上两者共存时，问。</div></li>
+          <li><span class="who">第 3 步</span><div class="what"><strong>工具自检</strong>。先看 <code>EXPLORE</code>/<code>ACCEPT_EDITS</code> 的只读判定，再调 <code>tool.checkPermissions()</code>。</div></li>
+          <li><span class="who">第 4 步</span><div class="what"><strong>allow 规则</strong>。到这里才轮到「无条件放行」。前面任何一步给出 DENY/ASK，都到不了这。</div></li>
+          <li><span class="who">第 5 步</span><div class="what"><code>BYPASS</code> 兜底放行。</div></li>
+          <li><span class="who">第 6 步</span><div class="what">默认 <code>ASK</code>；<code>DONT_ASK</code> 下改为 <code>DENY</code>。</div></li>
+        </ul>
+        <p class="src-line">
+          <code>checkPermission</code> 的六段代码：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionEngine.java:139">PermissionEngine.java:139</span>；allow 规则在 <code>continueAfterToolCheck</code> 里：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionEngine.java:180">:180</span>
+        </p>
+        <p>
+          这个顺序意味着：<strong>allow 规则不是「白名单」</strong>。它挡不住工具自检的 DENY，也压不过 ask 规则；
+          反过来，工具自检返回 ALLOW 时，你连 allow 规则都不需要写。想把「这个工具永远放行」写在配置里，就得保证
+          工具自检没先拒它。
+        </p>
+
+        <h3 id="is-trivial">4. 一个隐藏开关：<code>isTrivial()</code> 决定走不走引擎</h3>
+        <p>
+          <code>PermissionContextState</code> 有一个 <code>isTrivial()</code>：<strong>模式是 DEFAULT、没有工作目录、
+          三张规则表全空</strong>时为 <code>true</code>。此时 agent 不走完整的 <code>PermissionEngine</code>，而是退回轻量路径——
+          只调工具的 <code>checkPermissions()</code>，返回 ASK 才拦，其余的 <code>PASSTHROUGH</code> 直接放行<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:3336"
+            >ReActAgent.java:3336</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">「没配权限」不等于「没有权限检查」</span>
+          <p>
+            轻量路径下，注解式 <code>@Tool</code> 默认返回 <code>PASSTHROUGH</code> → 直接执行；但非只读的 MCP 工具
+            自检返回 <code>ASK</code> → 仍然会暂停问你。反过来，只要你设了 <code>.mode(EXPLORE)</code>，
+            <code>isTrivial()</code> 立刻变成 <code>false</code>，完整引擎上线，判定规则全变。所以「加了个 mode，
+            行为突然不一样了」不是 bug。
+          </p>
+        </div>
+        <p class="src-line">
+          <code>isTrivial</code> 的五个条件：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionContextState.java:107">PermissionContextState.java:107</span>；轻量路径：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:3378">ReActAgent.java:3378</span>
+        </p>
+
+        <h2 id="hitl">HITL 完整回路：从暂停到继续</h2>
+        <p>
+          阻塞式 <code>call</code> 是入门写法；Web 后端更常见的是事件流：把 agent 的每一步推给前端，前端渲染成
+          「这张卡片要不要批准」。两者内核一样，只是拿 <code>ToolUseBlock</code> 的位置不同。
+        </p>
+        <h3 id="event-flow">1. 事件流版本：监听 RequireUserConfirmEvent</h3>
+        <pre data-lang="java" data-file="HitlByEvents.java">import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.event.RequireUserConfirmEvent;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.UserMessage;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+
+RuntimeContext ctx =
+        RuntimeContext.builder().userId("alice").sessionId("s-001").build();
+
+// 1) 跑一轮，把「要确认」的事件捡出来
+AtomicReference&lt;RequireUserConfirmEvent&gt; pending = new AtomicReference&lt;&gt;();
+agent.streamEvents(new UserMessage("user", "删掉 /tmp/a.txt"), ctx)
+        .doOnNext(
+                event -&gt; {
+                    if (event instanceof RequireUserConfirmEvent confirm) {
+                        pending.set(confirm);
+                    }
+                })
+        .blockLast();
+
+RequireUserConfirmEvent confirm = pending.get();
+if (confirm == null) {
+    return;   // 这一轮没有工具需要确认
+}
+
+// 2) 事件里直接带出了 ToolUseBlock 列表
+List&lt;ConfirmResult&gt; results =
+        confirm.getToolCalls().stream().map(t -&gt; new ConfirmResult(true, t)).toList();
+
+// 3) 用同一个 ctx 恢复（换了 ctx = 换了槽位，找不到挂起的调用）
+Msg resumeMsg =
+        UserMessage.builder()
+                .metadata(Map.of(Msg.METADATA_CONFIRM_RESULTS, results))
+                .build();
+Msg resumed = agent.call(List.of(resumeMsg), ctx).block();</pre>
+        <p class="src-line">
+          事件流可编译参考：<span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/harness/planmode/PlanModeAutoExample.java:140">PlanModeAutoExample.java:140</span>；事件类：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/RequireUserConfirmEvent.java:26">RequireUserConfirmEvent.java:26</span>
+        </p>
+        <p>
+          事件流的额外好处：<code>RequireUserConfirmEvent</code> 同时带 <code>replyId</code>，你可以用它把「问」和「答」
+          配对（多轮并行确认时尤其重要）。
+        </p>
+
+        <h3 id="confirm-result-fields">2. ConfirmResult 的四个字段，每个都有用</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>作用</th><th>注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>confirmed</code></td><td><code>true</code> 放行，<code>false</code> 拒绝</td><td>没有任何默认值，必须显式给</td></tr>
+              <tr><td><code>toolCall</code></td><td>要确认的那个调用</td><td><strong>id 必须与 ASKING 的一致</strong>；可以传一个改过参数的副本</td></tr>
+              <tr><td><code>rules</code></td><td>顺手加几条规则，下次免问</td><td>只在 <code>confirmed=true</code> 时注册进引擎</td></tr>
+              <tr><td><code>reason</code></td><td>拒绝的理由</td><td>会成为模型看到的工具结果文本，不写就是默认文案</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>「用户改了参数再放行」是常见需求，把 <code>toolCall</code> 换成一个同 id 的新块就行：</p>
+        <pre data-lang="java" data-file="EditThenApprove.java">ToolUseBlock edited =
+        ToolUseBlock.builder()
+                .id(t.getId())        // id 必须原样，否则对不上 ASKING
+                .name(t.getName())
+                .input(Map.of("path", "/tmp/b.txt"))
+                .build();
+
+ConfirmResult result = new ConfirmResult(true, edited);   // 执行的是改过的参数</pre>
+        <p class="src-line">
+          <code>ConfirmResult</code> 四个字段与三个构造器：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/ConfirmResult.java:35">ConfirmResult.java:35</span>；确认后改为 ALLOWED 并注册规则：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2098">ReActAgent.java:2098</span>
+        </p>
+
+        <h3 id="after-reject">3. 拒绝之后，模型看到什么</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>谁拒的</th><th>写回 context 的文本</th><th>模型接下来会</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>人在 HITL 里点「拒绝」且没填理由</td><td><code>Permission denied by user</code></td><td>看到拒绝，换一种做法或解释原因</td></tr>
+              <tr><td>人在 HITL 里填了 <code>reason</code></td><td>你填的那句话</td><td>根据理由调整（「换个目录」之类）</td></tr>
+              <tr><td>命中 deny 规则</td><td><code>Permission denied by rules</code></td><td>同上，但连问都不会问</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          两句默认文案：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1707">ReActAgent.java:1707</span>；<code>reason</code> 的优先级：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2108">:2108</span>
+        </p>
+        <div class="callout tip">
+          <span class="ct">被拒不是「报错」，是一轮正常的工具结果</span>
+          <p>
+            拒绝会生成一条 <code>ToolResultBlock</code>，状态是 <code>DENIED</code>，带完整的
+            <code>ToolResultStart</code> / <code>TextDelta</code> / <code>End</code> 事件链。模型拿到它，就像拿到
+            「这个工具返回了错误」一样继续推理。所以<strong>拒绝之后 agent 不会崩，它会换个办法</strong>——除非你用中间件把
+            它停下来。
+          </p>
+        </div>
+
+        <h3 id="tool-call-state">4. <code>ToolCallState</code> 与 <code>ToolResultState</code> 别搞混</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>枚举</th><th>取值</th><th>用在哪</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>ToolCallState</code></td><td><code>PENDING</code> / <code>ASKING</code> / <code>ALLOWED</code> / <code>SUBMITTED</code> / <code>FINISHED</code></td><td>工具调用本身的状态；<strong>没有 DENIED</strong></td></tr>
+              <tr><td><code>ToolResultState</code></td><td>包含 <code>DENIED</code> 等</td><td>工具结果的状态；拒绝体现在这里</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          所以「筛待确认」只能筛 <code>ASKING</code>；被拒的调用已经不在 <code>ASKING</code> 里了，它对应一条
+          <code>DENIED</code> 的结果。
+        </p>
+        <div class="callout warn">
+          <span class="ct"><code>AllToolsDeniedEvent</code> 不会自动停</span>
+          <p>
+            当一轮里所有工具调用都被拒，框架会发一个 <code>AllToolsDeniedEvent</code>，但它只是个通知：没有中间件
+            响应的话，agent 会继续下一轮推理（这是为了兼容旧行为）。想「一拒就停」，得由中间件看到它之后发
+            <code>RequestStopEvent</code>，并把停止原因写成 <code>GenerateReason.ALL_TOOLS_DENIED</code>——这部分在第 09 章。
+          </p>
+        </div>
+
+        <h2 id="gaps">2.0.4 里「文档写着、代码没接线」的四件事</h2>
+        <p>
+          这一节是本章最省钱的部分。下面四项能力在文档、注释里都描述得像现成的，翻实现却会发现它们只是数据或
+          字段，没有真正的执行代码。<strong>先知道边界，再决定要不要自己补</strong>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>看起来能用</th><th>2.0.4 的实际情况</th><th>你该怎么做</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>「建议规则」一键免问</td><td><code>suggestedRules</code> 只生成、没人读</td><td>自己塞 <code>PermissionRule</code> 进 <code>ConfirmResult.rules</code></td></tr>
+              <tr><td><code>ACCEPT_EDITS</code> 自动放行工作目录内的编辑</td><td>引擎从不读 <code>workingDirectories</code></td><td>只当「只读放行」用；要目录白名单就自己写规则</td></tr>
+              <tr><td><code>.stopOnReject(true)</code> 拒绝即终止</td><td>只存进 <code>ReactConfig</code>，无消费点</td><td>用中间件监听 <code>AllToolsDeniedEvent</code></td></tr>
+              <tr><td>内置危险路径保护</td><td>常量和 <code>isDangerousPath</code> 只有单测在调</td><td>自己继承 <code>ToolBase</code> 在自检里调用</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="unwired-suggested-rules">1) suggestedRules：生成了，但没人接</h3>
+        <p>
+          <code>PermissionDecision</code> 有一个 <code>suggestedRules</code> 字段，引擎在「ask 规则命中」和「默认 ASK」两个
+          分支里都会调用 <code>tool.generateSuggestions(input)</code> 把它填上<span
+            class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionEngine.java:152"
+            >PermissionEngine.java:152</span
+          >。但全仓找不到一处 <code>getSuggestedRules()</code> 的调用：<code>RequireUserConfirmEvent</code> 只带
+          <code>List&lt;ToolUseBlock&gt;</code>，而 <code>ToolUseBlock</code> 根本没有这个字段。文档里的
+          <code>ConfirmResult.acceptedRules</code> 和 <code>toolCall.getSuggestedRules()</code> 都<strong>不存在</strong>，
+          照抄会编译不过。
+        </p>
+        <p>
+          自己实现「不再问」很简单——把默认建议等价写成一条工具级 ALLOW 规则：
+        </p>
+        <pre data-lang="java" data-file="AlwaysAllow.java">PermissionRule remember =
+        new PermissionRule(t.getName(), null, PermissionBehavior.ALLOW, "suggested");
+
+ConfirmResult result = new ConfirmResult(true, t, List.of(remember));</pre>
+        <p class="src-line">
+          没有被消费的 getter：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionDecision.java:93">PermissionDecision.java:93</span>；默认建议的内容：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolBase.java:253">ToolBase.java:253</span>
+        </p>
+
+        <h3 id="unwired-working-dirs">2) workingDirectories：存了，但引擎不读</h3>
+        <p>
+          <code>PermissionContextState</code> 用一整张表存工作目录，<code>AdditionalWorkingDirectory</code> 的注释也写着它
+          「驱动 <code>ACCEPT_EDITS</code> 的自动放行」。但 <code>PermissionEngine</code> 全文只读 <code>getMode()</code>
+          和三张规则表，<code>getWorkingDirectories()</code> 一次都没被调用<span
+            class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionEngine.java:210"
+            >PermissionEngine.java:210</span
+          >。<code>ACCEPT_EDITS</code> 的实际行为只有一条：<code>isReadOnly()</code> 为真的工具放行，其余继续走规则。
+        </p>
+        <p>
+          官方示例自己的注释也承认了这一点：<em>「EXPLORE mode auto-denies non-readOnly tools before allow rules are
+          checked, so it should only be used with ToolBase tools that set readOnly(true)」</em><span
+            class="src"
+            data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/tool/PermissionContextExample.java:99"
+            >PermissionContextExample.java:99</span
+          >。
+        </p>
+
+        <h3 id="unwired-stop-on-reject">3) stopOnReject：设了，但没人读</h3>
+        <p>
+          <code>ReactConfig</code> 的注释说它控制「拒绝是否终止循环」，<code>ReActAgent.builder().stopOnReject(true)</code>
+          也能设<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5241">ReActAgent.java:5241</span
+          >。但整个 core 里除了赋值和 getter，没有任何代码读它。实际行为恒定为：拒绝结果写回 context，模型下一轮继续。
+          要「一拒就停」，还是得靠中间件。
+        </p>
+
+        <h3 id="unwired-danger-paths">4) 危险路径：常量很全，但只有单测在用</h3>
+        <p>
+          <code>ToolDangerousPathConstants</code> 列了 22 个敏感文件（<code>.env*</code>、<code>.ssh/config</code>、
+          <code>.npmrc</code>……）、4 个敏感目录（<code>.git</code> / <code>.vscode</code> / <code>.idea</code> /
+          <code>.ssh</code>）和 11 条高危命令；<code>ToolBase.isDangerousPath()</code> 还实现了符号链接解析<span
+            class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolDangerousPathConstants.java:37"
+            >ToolDangerousPathConstants.java:37</span
+          >。但生产代码里没有任何调用点，内置的 <code>view_text_file</code> / <code>write_text_file</code> /
+          <code>list_directory</code> 又都是注解工具（不是 <code>ToolBase</code> 子类），压根用不上它。下一节给出补法。
+        </p>
+
+        <h2 id="escape">自己补上缺口：三招够用</h2>
+        <p>
+          上一节那四项「没接线」的能力，其实都能在自己的代码里补回来。只需要三招：<strong>标 <code>readOnly</code></strong>、
+          <strong>写 <code>ToolBase</code> 子类</strong>、<strong>运行时换模式</strong>。
+        </p>
+
+        <h3 id="trick-1-guard">第 1 招：先让模式认识你的工具</h3>
+        <p>
+          <code>EXPLORE</code> / <code>ACCEPT_EDITS</code> 的唯一依据就是工具自报的 <code>isReadOnly()</code>，而
+          <code>@Tool</code> 注解的 <code>readOnly</code> 默认是 <code>false</code>。不标它，一个纯粹的查询工具在探索模式下也会被拒。
+        </p>
+        <pre data-lang="java" data-file="ReadOnlyTools.java">// 只读：在 EXPLORE / ACCEPT_EDITS 下自动放行
+@Tool(name = "search_docs", description = "在文档库里检索", readOnly = true)
+public String search(
+        @ToolParam(name = "query", description = "检索词") String query) {
+    return "命中 3 条：...";
+}
+
+// 会改状态：不要标 readOnly，否则 EXPLORE 会错误放行
+@Tool(name = "publish_doc", description = "发布文档")
+public String publish(
+        @ToolParam(name = "id", description = "文档 id") String id) {
+    return "published: " + id;
+}</pre>
+        <p class="src-line">
+          <code>@Tool.readOnly()</code> 默认为 <code>false</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Tool.java:107">Tool.java:107</span>；<code>ToolBase.isReadOnly()</code> 是 <code>final</code>，只能从 builder 传：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolBase.java:173">ToolBase.java:173</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">内置文件工具没标 <code>readOnly</code></span>
+          <p>
+            自带的 <code>view_text_file</code> / <code>list_directory</code> / <code>write_text_file</code> 都是注解工具，
+            一个都没标 <code>readOnly = true</code>。所以在 <code>EXPLORE</code> 下，<strong>连「读文件」都会被拒</strong>。想在只读模式里用内置读工具，
+            只能自己包一层 <code>readOnly = true</code> 的工具，或者干脆不配 <code>EXPLORE</code>、改用 deny 规则挡写工具。
+          </p>
+        </div>
+
+        <h3 id="trick-2-toolbase">第 2 招：继承 <code>ToolBase</code>，把安全检查写进工具里</h3>
+        <p>
+          这一步同时补上「危险路径」和「工具自检」两件事：<code>isDangerousPath()</code> 自带 22 个敏感文件名、4 个敏感目录和符号链接解析，
+          你要做的只是<strong>在合适的时机调它</strong>。
+        </p>
+        <pre data-lang="java" data-file="SafeDeleteTool.java">import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.permission.PermissionBehavior;
+import io.agentscope.core.permission.PermissionContextState;
+import io.agentscope.core.permission.PermissionDecision;
+import io.agentscope.core.tool.ToolBase;
+import io.agentscope.core.tool.ToolCallParam;
+import io.agentscope.core.tool.ToolDangerousPathConstants;
+
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import reactor.core.publisher.Mono;
+
+public class SafeDeleteTool extends ToolBase {
+
+    public SafeDeleteTool() {
+        super(
+                ToolBase.builder()
+                        .name("safe_delete")
+                        .description("删除文件；敏感路径直接拒绝")
+                        .inputSchema(
+                                Map.of(
+                                        "type",
+                                        "object",
+                                        "properties",
+                                        Map.of(
+                                                "path",
+                                                Map.of("type", "string", "description", "文件路径")),
+                                        "required",
+                                        List.of("path")))
+                        .readOnly(false));
+    }
+
+    @Override
+    public Mono&lt;ToolResultBlock&gt; callAsync(ToolCallParam param) {
+        String path = String.valueOf(param.getInput().get("path"));
+        return Mono.just(
+                new ToolResultBlock(
+                        param.getToolUseBlock().getId(),
+                        getName(),
+                        List.of(TextBlock.builder().text("deleted: " + path).build())));
+    }
+
+    @Override
+    public Mono&lt;PermissionDecision&gt; checkPermissions(
+            Map&lt;String, Object&gt; input, PermissionContextState context) {
+        String path = String.valueOf(input.getOrDefault("path", ""));
+        String lower = path.toLowerCase(Locale.ROOT);
+
+        // 1) 敏感路径：直接 DENY，BYPASS 也放不过去
+        if (isDangerousPath(path)) {
+            return Mono.just(PermissionDecision.deny("拒绝操作敏感路径: " + path));
+        }
+
+        // 2) 参数里出现高危片段：要问人，decisionReason 必须带 safety
+        boolean risky =
+                ToolDangerousPathConstants.DANGEROUS_COMMANDS.stream()
+                        .anyMatch(cmd -&gt; lower.contains(cmd.toLowerCase(Locale.ROOT)));
+        if (risky) {
+            return Mono.just(
+                    PermissionDecision.builder()
+                            .behavior(PermissionBehavior.ASK)
+                            .message("参数含高危命令片段：" + path)
+                            .decisionReason("safety: dangerous command fragment")
+                            .build());
+        }
+
+        // 3) 其余交给引擎按规则 / 模式评估
+        return Mono.just(PermissionDecision.passthrough(getName()));
+    }
+}</pre>
+        <p class="src-line">
+          完整可编译的 <code>ToolBase</code> 子类：<span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/tool/ToolBaseExample.java:135">ToolBaseExample.java:135</span>；<code>isDangerousPath</code> 与符号链接解析：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolBase.java:263">ToolBase.java:263</span>；常量表：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolDangerousPathConstants.java:67">ToolDangerousPathConstants.java:67</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">两个细节：<code>decisionReason</code> 与 <code>contains</code> 的粗糙</span>
+          <p>
+            第一，<code>PermissionDecision.ask("safety: ...")</code> <strong>不会</strong>触发「立即暂停」——静态工厂只设 <code>message</code>，
+            <code>decisionReason</code> 是 <code>null</code>，引擎查不到 <code>"safety"</code> 就继续走 allow 规则。必须用 <code>builder()</code> 显式写
+            <code>decisionReason</code>。第二，<code>contains</code> 匹配很粗：<code>DANGEROUS_COMMANDS</code> 里有 <code>"dd"</code>，
+            <code>/tmp/add.txt</code> 这种路径也会命中。真做命令工具时换成前缀匹配或词边界匹配。
+          </p>
+        </div>
+        <p>
+          还有一处：<code>PermissionRule.ruleContent</code> 要靠工具的 <code>matchRule()</code> 解释，而 <code>ToolBase</code> 的默认实现
+          <strong>只认 <code>null</code></strong>——非空模式一律不匹配。想让「按路径」的规则生效，得自己重写：
+        </p>
+        <pre data-lang="java" data-file="SafeDeleteTool.java">@Override
+public boolean matchRule(String ruleContent, Map&lt;String, Object&gt; input) {
+    // 规则写成 "path:/tmp/" 时按前缀命中；其余交给默认实现
+    if (ruleContent != null &amp;&amp; ruleContent.startsWith("path:")) {
+        String prefix = ruleContent.substring("path:".length());
+        return String.valueOf(input.get("path")).startsWith(prefix);
+    }
+    return super.matchRule(ruleContent, input);
+}</pre>
+        <p class="src-line">
+          默认只匹配 <code>null</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolBase.java:244">ToolBase.java:244</span>；引擎怎么用它：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionEngine.java:310">PermissionEngine.java:310</span>
+        </p>
+
+        <h3 id="trick-3-switch-mode">第 3 招：运行时换模式，而不是重启 agent</h3>
+        <p>
+          模式和规则都存在<strong>槽位</strong>里，属于会话状态，可以随时改。改完立刻生效，而且只影响这一个
+          <code>(userId, sessionId)</code>。
+        </p>
+        <pre data-lang="java" data-file="SwitchMode.java">RuntimeContext ctx =
+        RuntimeContext.builder().userId("alice").sessionId("s-001").build();
+
+// 临时切成只读：后面的 call 全部按 EXPLORE 判定
+agent.setPermissionMode(ctx, PermissionMode.EXPLORE);
+doSomething(agent, ctx);
+
+// 用完切回（规则全保留，withMode 只换模式）
+agent.setPermissionMode(ctx, PermissionMode.DEFAULT);
+
+// 想改规则：整体替换上下文，改完会重建该槽位的引擎并落盘
+PermissionContextState cur =
+        agent.getAgentState("alice", "s-001").getPermissionContext();
+PermissionContextState next =
+        PermissionContextState.builder()
+                .mode(cur.getMode())
+                .addAllowRule(
+                        "safe_delete",
+                        new PermissionRule(
+                                "safe_delete", null, PermissionBehavior.ALLOW, "session"))
+                .build();
+agent.replacePermissionContext("alice", "s-001", next);</pre>
+        <p class="src-line">
+          <code>setPermissionMode</code> 两个重载：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4608">ReActAgent.java:4608</span>；<code>replacePermissionContext</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4626">ReActAgent.java:4626</span>；<code>withMode</code> 保留全部规则：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionContextState.java:148">PermissionContextState.java:148</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct"><code>replacePermissionContext</code> 是整体替换，不是追加</span>
+          <p>
+            上面那段用 <code>builder()</code> 从零建了一个新上下文，<strong>老规则全丢了</strong>。要保留就得自己把
+            <code>cur.getAllowRules()</code> / <code>getDenyRules()</code> / <code>getAskRules()</code> 三张表逐条搬过去；只换模式请用
+            <code>withMode()</code>，它会把目录和三张表一起复制。
+          </p>
+        </div>
+        <div class="callout tip">
+          <span class="ct">确认时附带的 <code>rules</code> 只活在内存里</span>
+          <p>
+            <code>ConfirmResult.rules</code> 走的是 <code>permissionEngine.addRule(rule)</code>——只加进<strong>这个槽位当前的引擎实例</strong>，
+            不写回 <code>AgentState.permissionContext</code>。所以：进程重启就没了，切一次模式（引擎按上下文重建）也没了。
+            要「永久免问」，得像上面那样写进 <code>permissionContext</code>。
+          </p>
+        </div>
+
+        <h2 id="cheatsheet">速查</h2>
+        <h3 id="api-quick">1. API 速查</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>类</th><th>干什么</th><th>关键方法</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>PermissionContextState</code></td><td>一个槽位的权限配置：模式 + 目录 + 三张规则表</td><td><code>builder().mode().addAllowRule().addAskRule().addDenyRule()</code>、<code>isTrivial()</code>、<code>withMode()</code></td></tr>
+              <tr><td><code>PermissionRule</code></td><td>一条规则：工具名 + 模式串 + 行为 + 来源</td><td><code>new PermissionRule(name, ruleContent, behavior, source)</code></td></tr>
+              <tr><td><code>PermissionEngine</code></td><td>六步判定的实现</td><td><code>checkPermission(tool, input)</code>、<code>addRule(rule)</code></td></tr>
+              <tr><td><code>PermissionDecision</code></td><td>一个判定结果</td><td><code>allow/deny/ask/passthrough(msg)</code>、<code>builder().decisionReason(...)</code></td></tr>
+              <tr><td><code>ToolBase</code></td><td>会参与权限的工具基类</td><td><code>checkPermissions</code>、<code>matchRule</code>、<code>isDangerousPath</code>、<code>generateSuggestions</code></td></tr>
+              <tr><td><code>ConfirmResult</code></td><td>人对一次 ASKING 的回答</td><td><code>new ConfirmResult(confirmed, toolCall, rules, reason)</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="want-table">2. 「我想…」对照表</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>做法</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>某个工具永远不要被执行</td><td><code>addDenyRule(name, null, DENY, "policy")</code>，最高优先级</td></tr>
+              <tr><td>某个工具每次都要人确认</td><td><code>addAskRule(...ASK...)</code>；注意它会盖过 allow 规则</td></tr>
+              <tr><td>常用工具免确认</td><td><code>addAllowRule(...ALLOW...)</code>，但要接受「工具自检 DENY 仍然优先」</td></tr>
+              <tr><td>整个会话只读</td><td><code>setPermissionMode(ctx, EXPLORE)</code>，并给只读工具标 <code>readOnly = true</code></td></tr>
+              <tr><td>无人值守跑批</td><td><code>DONT_ASK</code>：本该问人的一律变 DENY，<strong>不会卡住</strong></td></tr>
+              <tr><td>只放行某些路径</td><td><code>ruleContent</code> + 工具里重写 <code>matchRule</code>（默认只认 <code>null</code>）</td></tr>
+              <tr><td>读完就走的临时提权</td><td><code>setPermissionMode(..., BYPASS)</code>，用完立刻切回 <code>DEFAULT</code></td></tr>
+              <tr><td>把确认结果做成前端卡片</td><td>订阅 <code>RequireUserConfirmEvent</code>，拿 <code>getToolCalls()</code> 渲染</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="source-locations">3. 源码位置</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想确认的事</th><th>去哪看</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>六步判定的完整顺序</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionEngine.java:139">PermissionEngine.java:139</span></td></tr>
+              <tr><td><code>isTrivial()</code> 的五个条件</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionContextState.java:107">PermissionContextState.java:107</span></td></tr>
+              <tr><td>「不走引擎」的轻量路径</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:3378">ReActAgent.java:3378</span></td></tr>
+              <tr><td>非 <code>ToolBase</code> 工具直接放行</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:3363">ReActAgent.java:3363</span></td></tr>
+              <tr><td>确认结果的校验与落地</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1953">ReActAgent.java:1953</span></td></tr>
+              <tr><td>暂停并发出确认事件</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:3068">ReActAgent.java:3068</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. 配了 <code>EXPLORE</code>，结果连读文件都被拒</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>切到只读模式后，模型说「没有权限读取文件」，而它调的正是 <code>view_text_file</code>。</dd>
+            <dt>因为</dt>
+            <dd><code>EXPLORE</code> 只看 <code>isReadOnly()</code>，而内置的注解式文件工具都没标 <code>readOnly = true</code>，默认是 <code>false</code> → 一律 DENY。</dd>
+            <dt>改成</dt>
+            <dd>自己包一层 <code>readOnly = true</code> 的读工具；或者不用 <code>EXPLORE</code>，改用 deny 规则单独封掉写工具。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 把 allow 规则当白名单</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>明明给工具加了 <code>ALLOW</code> 规则，它还是弹确认框；或者开了 <code>BYPASS</code>，某个工具依然被拒。</dd>
+            <dt>因为</dt>
+            <dd>判定顺序是 deny → ask → 工具自检 → allow → BYPASS。ask 规则在 allow 前面，工具自检的 DENY 更在前面。</dd>
+            <dt>改成</dt>
+            <dd>先确认没有同名的 ask/deny 规则，且工具自检没先拒；要绝对免问，就得同时拿下这两关。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. 暂停了，直接追问下一句</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>一次普通的 <code>call</code> 直接抛 <code>IllegalStateException</code>，说「有工具处于 ASKING 状态，需要你的批准」。</dd>
+            <dt>因为</dt>
+            <dd>上下文里还挂着 ASKING 的工具调用，新一次 call 却没带 <code>ConfirmResult</code>。框架宁可报错也不替你猜。</dd>
+            <dt>改成</dt>
+            <dd>先处理暂停：要么带 <code>ConfirmResult</code> 恢复，要么另开一个 <code>sessionId</code>。错误信息里直接给了可复制的恢复代码。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 两次 <code>call</code> 用的不是同一个 <code>RuntimeContext</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>带着 <code>ConfirmResult</code> 恢复，却报「引用了非 ASKING 的调用」；或者干脆看不到暂停，直接把原始请求重跑了一遍。</dd>
+            <dt>因为</dt>
+            <dd>挂起的调用存在<strong>槽位</strong>里。第二次 call 没传 ctx（用了 <code>call(String)</code> 这类便捷重载）或换了 sessionId，就是另一个槽位。</dd>
+            <dt>改成</dt>
+            <dd>把第一次 call 用的 <code>RuntimeContext</code> 存起来，两次都用它；别在恢复时用不带 ctx 的重载。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. 自己写的工具没继承 <code>ToolBase</code>，权限完全失效</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>为一个工具配了 deny 规则，它照样执行；工具自检也从来不进。</dd>
+            <dt>因为</dt>
+            <dd><code>evaluateOne</code> 里只有 <code>instanceof ToolBase</code> 才进引擎，其余 <code>AgentTool</code> 一律按 ALLOW 直接放走。内置的 <code>ShellCommandTool</code>、<code>SubAgentTool</code> 就是这种——它们自带白名单 / 回调，不归权限引擎管。</dd>
+            <dt>改成</dt>
+            <dd>要受管就继承 <code>ToolBase</code>；不改的，就在自己工具里做检查，别忘了它们完全绕过了这套闸。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">6. <code>PermissionDecision.ask("safety: ...")</code> 没生效</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>工具自检返回了 ASK，文案里还写着 safety，但 agent 没暂停——尤其在 <code>BYPASS</code> 下直接执行了。</dd>
+            <dt>因为</dt>
+            <dd>静态工厂只设 <code>message</code>，<code>decisionReason</code> 是 <code>null</code>；引擎只查 <code>decisionReason.toLowerCase().contains("safety")</code>，查不到就继续走 allow 规则和 BYPASS。</dd>
+            <dt>改成</dt>
+            <dd>用 <code>PermissionDecision.builder().behavior(ASK).message(...).decisionReason("safety: ...").build()</code>。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>同一个工具同时有 <code>ALLOW</code> 和 <code>ASK</code> 两条规则，会发生什么？</summary>
+          <p>
+            问人。判定顺序是 deny → <strong>ask</strong> → 工具自检 → <strong>allow</strong>，ask 在 allow 前面。规则表按工具名分桶，所以两条规则都存在，但只有 ask 能被看到。反过来，如果有 <code>DENY</code> 规则，连问都不会问。
+          </p>
+        </details>
+        <details>
+          <summary>一轮里 3 个工具都停在 <code>ASKING</code>，我只想确认其中 1 个，剩下两个不理——行吗？</summary>
+          <p>
+            行，但至少要给一条。校验只要求：id 不能重复，且必须是当前 <code>ASKING</code> 里的 id；<strong>只确认子集是合法的</strong>（源码注释原话："Confirmations may cover a subset of ASKING calls"）。没被覆盖的两个继续保持 <code>ASKING</code>，这一轮不会执行、也不会被当成拒绝，下次恢复时你仍然得处理它们；而一条 <code>ConfirmResult</code> 都不给，直接抛 <code>IllegalStateException</code>。
+          </p>
+        </details>
+        <details>
+          <summary>一个自己写的工具只 <code>implements AgentTool</code>，我给它配了一条 <code>DENY</code> 规则，能拦住吗？</summary>
+          <p>
+            拦不住。<code>evaluateOne</code> 开头就是 <code>if (!(tool instanceof ToolBase tb)) return ALLOW</code>，连引擎都不会进。自定义工具想受管就必须继承 <code>ToolBase</code>；内置的 <code>ShellCommandTool</code>、<code>SubAgentTool</code> 属于前者，它们各自用自己的白名单 / 回调做保护。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">把最小例子跑一遍，然后换成拒绝</span>
+            <div>
+              先按 <code>HitlDemo</code> 跑通一次放行。再把 <code>new ConfirmResult(true, t)</code> 改成
+              <code>new ConfirmResult(false, t, null, "我不想删 /tmp/a.txt，换个目录")</code>，观察两件事：agent 不会崩，它会根据理由回句话或换一个方案。这就是「拒绝是一条正常工具结果」的直观证据。
+            </div>
+          </li>
+          <li>
+            <span class="sh">给一次确认加上「以后不再问」</span>
+            <div>
+              确认时传 <code>new ConfirmResult(true, t, List.of(rule))</code>，<code>rule</code> 是
+              <code>new PermissionRule(t.getName(), null, ALLOW, "suggested")</code>。再发一句会触发同一个工具的请求，确认它不再暂停。然后把
+              <code>agent.setPermissionMode(ctx, PermissionMode.DEFAULT)</code> 调一次（模式没变也会重建引擎），再试——规则没了。这就验证了「确认时带的规则只在内存里」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">用 <code>ToolBase</code> 验证三种模式</span>
+            <div>
+              把 <code>SafeDeleteTool</code> 注册进去，分别用 <code>DEFAULT</code> / <code>EXPLORE</code> / <code>BYPASS</code> 各跑一次，看同一句「删掉 /tmp/.env」会发生什么：
+              <code>DEFAULT</code> 下工具自检直接 DENY；<code>EXPLORE</code> 下因为 <code>readOnly=false</code> 连自检都没到就被拒；<code>BYPASS</code> 下依然是 DENY——因为工具自检的 DENY 排在 BYPASS 之前。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          到这里，agent 的基本闭环已经齐了：消息进、模型想、工具做、权限闸、状态存。但还有一类需求没地方放——
+          「每轮开始前加一段动态提示词」、「工具调完统一记审计日志」、「命中敏感词就停下整个循环」。这些都不该塞进工具，也不该塞进业务代码。下一章 <a href="09-middleware-hook.html">09 中间件与 Hook</a>：<code>MiddlewareBase</code> 怎么插入 ReAct 循环的六个阶段，以及怎么用 <code>RequestStopEvent</code> 把本章那个「不会自动停」的 <code>AllToolsDeniedEvent</code> 真正变成一次终止。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想确认的事</th><th>去哪看</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方权限章节（本章主要对照对象）</td><td><span class="src" data-src="docs/v2/zh/docs/building-blocks/permission-system.md:7">permission-system.md:7</span></td></tr>
+              <tr><td>可交互 HITL 示例</td><td><span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/hitl/PermissionHITLExample.java:145">PermissionHITLExample.java:145</span></td></tr>
+              <tr><td>事件流版确认回路</td><td><span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/harness/planmode/PlanModeAutoExample.java:140">PlanModeAutoExample.java:140</span></td></tr>
+              <tr><td>权限上下文里到底存了什么</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:207">AgentState.java:207</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

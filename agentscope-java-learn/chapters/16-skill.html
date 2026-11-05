@@ -1,0 +1,1152 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="工具解决「能做什么」，技能解决「怎么做才对」。一个技能就是一个目录 + 一份 SKILL.md：元数据每轮进 prompt，正文和参考资料等模型真正需要时再加载。这一章从模型怎么知道有哪些技能、凭什么相信加载的是这一个开始，一路走到四层合并、files-root、skill_manage 六动作与 curator 归档。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="16 技能：从 SKILL.md 到治理 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="工具解决「能做什么」，技能解决「怎么做才对」。一个技能就是一个目录 + 一份 SKILL.md：元数据每轮进 prompt，正文和参考资料等模型真正需要时再加载。这一章从模型怎么知道有哪些技能、凭什么相信加载的是这一个开始，一路走到四层合并、files-root、skill_manage 六动作与 curator 归档。" />
+    <title>16 技能：从 SKILL.md 到治理 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="16-skill" data-root="..">
+    <main>
+      <article class="article">
+        <h1>16 · 技能：从 SKILL.md 到治理</h1>
+        <p class="lede">
+          工具解决「能做什么」，技能解决「怎么做才对」。一个技能就是一个目录 + 一份 <code>SKILL.md</code>：元数据每轮进 prompt，正文和参考资料等模型真正需要时再加载。这一章从最底层的问题开始——<strong>模型怎么知道有哪些技能、凭什么相信加载的是这一个</strong>——一路走到四层合并、<code>load_skill_through_path</code>、<code>files-root</code>、<code>skill_manage</code> 六动作、晋升闸门、使用计数与 curator 归档。和官方文档的分歧集中在两处：<strong>默认闸门到底做了什么</strong>，以及<strong>所谓的「LLM 伞合并」其实还不存在</strong>。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>写出一个能被正确解析的 <code>SKILL.md</code>，并知道 <code>name</code>/<code>description</code>/正文三者缺一个会发生什么</li>
+          <li>背下四层来源的优先级顺序，并说出 <code>skillRepository(...)</code> 重复调用时谁覆盖谁</li>
+          <li>解释 <code>skillId = name + "_" + source</code> 为什么必须带 source，以及同名仓库自动改名的规则</li>
+          <li>画出 <code>&lt;available_skills&gt;</code> 的渲染条件，说清 <code>&lt;files-root&gt;</code> 在三种文件系统模式下的取值</li>
+          <li>把 <code>skill_manage</code> 的六个动作、写入落点与安全扫描串起来，指出草稿为什么「看不见」</li>
+          <li>说清晋升闸门的三值决策、默认 <code>RejectAllGate</code> 的真实行为，以及为什么官方示例里的 <code>defaultPrompter()</code> 永远批不下来</li>
+          <li>指出 curator 的状态机、归档路径，以及「LLM 伞合并」与源码的差距</li>
+        </ul>
+
+        <h2 id="why">先说为什么：技能是「按需展开的程序性知识」</h2>
+        <p>
+          一段「怎么评审代码」「怎么发版」「怎么排查线上 502」的流程，动辄几千字。把它们全塞进 system prompt，成本随技能数量线性上涨，而且模型大部分轮次根本用不上。技能机制把这个成本拆成三级：
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">第一级：只给清单</span>
+            <div class="ld">
+              每轮推理前，所有可见技能以 <code>&lt;skill&gt;</code> 条目进 prompt，只有 <code>name</code>、<code>description</code>、<code>skill-id</code>，以及可选的 <code>files-root</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillPromptBuilder.java:165-179"
+                >SkillPromptBuilder.java:165-179</span
+              >。模型先判断「这事跟我有没有关系」。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">第二级：加载正文</span>
+            <div class="ld">
+              决定要用，才调 <code>load_skill_through_path(skillId, "SKILL.md")</code>，把完整文档取回来<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillLoadTool.java:195-201"
+                >SkillLoadTool.java:195-201</span
+              >。这一步的返回内容会作为工具结果进入上下文。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">第三级：按题取资料</span>
+            <div class="ld">
+              正文里写了「详见 <code>references/style-guide.md</code>」，模型再发一次同一个工具，只取那一个文件；脚本则通过 shell 执行 <code>&lt;files-root&gt;/scripts/...</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/ShellPathPolicy.java:100-151"
+                >ShellPathPolicy.java:100-151</span
+              >。
+            </div>
+          </div>
+        </div>
+        <p>
+          这套「渐进披露」与第 15 章的 <code>MEMORY.md</code> 注入是两种思路：记忆是<strong>框架主动</strong>把文件塞进 prompt 并做预算截断；技能是<strong>模型主动</strong>决定加载哪一份，框架只负责列出候选、解析路径、守住可见性边界。
+        </p>
+        <div class="callout tip">
+          <span class="ct">技能不是工具</span>
+          <p>
+            工具是 <code>Toolkit</code> 里的可调用函数；技能是纯文本 + 资源，最终仍要靠 <code>load_skill_through_path</code>（读）和 <code>execute</code>（跑脚本）落地。所以一个没有 shell、没有文件系统工具的 agent，<strong>照样能读技能</strong>——只是跑不了技能自带的脚本。
+          </p>
+        </div>
+
+        <h2 id="format">SKILL.md 的硬约束：三个字段，一条正则</h2>
+        <p>
+          目录结构没有魔法，就三层：
+        </p>
+        <pre data-lang="text" data-file="推荐布局">&lt;workspace&gt;/skills/&lt;skill-name&gt;/
+├── SKILL.md            # 必需：YAML front matter + 正文
+├── references/         # 可选：长篇资料
+├── templates/          # 可选：模板
+├── scripts/            # 可选：可执行脚本
+└── assets/             # 可选：图片等静态资产</pre>
+        <p>
+          解析入口是 <code>SkillUtil.createFrom</code>。它做四件事、抛两种异常：<code>name</code> 与 <code>description</code> 缺失或为空 → <code>IllegalArgumentException</code>；front matter 之后正文为空 → 也是 <code>IllegalArgumentException</code><span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/skill/util/SkillUtil.java:90-116"
+            >SkillUtil.java:90-116</span
+          >。front matter 本身有解析上限：16384 个 code point，超了就当作没有 front matter<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/skill/util/MarkdownSkillParser.java:70"
+            >MarkdownSkillParser.java:70</span
+          >。
+        </p>
+        <pre data-lang="markdown" data-file="SKILL.md（最小可用）">---
+name: code-reviewer
+description: 当用户要求代码评审、风格反馈或 PR 审核时使用。不用于回答框架 API 问题。
+---
+
+# Code Reviewer
+
+1. 先读 `references/style-guide.md`，拿到本项目的命名与异常处理规范。
+2. 需要自动检查时，执行 `scripts/run-checks.sh &lt;目标路径&gt;`，把输出按严重级别归纳。
+3. 只评论改动涉及的代码，不要重写整个文件。</pre>
+        <p>
+          两个容易忽略的点：
+        </p>
+        <ul>
+          <li><strong>技能的身份不是 name，而是 <code>skillId</code></strong>。它由 <code>getName() + "_" + getSource()</code> 拼成<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/skill/AgentSkill.java:263-269">AgentSkill.java:263-269</span>。同一个 <code>code-reviewer</code> 从 Git 市场来是 <code>code-reviewer_git</code>，从工作区来是 <code>code-reviewer_workspace-namespaced</code>，两者可以共存。所以调用工具时第一个参数是 <code>skillId</code>，不是目录名。</li>
+          <li><strong>正文里只写相对路径</strong>。绝对路径在沙箱里会失效；框架会为每个技能算出自己的 <code>&lt;files-root&gt;</code>，模型用这个前缀拼 shell 命令。</li>
+        </ul>
+
+        <h2 id="discovery">技能是怎么被「发现」的：一次 glob 加一条过滤</h2>
+        <p>
+          工作区侧的仓库实现是 <code>WorkspaceSkillRepository</code>。它不是遍历目录树，而是向<strong>当前文件系统视图</strong>要一次 glob：<code>glob(ctx, "SKILL.md", "skills")</code>，对每个命中读全文、解析成 <code>AgentSkill</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/WorkspaceSkillRepository.java:150-186"
+            >WorkspaceSkillRepository.java:150-186</span
+          >。这里有两个关键设计：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">资源不预加载</span>
+            <div>
+              注册时只读 <code>SKILL.md</code>，<code>references/</code>、<code>scripts/</code> 全部留空，等 <code>load_skill_through_path</code> 时再按 <code>resourcesFor(name, ctx)</code> 懒加载<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/WorkspaceSkillRepository.java:177-180"
+                >:177-180</span
+              >。这样一个几百份技能的工作区也不会在启动时把磁盘读穿。
+            </div>
+          </li>
+          <li>
+            <span class="sh">元数据子树被整棵跳过</span>
+            <div>
+              <code>hasMetadataAncestor</code> 会丢掉 <code>skills</code> 下第一段以 <code>_</code> 或 <code>.</code> 开头的路径：<code>_drafts/</code>、<code>.archive/</code>、<code>.audit/</code>、<code>.backups/</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/WorkspaceSkillRepository.java:501-559"
+                >:501-559</span
+              >。这就是「草稿写进去但模型看不见」的真正原因——不是权限，是枚举阶段被过滤了。
+            </div>
+          </li>
+          <li>
+            <span class="sh">坏的 SKILL.md 只 warn，不中断</span>
+            <div>
+              单个技能解析抛异常会被 catch，记一条 <code>Failed to load skill from ...</code>，其余技能照常返回<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/WorkspaceSkillRepository.java:181-184"
+                >:181-184</span
+              >。所以「少了一个技能」通常要去看日志，而不是等一个报错。
+            </div>
+          </li>
+        </ol>
+        <p>
+          读取资源时还有一道防穿越：<code>sanitize</code> 拒绝以 <code>/</code> 开头或包含 <code>..</code> 的相对路径<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/WorkspaceSkillRepository.java:642-651"
+            >:642-651</span
+          >。别指望用 <code>path="../../MEMORY.md"</code> 读到技能目录外的文件。
+        </p>
+
+        <h2 id="layers">四层合并：谁覆盖谁</h2>
+        <p>
+          <code>build()</code> 的第一件事是把四个来源按优先级拼成一个<strong>有序列</strong><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:877-919"
+            >HarnessAgentBuilderSupport.java:877-919</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>优先级</th><th>来源</th><th>怎么开</th><th>注册条件</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>1（最低）</td><td>项目全局目录</td><td><code>projectGlobalSkillsDir(Path)</code></td><td><code>Files.isDirectory</code> 为真，否则<strong>静默跳过</strong></td></tr>
+              <tr><td>2</td><td>市场仓库</td><td><code>skillRepository(...)</code> 可重复调用</td><td>至少一个</td></tr>
+              <tr><td>3</td><td>工作区共用 <code>skills/</code></td><td>默认开</td><td><code>wsManager.getSkillsDir()</code> 在宿主盘上存在</td></tr>
+              <tr><td>4（最高）</td><td><code>&lt;userId&gt;/skills/</code></td><td>默认开，<code>disableDefaultWorkspaceSkills()</code> 可关</td><td><code>filesystem != null</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「覆盖」发生在合并阶段，规则只有一句：<strong>后出现的同名技能胜出</strong>。中间件按 compose 顺序遍历所有仓库，用 <code>LinkedHashMap.put(name, ...)</code> 写入，后面的直接顶掉前面的<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/HarnessSkillMiddleware.java:344-376"
+            >HarnessSkillMiddleware.java:344-376</span
+          >。所以：
+        </p>
+        <ul>
+          <li><code>skillRepository(a).skillRepository(b)</code> → <code>b</code> 覆盖 <code>a</code>。这也是为什么官方文档说「后注册的优先级更高」。用 <code>skillRepositories(list)</code> 是<strong>清空后重建</strong>，不是追加<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1753-1766">HarnessAgent.java:1753-1766</span>。</li>
+          <li>工作区共用覆盖所有市场；用户目录覆盖工作区共用。官方那张优先级表和代码一致。</li>
+          <li>第 1 层目录不存在时不会报错，也不会占位——这是「配了但没生效」最常见的来源。</li>
+        </ul>
+        <div class="callout warn">
+          <span class="ct">第 3 层依赖「宿主路径存在」</span>
+          <p>
+            第 3 层用的是 <code>wsManager.getSkillsDir()</code> 返回的 <code>Path</code>，注册前做的是 <code>Files.isDirectory</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:896-907"
+              >:896-907</span
+            >——这是宿主 JVM 的本地文件检查。沙箱或远程文件系统模式下，如果这个目录在宿主侧不存在，第 3 层会被跳过；第 4 层走 <code>AbstractFilesystem</code>，不受影响。实践含义：<strong>别把「共用技能」只放在第 3 层然后指望它在所有模式下都在</strong>；要么确认宿主目录存在，要么接受第 4 层作为统一入口。
+          </p>
+        </div>
+        <p>
+          子 agent 不需要重复配置。构建子 agent 时，父级的市场列表、<code>skillFilter</code>、<code>disableDefaultWorkspaceSkills</code>、<code>projectGlobalSkillsDir</code> 都会被复制过去<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:334-405"
+            >HarnessAgentBuilderSupport.java:334-405</span
+          >。
+        </p>
+
+        <h2 id="marketplace">市场仓库：一个接口，几种后端</h2>
+        <p>
+          市场侧统一实现 <code>AgentSkillRepository</code>，Harness 只认这个接口。仓库里自带三种实现，另外几种在扩展模块：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>实现</th><th>位置</th><th>适合</th><th>注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>FileSystemSkillRepository</code></td><td><code>agentscope-core</code></td><td>本地目录、共享盘</td><td>默认把资源全部预载进内存；<code>lazy=true</code> 时只留 <code>originDir</code> 做磁盘兜底</td></tr>
+              <tr><td><code>ClasspathSkillRepository</code></td><td><code>agentscope-core</code></td><td>跟 JAR 一起发</td><td>构造器会 <code>throws IOException</code>，<code>AutoCloseable</code></td></tr>
+              <tr><td><code>GitSkillRepository</code></td><td><code>agentscope-extensions-skill-git-repository</code></td><td>团队 Git 仓库</td><td>需要单独引扩展依赖</td></tr>
+              <tr><td><code>MysqlSkillRepository</code></td><td><code>agentscope-extensions-skill-mysql-repository</code></td><td>平台统一管理</td><td>可写回；表结构由 builder 建</td></tr>
+              <tr><td><code>PostgresSkillRepository</code></td><td><code>agentscope-extensions-skill-postgresql-repository</code></td><td>同 MySQL</td><td>同上</td></tr>
+              <tr><td><code>NacosSkillRepository</code></td><td><code>agentscope-extensions-nacos-skill</code></td><td>在线下发、变更订阅</td><td><code>AutoCloseable</code>，退出时关掉释放订阅</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="java" data-file="SkillMarketplace（自包含，可直接跑）">HarnessAgent agent =
+        HarnessAgent.builder()
+                .name("assistant")
+                .model("dashscope:qwen-plus")
+                .workspace(workspace)
+                .skillRepository(new ClasspathSkillRepository("skills"))
+                .build();</pre>
+        <p>
+          每个仓库都有一个 <code>getSource()</code>，它决定两件事：技能 id 的后缀，以及市场技能落到 <code>.skills-cache/</code> 下的目录名。如果两个仓库报了同一个 source，<code>resolveSourceNamespaces</code> 会给第二个及以后加 <code>_2</code>、<code>_3</code> 后缀并打 warn<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/MarketplaceStager.java:522-563"
+            >MarketplaceStager.java:522-563</span
+          >；source 为空串的仓库归到 <code>_global</code>。
+        </p>
+
+        <h2 id="prompt">每轮注入什么：一段 XML，三个条件</h2>
+        <p>
+          <code>onSystemPrompt</code> 是<strong>管道</strong>而不是洋葱：多个中间件依次调用，每个拿到上一个的输出<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareBase.java:147-160"
+            >MiddlewareBase.java:147-160</span
+          >。工作区上下文先拼好，技能中间件再在末尾追加这块：
+        </p>
+        <pre data-lang="xml" data-file="&lt;available_skills&gt; 渲染结果">&lt;!-- DEFAULT_HEADER 的结尾就是这一行，后面接技能条目 --&gt;
+&lt;available_skills&gt;
+
+&lt;skill&gt;
+  &lt;name&gt;code-reviewer&lt;/name&gt;
+  &lt;description&gt;当用户要求代码评审、风格反馈或 PR 审核时使用。&lt;/description&gt;
+  &lt;skill-id&gt;code-reviewer_workspace-namespaced&lt;/skill-id&gt;
+  &lt;files-root&gt;D:\ws\skills\code-reviewer&lt;/files-root&gt;
+&lt;/skill&gt;
+
+&lt;/available_skills&gt;</pre>
+        <p>
+          三个条件决定了这块到底出现什么：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>条件</th><th>结果</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>合并后没有任何技能</td><td>安装空 catalog，<strong>prompt 原样返回</strong>，连标题都没有</td><td><code>HarnessSkillMiddleware:269-273</code></td></tr>
+              <tr><td>过滤后为空</td><td>同样返回空 catalog，不渲染</td><td><code>:275-280</code></td></tr>
+              <tr><td>至少一个条目有非空 <code>files-root</code></td><td>末尾追加 <code>## Code Execution</code> 段，教模型用 <code>&lt;files-root&gt;</code> 跑脚本</td><td><code>SkillPromptBuilder:150-157</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          条目里的元数据不是只有 name/description：默认 <code>exposeAllMetadata=true</code>，front matter 里你写的<strong>任意键</strong>都会被渲染成 XML 子节点；嵌套 map 变嵌套元素，列表变重复的 <code>&lt;item&gt;</code>，非法标签名退化成 <code>&lt;entry key="..."&gt;</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillPromptBuilder.java:165-232"
+            >:165-232</span
+          >。所以别在 front matter 里塞密钥——它每轮都会进 prompt。
+        </p>
+        <div class="callout tip">
+          <span class="ct">动态与冻结只差一次合并时机</span>
+          <p>
+            默认每次 <code>onSystemPrompt</code> 都重新遍历仓库<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/HarnessSkillMiddleware.java:321-323">:321-323</span>；调了 <code>disableDynamicSkills()</code> 就在构建时合并一次、之后固定<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/HarnessSkillMiddleware.java:168-214">:168-214</span>。冻结用的是 <code>RuntimeContext.empty()</code> 的合并结果，所以依赖用户上下文的仓库在冻结模式下拿不到「当前用户」的视图——这是一个容易忽略的代价。
+          </p>
+        </div>
+
+        <h2 id="load">load_skill_through_path：四步查找与一条授权边界</h2>
+        <p>
+          工具名是常量 <code>load_skill_through_path</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillLoadTool.java:57"
+            >SkillLoadTool.java:57</span
+          >，参数只有两个：<code>skillId</code>（必填）与 <code>path</code>（必填，<code>SKILL.md</code> 表示正文）。查找顺序固定四步<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillLoadTool.java:195-219"
+            >:195-219</span
+          >：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">① path 等于 SKILL.md</span>
+            <div>
+              直接返回<strong>完整文档</strong>：一段头部信息（skillId / name / description / source / files-root）+ 四反引号围栏里的 <code>MarkdownSkillParser.generate(metadata, content)</code>，也就是 front matter + 正文都给你<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillLoadTool.java:232-256"
+                >:232-256</span
+              >。javadoc 写明了原因：早先只返回正文，模型拿 <code>patch</code> 去改 front matter 附近时总是匹配失败。
+            </div>
+          </li>
+          <li>
+            <span class="sh">② 内存命中</span>
+            <div>
+              <code>skill.getResources().get(path)</code>。市场技能、classpath 技能、非懒加载的工作区技能都在这一层命中。
+            </div>
+          </li>
+          <li>
+            <span class="sh">③ 懒加载兜底</span>
+            <div>
+              仓库实现了 <code>LazyResourceCapable</code> 就再试一次 <code>lazyResources().read(path)</code>，走的是<strong>当前调用的</strong> <code>RuntimeContext</code>，所以 per-user 命名空间与沙箱路由都跟着生效。
+            </div>
+          </li>
+          <li>
+            <span class="sh">④ 找不到时给清单，不给死路</span>
+            <div>
+              返回 <code>Resource not found: '...' in skill '...'</code>，下面列出 <code>SKILL.md</code> + 内存资源 + 懒加载 <code>list()</code> 的全部可用路径<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillLoadTool.java:277-311"
+                >:277-311</span
+              >。模型下一轮能自己改对。
+            </div>
+          </li>
+        </ol>
+        <div class="callout warn">
+          <span class="ct">catalog 就是授权边界</span>
+          <p>
+            每次调用可见的技能集合被写进 <code>RuntimeContext</code>（key 是 <code>SkillCatalog.class</code>），工具只在这个 catalog 里查 <code>skillId</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillRuntime.java:112-130"
+              >SkillRuntime.java:112-130</span
+            >。这意味着：某个技能即使存在于磁盘、即使别的会话能看到，只要它没在<strong>本次</strong>过滤后的 catalog 里，这次调用就加载不到。可见性过滤不是「提示词建议」，是运行时约束。
+          </p>
+        </div>
+        <p>
+          另一个细节：这个工具是<strong>未分组</strong>注册的，而且注册时会先移除同名旧工具再装自己的实例<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillRuntime.java:86-110"
+            >:86-110</span
+          >。未分组的含义是：它不受会话里持久化的「激活工具组」列表影响，老会话升级后也能立刻用。
+        </p>
+
+        <h2 id="filesroot">files-root：三种模式与一个缓存目录</h2>
+        <p>
+          技能自带脚本时，模型需要绝对路径才能执行。<code>ShellPathPolicy</code> 在构建时按文件系统类型选一次模式，之后每个技能算一个前缀<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/ShellPathPolicy.java:100-151"
+            >ShellPathPolicy.java:100-151</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模式</th><th>触发条件</th><th>工作区技能</th><th>市场技能</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>NO_SHELL</code></td><td>没有 <code>execute</code> 工具，或 <code>tools.json</code> 禁用了它</td><td>不渲染 <code>files-root</code></td><td>不渲染</td></tr>
+              <tr><td><code>LOCAL_WITH_SHELL</code></td><td><code>LocalFilesystemWithShell</code>，或 <code>OverlayFilesystem</code> 的上层是它</td><td><code>&lt;wsRoot&gt;/skills/&lt;name&gt;</code></td><td><code>&lt;wsRoot&gt;/.skills-cache/&lt;scope&gt;/&lt;source&gt;/&lt;name&gt;</code></td></tr>
+              <tr><td><code>SANDBOX</code></td><td><code>SandboxBackedFilesystem</code>（或被它包装的路由文件系统）</td><td><code>/workspace/skills/&lt;name&gt;</code></td><td><code>/workspace/.skills-cache/&lt;scope&gt;/&lt;source&gt;/&lt;name&gt;</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          沙箱前缀不是写死的 <code>/workspace</code>：如果沙箱上下文给了 <code>workspaceRoot</code>，就用它<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2883-2894"
+            >HarnessAgent.java:2883-2894</span
+          >；路径里有空格会转成 <code>\ </code>，方便直接拼进 POSIX 命令。
+        </p>
+        <p>
+          市场技能的物化由 <code>MarketplaceStager</code> 负责，三个行为值得记住：
+        </p>
+        <ul>
+          <li><strong>按文件 SHA-256 去重</strong>：内容没变就不重写，只补变化的文件<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/MarketplaceStager.java:304-345">:304-345</span>。</li>
+          <li><strong>孤儿目录有 30 分钟宽限</strong>：不在本轮白名单里的目录要「静置」超过 <code>DEFAULT_ORPHAN_GRACE</code> 才删<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/MarketplaceStager.java:92">:92</span>。原因是缓存按 <code>scope</code> 分片共享，A 调用的「孤儿」可能正是 B 调用正在用的 files-root。</li>
+          <li><strong>补回执行位</strong>：入库时资源变成字符串，POSIX 权限丢了；stager 用「首行 shebang 或已知脚本后缀」判断，按 <code>chmod +x</code> 语义只给已有读权限的位加执行位<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/MarketplaceStager.java:314-358">:314-358</span>。</li>
+        </ul>
+        <div class="callout tip">
+          <span class="ct">scope 段是文档里没有的</span>
+          <p>
+            <code>stage(visible, sourceNs, scope)</code> 的目录是 <code>.skills-cache/&lt;scope&gt;/&lt;source&gt;/&lt;name&gt;</code>；<code>scope</code> 为空串时收敛成 <code>_shared</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/MarketplaceStager.java:139-200"
+              >:139-200</span
+            >。官方文档给的 <code>.skills-cache/&lt;source&gt;/&lt;name&gt;</code> 少了这一段。排查「脚本找不到」时按四段路径去找，别按三段。
+          </p>
+        </div>
+
+        <h2 id="filter">三道过滤：可见性 → 白黑名单 → tools.json</h2>
+        <p>
+          一个技能要从「磁盘上有」走到「模型能加载」，要过三道闸，顺序固定：
+        </p>
+        <div class="compare">
+          <div class="col pick">
+            <h4>① 可见性过滤（per-call）</h4>
+            <ul>
+              <li>接口 <code>SkillVisibilityFilter</code>，先执行<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/HarnessSkillMiddleware.java:275-276">:275-276</span></li>
+              <li><code>EnvironmentFilter</code>：sidecar 的 <code>environments</code> 不含当前环境就隐藏</li>
+              <li><code>CanaryFilter</code>：对 <code>userId × skillName</code> 取稳定哈希，落在百分比内才可见</li>
+              <li><code>AllowListFilter</code>：只放白名单里的名字</li>
+              <li><code>CompositeFilter</code>：依次串联多个过滤器</li>
+              <li>除 <code>EnvironmentFilter</code> 外都继承 <code>AbstractAgentCreatedFilter</code>，<strong>只约束 <code>created_by="agent"</code> 的技能</strong>，手写技能原样放行</li>
+            </ul>
+          </div>
+          <div class="col">
+            <h4>② 技能白黑名单（builder）</h4>
+            <ul>
+              <li><code>SkillFilter.only(...)</code> / <code>except(...)</code> / <code>all()</code> / <code>none()</code></li>
+              <li>builder 级用 <code>enableSkills</code>、<code>disableSkills</code>、<code>skillsEnabled</code> 设置</li>
+              <li>运行时可以在 <code>RuntimeContext</code> 放一个 overlay，由 <code>builderFilter.overlay(ctx)</code> 合并<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/HarnessSkillMiddleware.java:325-327">:325-327</span></li>
+              <li>被这里挡掉的技能，同样进不了 catalog</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          第三道在 <code>build()</code> 的最后：<code>tools.json</code> 的 allow/deny 会作用到整个 <code>Toolkit</code>，<strong>包括</strong> <code>load_skill_through_path</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2933-2937"
+            >:2933-2937</span
+          >。这一条很多人踩过：技能清单还在 prompt 里，加载工具却被 deny 掉了，模型只能看到名字、点不开。
+        </p>
+        <div class="callout warn">
+          <span class="ct">可见性过滤器异常 = 全部放行</span>
+          <p>
+            <code>applyVisibility</code> 对过滤器抛出的异常是 <strong>fail-open</strong>：记一条 warn，然后把原始列表原样返回<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/HarnessSkillMiddleware.java:378-410"
+              >:378-410</span
+            >。写自定义灰度过滤器时，别让它因为一个空指针就变成「全量可见」——异常要在过滤器内部吞掉并返回空列表。
+          </p>
+        </div>
+
+        <h2 id="manage">skill_manage：六个动作，两个落点</h2>
+        <p>
+          打开 <code>enableSkillManageTool(...)</code> 后，并且<strong>只有</strong> <code>filesystem != null</code> 时才装配这套东西<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2783"
+            >HarnessAgent.java:2783</span
+          >，agent 获得两个工具：<code>propose_skill</code> 与 <code>skill_manage</code>。后者是主力，六个动作：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>action</th><th>作用</th><th>关键参数</th><th>失败条件</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>create</code></td><td>写一份新的 <code>SKILL.md</code>（必须带 front matter）</td><td><code>name</code> + <code>content</code></td><td>名字非法、已存在、扫描不过</td></tr>
+              <tr><td><code>edit</code></td><td>整篇重写已有技能的 <code>SKILL.md</code></td><td><code>name</code> + <code>content</code></td><td>技能不存在、扫描不过</td></tr>
+              <tr><td><code>patch</code></td><td>精确字符串替换，可指定 <code>file_path</code></td><td><code>old_string</code> / <code>new_string</code> / <code>replace_all</code></td><td>不唯一且未开 <code>replace_all</code></td></tr>
+              <tr><td><code>write_file</code></td><td>写一个附属文件</td><td><code>file_path</code> + <code>file_content</code></td><td>不在四个允许子目录下、超过 1 MiB</td></tr>
+              <tr><td><code>remove_file</code></td><td>删一个附属文件</td><td><code>file_path</code></td><td>文件不存在</td></tr>
+              <tr><td><code>delete</code></td><td>归档整个技能目录（<strong>非破坏</strong>）</td><td><code>absorbed_into</code>（可选）</td><td>只读仓库</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「两个落点」是最容易记混的地方：
+        </p>
+        <ul>
+          <li><code>autoPromote=false</code>（默认）：<code>create</code> 写到 <code>skills/_drafts/&lt;name&gt;/</code>；其余动作<strong>先找草稿、再找正式目录</strong>，同名草稿优先<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SkillManageTool.java:55-58">SkillManageTool.java:55-58</span>。</li>
+          <li><code>autoPromote=true</code>：直接写 <code>skills/&lt;name&gt;/</code>，下一轮立即可见。工具描述会跟着变，告诉模型「草稿是免费的、不会生效」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SkillManageTool.java:137-140">:137-140</span>。</li>
+        </ul>
+        <p>
+          写入前有五条硬校验，全部是常量，写死在这里<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SkillManageTool.java:66-73"
+            >:66-73</span>：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>限制</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>技能名</td><td>≤ 64 字符，正则 <code>^[a-z0-9][a-z0-9._-]*$</code>（不许大写、不许开头 <code>_</code> 或 <code>.</code>）</td></tr>
+              <tr><td>描述</td><td>≤ 1024 字符</td></tr>
+              <tr><td>SKILL.md 正文</td><td>≤ 100 000 字符</td></tr>
+              <tr><td>单个附属文件</td><td>≤ 1 048 576 字节（1 MiB）</td></tr>
+              <tr><td>附属目录</td><td>只允许 <code>references</code> / <code>templates</code> / <code>scripts</code> / <code>assets</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          每次写（create / edit / patch / write_file）之后，如果 <code>securityScan=true</code>（默认），会跑一次 <code>SkillSecurityScanner</code>，被判 <code>DANGEROUS</code> 就拒绝写入<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SkillManageTool.java:342-346"
+            >:342-346</span
+          >。它不是可选项里的摆设：<code>SkillManageConfig.Builder</code> 里默认就是 <code>true</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SkillManageConfig.java:77-83"
+            >SkillManageConfig.java:77-83</span
+          >。
+        </p>
+        <div class="callout tip">
+          <span class="ct">打开工具时顺手改了仓库</span>
+          <p>
+            第 4 层原本是只读的 <code>WorkspaceSkillRepository(filesystem, "skills", "workspace-namespaced", false)</code>；<code>build()</code> 会从后往前找到第一个只读的 <code>WorkspaceSkillRepository</code>，把它<strong>替换</strong>成指向 <code>mainDir</code> 的可写版本，再额外加一个指向 <code>draftsDir</code> 的仓库<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2788-2811"
+              >HarnessAgent.java:2788-2811</span
+            >。所以「开自学习」不只是多一个工具，可见的仓库实例也换了。
+          </p>
+        </div>
+
+        <h2 id="promote">晋升：先扫描，再问闸门</h2>
+        <p>
+          草稿要变成正式技能，只有一条路：<code>SkillPromoter.promote(name, reviewerId, ctx)</code>。它的顺序不能调换<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillPromoter.java:87-119"
+            >SkillPromoter.java:87-119</span
+          >：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">① 读草稿，读不到就 invalid</span>
+            <div>
+              <code>draftsRepo.getSkill(name, ctx)</code> 返回 null 时结果是 <code>invalid("draft 'x' not found")</code>，不会抛异常。
+            </div>
+          </li>
+          <li>
+            <span class="sh">② 安全扫描，无条件执行</span>
+            <div>
+              注意它<strong>不读</strong> <code>SkillManageConfig.securityScan</code>——晋升这一关永远是「最后一道闸」，用的是完整扫描（SKILL.md + 四个子目录的资源）<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillPromoter.java:102-113"
+                >:102-113</span
+              >。判 <code>DANGEROUS</code> 直接 <code>rejected</code>，闸门根本不会被问到。
+            </div>
+          </li>
+          <li>
+            <span class="sh">③ 问闸门，三选一</span>
+            <div>
+              返回 <code>Approve</code> / <code>Reject</code> / <code>Defer</code> 三种决策之一<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillPromotionGate.java:49-57"
+                >SkillPromotionGate.java:49-57</span
+              >。<code>Defer</code> 带 <code>retryAfter</code>，表示「现在不批，过会儿再问」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">④ 批准才搬目录</span>
+            <div>
+              <code>workspaceManager.moveSkill(ctx, "skills/_drafts/&lt;name&gt;", "skills/&lt;name&gt;")</code>；搬完在 sidecar 上写 <code>created_by="agent"</code>、<code>promoted_by</code>、目标环境（空则 <code>["prod"]</code>），最后追加一条审计<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillPromoter.java:139-179"
+                >:139-179</span
+              >。
+            </div>
+          </li>
+        </ol>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>内置闸门</th><th>行为</th><th>什么时候用</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>RejectAllGate</code>（默认）</td>
+                <td>永远返回 <code>Defer</code>，理由写死为「promotion requires explicit HarnessAgent.promoteSkill」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/RejectAllGate.java:23-46">RejectAllGate.java:23-46</span></td>
+                <td>没有接审核系统，只想让业务代码手动批</td>
+              </tr>
+              <tr>
+                <td><code>LocalApprovalGate</code></td>
+                <td>把候选包交给 <code>Prompter</code>，超时（默认 30 分钟）或异常都变 <code>Defer</code>；默认目标环境 <code>["prod"]</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/LocalApprovalGate.java:50-88">LocalApprovalGate.java:50-88</span></td>
+                <td>CLI / IDE 里人工确认</td>
+              </tr>
+              <tr>
+                <td><code>NotifyAndWaitGate</code></td>
+                <td>先推通知、立刻 <code>Defer</code>；真正的批准由外部回调触发再次 <code>promote</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/NotifyAndWaitGate.java:34-93">NotifyAndWaitGate.java:34-93</span></td>
+                <td>IM / 工单审批</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="ct">默认闸门不是「拒绝」，是「延期」</span>
+          <p>
+            类名叫 <code>RejectAllGate</code>，但返回的是 <code>Defer</code>。差别很实际：<code>Reject</code> 意味着这份草稿废了，<code>Defer</code> 意味着它还在 <code>_drafts/</code> 里等你手动批。所以「什么都没配」时，最省事的路径不是改配置，而是在业务代码里调 <code>agent.promoteSkill(name, reviewerId, ctx)</code>——它绕过的是「自动问闸门」，不是「安全扫描」（扫描在问闸门之前，照样跑）。
+          </p>
+        </div>
+        <p>
+          另一个坑在官方示例里：<code>new LocalApprovalGate(LocalApprovalGate.defaultPrompter())</code> 看着像「本地人工确认」，但 <code>defaultPrompter()</code> 的实现是<strong>永远 Defer</strong>（javadoc 写的是 “never approves. Suitable for tests”）<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/LocalApprovalGate.java:82-88"
+            >:82-88</span
+          >。真要用，得自己写 <code>Prompter</code>，或者用 <code>stdinPrompter(in, out)</code>。<code>promoteSkill</code> 的返回值也是四种：<code>approved</code> / <code>rejected</code> / <code>deferred</code> / <code>invalid</code>，其中 <code>invalid</code> 专门表示「前置条件不满足」（没配 promoter、草稿不存在、搬目录失败）<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:306-326"
+            >HarnessAgent.java:306-326</span
+          >。
+        </p>
+
+        <h2 id="usage">使用计数与审计：两个 sidecar 文件</h2>
+        <p>
+          自学习闭环需要「这个技能最近有没有人用」的数据。它放在两个地方，职责完全不同：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>文件</th><th>谁写</th><th>内容</th><th>谁读</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>skills/.usage.json</code></td>
+                <td><code>SkillUsageStore</code>（文件后端；配了分布式 store 时按 <code>["skills","usage"]</code> 存 KV）</td>
+                <td>每个技能一条 <code>SkillUsageRecord</code>：view/use/patch 计数、<code>created_by</code>、状态、<code>pinned</code>、<code>environments</code>、最后活跃时间</td>
+                <td><code>EnvironmentFilter</code> / <code>CanaryFilter</code> / <code>AllowListFilter</code>、curator</td>
+              </tr>
+              <tr>
+                <td><code>skills/.audit/YYYY-MM-DD.jsonl</code></td>
+                <td><code>SkillAuditLog</code>（append-only）</td>
+                <td>每次写、晋升、扫描的行：<code>ts / actor / op / target / decision / scanVerdict / beforeHash / afterHash / ctx / extra</code></td>
+                <td><code>agent.queryAudit(day, filter)</code>、<code>runCuratorOnce</code> 的运维排查</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          计数的时机值得注意：<code>SkillUsageMiddleware</code> 挂在 <code>onActing</code> 上，<strong>看到 toolCalls 就记</strong>，不等工具结果返回<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SkillUsageMiddleware.java:62-74"
+            >SkillUsageMiddleware.java:62-74</span
+          >。语义是「模型决定用这个技能」，而不是「技能成功执行」。它认两个工具名：<code>load_skill_through_path</code> 与 <code>read_skill</code>，后者在 2.0.4 里<strong>并不存在</strong>，只是为未来改名预留<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SkillUsageMiddleware.java:46-54"
+            >:46-54</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">view 计数会落到另一个 key 上</span>
+          <p>
+            把两条源码事实并排放：中间件从工具入参里取的是 <code>skillId</code>（形如 <code>notes-taker_workspace-namespaced</code>）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SkillUsageMiddleware.java:110-129">:110-129</span>；而晋升/写入 sidecar 时用的是纯技能名 <code>notes-taker</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillPromoter.java:150-157">SkillPromoter.java:150-157</span>。<code>bumpView</code> 又要求该 key 上已有 <code>created_by</code> 记录，否则原样返回（no-op）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillUsageStore.java:184-200">SkillUsageStore.java:184-200</span>。结果是：<strong>正常链路里 view 计数不会累加</strong>，curator 判断活跃度主要靠 <code>lastPatchedAt</code> 与 <code>createdAt</code>。要自己补，就在业务侧按纯名字调 <code>usageStore.bumpView(name)</code>，别指望中间件。
+          </p>
+        </div>
+        <p>
+          审计侧没有这个问题：<code>skill_manage</code> 的每次写、<code>promoteSkill</code> 的每次批准都会 append 一行，带 <code>beforeHash</code>/<code>afterHash</code>，能还原「谁在什么时候把哪份内容换掉了」。<code>queryAudit</code> 只读<strong>某一天</strong>的文件，传 <code>null</code> 表示今天<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillAuditLog.java:39-52"
+            >SkillAuditLog.java:39-52</span
+          >。<code>enableSkillManageTool</code> 没开时它返回空列表，不会报错。
+        </p>
+
+        <h2 id="curator">curator：只归档、不删除的后台整理</h2>
+        <p>
+          打开 <code>enableSkillCurator(config)</code> 后，中间件会在每次 <code>call()</code> 完成时问一次「现在该跑吗」；该跑就丢到单线程 daemon executor，不阻塞调用方<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SkillCuratorMiddleware.java:32-80"
+            >SkillCuratorMiddleware.java:32-80</span
+          >。默认参数：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>配置</th><th>默认</th><th>含义</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td><code>true</code></td><td>config 内部开关；只有调了 <code>enableSkillCurator</code> 才会被使用</td></tr>
+              <tr><td><code>intervalHours</code></td><td><code>168</code>（7 天）</td><td>两次运行的最小间隔，<code>Math.max(1, v)</code></td></tr>
+              <tr><td><code>staleAfterDays</code></td><td><code>30</code></td><td>超过这么久没活动 → <code>STALE</code></td></tr>
+              <tr><td><code>archiveAfterDays</code></td><td><code>90</code></td><td>超过这么久 → 搬进 <code>.archive/</code></td></tr>
+              <tr><td><code>umbrellaPassMode</code></td><td><code>DRY_RUN_ONLY</code></td><td>只写报告、不改技能</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          这五个默认值在 <code>SkillCuratorConfig.Builder</code> 里<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillCuratorConfig.java:74-105"
+            >:74-105</span
+          >；<code>archiveAfterDays</code> 会被夹到不小于 <code>staleAfterDays</code>，避免「还没 stale 就归档」。
+        </p>
+        <p>
+          节流有两层：<code>.curator_state.json</code> 里的 <code>last_run_at</code> 保证<strong>跨 JVM 重启</strong>也不会跑太勤；<code>PeriodicGate</code> 再保证<strong>多副本</strong>只有一个实例真正跑<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillCurator.java:152-185"
+            >SkillCurator.java:152-185</span
+          >。第一次运行不会执行：它只把 <code>last_run_at</code> 种进去就返回 false，所以「刚部署就想看效果」得手动 <code>runCuratorOnce()</code>。
+        </p>
+        <p>
+          状态机的输入只有两个：<code>created_by="agent"</code> 且 <code>pinned=false</code> 的记录，以及它们的<strong>最近活动时间</strong>（<code>lastUsedAt</code> / <code>lastViewedAt</code> / <code>lastPatchedAt</code> 取最大，都没有则用 <code>createdAt</code>）<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillCurator.java:205-241"
+            >:205-241</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>条件</th><th>动作</th><th>副作用</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>anchor 早于 <code>archiveCutoff</code> 且状态不是 ARCHIVED</td><td><code>mainRepo.delete(name)</code> + <code>setState(ARCHIVED)</code></td><td>目录被 move 到 <code>skills/.archive/&lt;name&gt;-&lt;yyyyMMddHHmmss&gt;</code>（UTC）</td></tr>
+              <tr><td>anchor 早于 <code>staleCutoff</code> 且状态是 ACTIVE</td><td><code>setState(STALE)</code></td><td>只在 sidecar 上标记，不动目录</td></tr>
+              <tr><td>anchor 晚于 <code>staleCutoff</code> 且状态是 STALE</td><td><code>setState(ACTIVE)</code></td><td>自动复活，计入 <code>reactivated</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「只归档、不删除」是硬约束：<code>WorkspaceSkillRepository.delete</code> 的实现就是 <code>filesystem.move(src, archiveDest)</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/WorkspaceSkillRepository.java:272-308"
+            >:272-308</span
+          >，javadoc 也写明与 curator 的 never-delete 对齐。另外草稿状态（<code>DRAFT</code>）归晋升闸门管，curator 不碰——它只看 <code>created_by="agent"</code>，草稿是 <code>"agent-draft"</code>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">所谓的「LLM 伞合并」还没实现</span>
+          <p>
+            官方文档写「可选叠加一个 LLM『伞合并』扫描（默认只 dry-run，输出报告，不实际改）」，读起来像是一次模型调用。源码里 <code>runUmbrellaDryRunReport</code> 的 javadoc 直接承认：<strong>prompt 与 LLM 调用被推迟到未来版本</strong>，当前实现只是把技能名按第一个 <code>-_.</code> 之前的段做聚类，写一份 <code>skills/.curator_reports/&lt;ts&gt;/REPORT.md</code>，内容是「前缀聚类 + 一个空的 <code>consolidations: []</code> YAML 块」<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillCurator.java:248-324"
+              >SkillCurator.java:248-324</span
+            >。没有模型、没有合并建议，只有分堆。
+          </p>
+        </div>
+        <p>
+          程序化入口有三个：<code>runCuratorOnce()</code> 绕过所有节流立即跑一次（没配 curator 时返回空 <code>Mono</code>）；<code>setPaused(true)</code> 暂停自动运行；<code>queryAudit</code> 查审计。它们都挂在 <code>HarnessAgent</code> 上，不需要自己去拿中间件<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:282-326"
+            >:282-326</span
+          >。
+        </p>
+
+        <h2 id="security">安全扫描：19 条正则，四档信任</h2>
+        <p>
+          <code>SkillSecurityScanner</code> 是一个纯函数：给文本，返回 <code>ScanResult(verdict, findings, reportText)</code>。规则库 19 条，分 6 类、4 个严重级<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillSecurityScanner.java:48-76"
+            >:48-76</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>类别</th><th>条数</th><th>典型模式</th><th>最高级别</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>EXFILTRATION</code></td><td>3</td><td><code>curl -d</code>、<code>wget --post-data</code>、<code>cat ... | nc</code></td><td>HIGH</td></tr>
+              <tr><td><code>INJECTION</code></td><td>3</td><td>“ignore previous instructions”、<code>&lt;system&gt;</code>、jailbreak 词表</td><td>MEDIUM</td></tr>
+              <tr><td><code>DESTRUCTIVE</code></td><td>4</td><td><code>rm -rf /</code>、<code>mkfs /dev/...</code>、<code>dd of=/dev/sd...</code></td><td>CRITICAL</td></tr>
+              <tr><td><code>PERSISTENCE</code></td><td>3</td><td><code>crontab -</code>、装 systemd unit、写 <code>~/.bashrc</code></td><td>HIGH</td></tr>
+              <tr><td><code>NETWORK</code></td><td>3</td><td>bash 反弹 shell、<code>nc -l</code>、<code>nc -e</code></td><td>CRITICAL</td></tr>
+              <tr><td><code>OBFUSCATION</code></td><td>3</td><td><code>base64 -d | sh</code>、<code>eval $(curl ...)</code>、<code>curl | bash</code></td><td>CRITICAL</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          判定不是「命中即拒」，而是「信任级别 × verdict」的矩阵<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillSecurityScanner.java:293-304"
+            >:293-304</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>TrustLevel</th><th>放行条件</th><th>典型来源</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>BUILTIN</code></td><td>无条件</td><td>框架自带技能</td></tr>
+              <tr><td><code>TRUSTED</code></td><td>非 <code>DANGEROUS</code></td><td>内部仓库</td></tr>
+              <tr><td><code>COMMUNITY</code></td><td>只有 <code>SAFE</code></td><td>公开市场</td></tr>
+              <tr><td><code>AGENT_CREATED</code></td><td>非 <code>DANGEROUS</code></td><td>agent 自己写的（Hermes 的 ASK 在这里收敛成 BLOCK）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>skill_manage</code> 与 <code>SkillPromoter</code> 都用 <code>AGENT_CREATED</code>，所以实际效果是「<code>SAFE</code>/<code>CAUTION</code> 放行、<code>DANGEROUS</code> 拒绝」。javadoc 特意加了一句免责：这玩意是<strong>写的时候抓明显错误</strong>，不是沙箱的替代品<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillSecurityScanner.java:40-45"
+            >:40-45</span
+          >。别把「扫描通过」当成「可以放心执行」。
+        </p>
+
+        <h2 id="assemble">装配：build() 里的技能段</h2>
+        <p>
+          把这一章涉及的注册动作按 <code>build()</code> 的真实顺序排一遍，顺序本身就是约束：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>顺序</th><th>动作</th><th>行号</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>1</td><td><code>composeSkillRepositories</code> 合并四层</td><td>2774-2776</td></tr>
+              <tr><td>2</td><td><code>if (skillManageToolEnabled &amp;&amp; filesystem != null)</code> 进入自学习分支</td><td>2783</td></tr>
+              <tr><td>3</td><td>替换只读第 4 层为可写 <code>mainDir</code> 仓库；追加 <code>draftsDir</code> 仓库</td><td>2788-2811</td></tr>
+              <tr><td>4</td><td>建 <code>SkillUsageStore</code> 与 <code>SkillAuditLog</code></td><td>2812-2816</td></tr>
+              <tr><td>5</td><td>注册 <code>skill_manage</code> 与 <code>propose_skill</code></td><td>2817-2826</td></tr>
+              <tr><td>6</td><td>装 <code>SkillUsageMiddleware</code></td><td>2827-2829</td></tr>
+              <tr><td>7</td><td>建 <code>SkillPromoter</code>，闸门缺省 <code>new RejectAllGate()</code></td><td>2831-2841</td></tr>
+              <tr><td>8</td><td><code>if (skillCuratorEnabled)</code> 建 curator + 装 <code>SkillCuratorMiddleware</code></td><td>2843-2857</td></tr>
+              <tr><td>9</td><td>选 <code>ShellPathPolicy</code>、建 <code>MarketplaceStager</code></td><td>2860-2898</td></tr>
+              <tr><td>10</td><td>装 <code>HarnessSkillMiddleware</code>（动态或 frozen）</td><td>2900-2917</td></tr>
+              <tr><td>11</td><td><code>inner.dynamicSkillsEnabled(false)</code>，关掉 core 的那套</td><td>2920</td></tr>
+              <tr><td>12</td><td>沙箱启动前 prestage 回调</td><td>2924-2927</td></tr>
+              <tr><td>13</td><td><code>ToolFilter.apply</code> 应用 <code>tools.json</code></td><td>2933-2937</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          四个连带结论：
+        </p>
+        <ul>
+          <li><strong><code>enableSkillCurator</code> 依赖 <code>enableSkillManageTool</code></strong>。curator 的建法嵌在自学习分支里，没开工具就没有 curator，也没有 <code>SkillCuratorMiddleware</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2843-2857">:2843-2857</span>。builder 的 javadoc 也只写了 “Requires enableSkillManageTool”，没写「静默失效」。</li>
+          <li><strong>core 的技能中间件被显式关掉</strong>。<code>agentscope-core</code> 里另有一套 <code>SkillBox</code> + <code>DynamicSkillMiddleware</code>，给不用 Harness 的 ReActAgent 用；Harness 自己接管后必须关掉，否则同一份技能会被注入两次<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2919-2920">:2919-2920</span>。</li>
+          <li><strong>技能中间件排在最后，所以它追加在 prompt 末尾</strong>。<code>onSystemPrompt</code> 是管道，注册在后面的中间件看到的是前面拼好的完整 prompt<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareBase.java:147-160">MiddlewareBase.java:147-160</span>。</li>
+          <li><strong><code>tools.json</code> 最后才过滤</strong>，因此它可以 deny 掉 <code>load_skill_through_path</code> 与 <code>skill_manage</code>；prompt 里的清单不会跟着消失。</li>
+        </ul>
+        <div class="compare">
+          <div class="col pick">
+            <h4>自学习链路（按调用顺序）</h4>
+            <ul>
+              <li><code>skill_manage(create)</code> → 写 <code>_drafts/</code>，sidecar 记 <code>agent-draft</code></li>
+              <li><code>load_skill_through_path</code> → 只读草稿？<strong>读不到</strong>，`_drafts` 被枚举过滤</li>
+              <li><code>promoteSkill</code> → 扫描 + 闸门 + 搬目录 + 记 <code>agent</code></li>
+              <li>下一轮 <code>onSystemPrompt</code> → 清单里出现</li>
+              <li>curator 按 30/90 天规则转 <code>STALE</code>/<code>ARCHIVED</code></li>
+            </ul>
+          </div>
+          <div class="col">
+            <h4>三个常见误解</h4>
+            <ul>
+              <li>「草稿能被测试」——不能，草稿只在 <code>_drafts/</code> 里，prompt 与 catalog 都看不见</li>
+              <li>「自动晋升是默认」——不是，<code>autoPromote=false</code></li>
+              <li>「curator 会删掉没用的技能」——只 move 到 <code>.archive/</code></li>
+            </ul>
+          </div>
+        </div>
+
+        <h2 id="doc-gap">官方说了什么 vs 源码实际是什么</h2>
+        <p>
+          这一章的分歧比前几章集中，因为它们都在「自学习闭环」这个较新的模块里。<code>docs/v2/zh/docs/harness/skill.md</code> 的说法放左边，源码放右边：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方文档</th><th>2.0.4 源码</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>闸门内置三种：「直接拒绝（默认）、本地人工确认、推消息后等」</td>
+                <td><code>RejectAllGate</code> 返回的是 <code>Defer</code>，不是 <code>Reject</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/RejectAllGate.java:23-46">RejectAllGate.java:23-46</span></td>
+                <td>「拒绝」意味着草稿作废；实际是挂起等你手动批</td>
+              </tr>
+              <tr>
+                <td>示例 <code>new LocalApprovalGate(LocalApprovalGate.defaultPrompter())</code></td>
+                <td><code>defaultPrompter()</code> 永远返回 <code>Defer</code>，javadoc 写 “never approves”<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/LocalApprovalGate.java:82-88">:82-88</span></td>
+                <td>照抄示例 = 永远批不下来</td>
+              </tr>
+              <tr>
+                <td>「可选叠加一个 LLM 伞合并扫描（默认只 dry-run，输出报告）」</td>
+                <td>无 LLM 调用；只按前缀聚类写 <code>REPORT.md</code>，javadoc 明写推迟到未来版本<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillCurator.java:248-258">:248-258</span></td>
+                <td>别指望它给出合并建议</td>
+              </tr>
+              <tr>
+                <td>市场技能落在 <code>&lt;wsRoot&gt;/.skills-cache/&lt;source&gt;/&lt;name&gt;/</code></td>
+                <td><code>.skills-cache/&lt;scope&gt;/&lt;source&gt;/&lt;name&gt;</code>；空 scope 收敛为 <code>_shared</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/MarketplaceStager.java:139-200">:139-200</span></td>
+                <td>按三段路径找不到脚本，实际多一层</td>
+              </tr>
+              <tr>
+                <td>「每次调 <code>load_skill_through_path</code> / <code>read_skill</code> 时自动记一笔」</td>
+                <td><code>read_skill</code> 在 2.0.4 没有实现，只出现在计数白名单里<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SkillUsageMiddleware.java:46-54">:46-54</span></td>
+                <td>写提示词时别让模型调 <code>read_skill</code></td>
+              </tr>
+              <tr>
+                <td><code>load_skill_through_path(skillId, path="SKILL.md")</code> 返回 markdown 正文</td>
+                <td>返回头部信息 + 完整文档（front matter + 正文），四反引号围栏<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/runtime/SkillLoadTool.java:232-256">:232-256</span></td>
+                <td><code>patch</code> 的 <code>old_string</code> 要跟含 front matter 的视图对齐</td>
+              </tr>
+              <tr>
+                <td>「工作区里的 skill 不用任何注册，把目录放好就生效」</td>
+                <td>第 3 层的注册前置是 <code>Files.isDirectory(wsInfo.getSkillsDir())</code>；第 4 层需要 <code>filesystem != null</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:896-916">:896-916</span></td>
+                <td>沙箱/远程模式下宿主目录不存在时，第 3 层会静默缺席</td>
+              </tr>
+              <tr>
+                <td>使用计数「为后面的清理、灰度发布提供数据」</td>
+                <td>计数只在已有 <code>created_by</code> 记录时生效，而中间件传的是 <code>skillId</code>、晋升记的是纯名字<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillUsageStore.java:184-200">SkillUsageStore.java:184-200</span></td>
+                <td>正常链路里 view 计数不会增长</td>
+              </tr>
+              <tr>
+                <td>「超过 30 天没用的 skill 标为 stale」</td>
+                <td>只看 <code>created_by="agent"</code> 且未 <code>pinned</code> 的记录；anchor 是 lastUsed/lastViewed/lastPatched 的最大值<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillCurator.java:205-241">:205-241</span></td>
+                <td>手写技能、草稿、置顶技能都不会被整理</td>
+              </tr>
+              <tr>
+                <td>「用 <code>enableSkillPromotionGate</code> 加审核闸门」</td>
+                <td>闸门只在 <code>enableSkillManageTool</code> 分支内被消费；没开工具时传了也不生效<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2783-2841">:2783-2841</span></td>
+                <td>配置看起来生效、实际没装配</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cheatsheet">速查</h2>
+        <h3 id="key-defaults">关键默认值</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>默认</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>技能可见范围</td><td><code>SkillFilter.all()</code></td><td><code>HarnessSkillMiddleware:198</code></td></tr>
+              <tr><td>动态合并</td><td>开（每次 prompt 重建）</td><td><code>HarnessAgent:2900-2915</code></td></tr>
+              <tr><td>第 4 层仓库</td><td>只读 <code>WorkspaceSkillRepository(..., false)</code></td><td><code>HarnessAgentBuilderSupport:912-916</code></td></tr>
+              <tr><td><code>skill_manage</code> 落点</td><td><code>skills/_drafts</code></td><td><code>SkillManageConfig:31-35</code></td></tr>
+              <tr><td><code>autoPromote</code> / <code>securityScan</code></td><td><code>false</code> / <code>true</code></td><td><code>SkillManageConfig:77-83</code></td></tr>
+              <tr><td>默认晋升闸门</td><td><code>RejectAllGate</code>（Defer）</td><td><code>HarnessAgent:2837</code></td></tr>
+              <tr><td>curator 间隔 / stale / archive</td><td>168h / 30d / 90d</td><td><code>SkillCuratorConfig:74-105</code></td></tr>
+              <tr><td>孤儿缓存宽限</td><td>30 分钟</td><td><code>MarketplaceStager:92</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 id="paths-filenames">路径与文件名</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>路径</th><th>内容</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>skills/&lt;name&gt;/SKILL.md</code></td><td>技能正文（唯一必需文件）</td></tr>
+              <tr><td><code>skills/_drafts/&lt;name&gt;/</code></td><td><code>autoPromote=false</code> 时的草稿；<strong>不会</strong>进 prompt</td></tr>
+              <tr><td><code>skills/.archive/&lt;name&gt;-&lt;ts&gt;/</code></td><td>被删/被 curator 归档的技能</td></tr>
+              <tr><td><code>skills/.usage.json</code></td><td>view/use/patch 计数与 provenance</td></tr>
+              <tr><td><code>skills/.audit/&lt;day&gt;.jsonl</code></td><td>写入与晋升审计</td></tr>
+              <tr><td><code>skills/.curator_state.json</code></td><td>last_run_at / paused / 上次摘要</td></tr>
+              <tr><td><code>skills/.curator_reports/&lt;ts&gt;/REPORT.md</code></td><td>前缀聚类报告（不是合并建议）</td></tr>
+              <tr><td><code>.skills-cache/&lt;scope&gt;/&lt;source&gt;/&lt;name&gt;/</code></td><td>市场技能物化目录，供 shell 执行</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 id="copy-config">一份能直接抄的配置</h3>
+        <pre data-lang="java" data-file="SkillGovernance（自包含，可直接跑）">HarnessAgent agent =
+        HarnessAgent.builder()
+                .name("assistant")
+                .model("dashscope:qwen-plus")
+                .workspace(workspace)
+                // 市场：后注册的覆盖先注册的
+                .skillRepository(new ClasspathSkillRepository("skills"))
+                // 只暴露两个手写技能（对 agent 自己创建的技能同样生效）
+                .enableSkills("code-reviewer", "release-notes")
+                // 自学习：草稿 + 人工闸门 + 周度整理
+                .enableSkillManageTool(SkillManageConfig.builder()
+                        .autoPromote(false)
+                        .securityScan(true)
+                        .build())
+                .enableSkillPromotionGate(
+                        new LocalApprovalGate(
+                                java.time.Duration.ofMinutes(10),
+                                LocalApprovalGate.stdinPrompter(System.in, System.out),
+                                java.util.List.of("prod")),
+                        new EnvironmentFilter("prod", usageStore))
+                .enableSkillCurator(SkillCuratorConfig.builder()
+                        .intervalHours(24 * 7)
+                        .staleAfterDays(30)
+                        .archiveAfterDays(90)
+                        .build())
+                .environment("prod")
+                .build();</pre>
+        <p>
+          注意这份配置里的 <code>usageStore</code> 必须与 agent 内部用的是同一个实例才能让环境过滤器看到正确数据；如果不想自己管，先用 <code>visibilityFilter=null</code>，只开闸门。
+        </p>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. SKILL.md 写了，模型却完全看不到</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>&lt;available_skills&gt;</code> 里没有这个技能，也没有任何异常；只有 DEBUG 日志里一行 <code>Failed to load skill from ...</code>。</dd>
+            <dt>因为</dt>
+            <dd>单个技能解析失败会被 catch 后跳过，不阻断整批<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/WorkspaceSkillRepository.java:172-184">:172-184</span>。常见原因：缺 <code>description</code>、正文为空、文件放在了 <code>_drafts/</code> 或 <code>.archive/</code> 下被元数据过滤掉。</dd>
+            <dt>改成</dt>
+            <dd>先确认 front matter 三个字段齐全，再用 <code>Files.walk</code> 自查目录里是否存在<strong>两级以内</strong>的 <code>SKILL.md</code>；最后看日志。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 开了 curator，但它从来没跑过</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>.curator_state.json</code> 里只有 <code>last_run_at</code> 和一个 <code>deferred first run</code> 的摘要，<code>.curator_reports/</code> 一直是空的。</dd>
+            <dt>因为</dt>
+            <dd>首次运行只 seed 不执行；之后还要等满足 <code>intervalHours</code> 并拿到 <code>PeriodicGate</code> 的 claim<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/SkillCurator.java:159-185">:159-185</span>。另外 curator 嵌在 <code>enableSkillManageTool</code> 分支里，没开工具就根本没建<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2783-2857">:2783-2857</span>。</dd>
+            <dt>改成</dt>
+            <dd>验证阶段直接 <code>agent.runCuratorOnce().block()</code>；上线后再依赖自动节流。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. promoteSkill 永远返回 deferred</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>结果里 <code>deferred</code>，理由固定是 “RejectAllGate: promotion requires explicit HarnessAgent.promoteSkill”。</dd>
+            <dt>因为</dt>
+            <dd>没配 <code>enableSkillPromotionGate</code>，<code>build()</code> 用了 <code>new RejectAllGate()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2831-2841">:2831-2841</span>。注意：<strong>调 <code>promoteSkill</code> 本身也要过这道闸门</strong>，它不是「绕过闸门」，只是「绕过自动询问」。</dd>
+            <dt>改成</dt>
+            <dd>要么给一个真的会 <code>Approve</code> 的 gate，要么自己实现 <code>SkillPromotionGate</code> 直接返回 <code>Approve(reviewerId, List.of("prod"), Instant.now())</code>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 用技能名调 <code>load_skill_through_path</code>，一直 not found</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>Resource not found</code> 或 <code>Unknown skillId</code>，但技能明明就在 <code>skills/code-reviewer/</code>。</dd>
+            <dt>因为</dt>
+            <dd>catalog 的键是 <code>skillId</code>，格式 <code>&lt;name&gt;_&lt;source&gt;</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/skill/AgentSkill.java:263-269">AgentSkill.java:263-269</span>。工作区来的通常是 <code>code-reviewer_workspace-namespaced</code>。</dd>
+            <dt>改成</dt>
+            <dd>让模型自己从 prompt 里的 <code>&lt;skill-id&gt;</code> 复制；手写调用时先 <code>SkillCatalog.ids()</code> 看一眼。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. 以为 curator 会删掉没用的技能</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>skills/</code> 下目录不见了，但 <code>skills/.archive/</code> 里多了一份带时间戳的副本。</dd>
+            <dt>因为</dt>
+            <dd>删除走的是 <code>filesystem.move</code>，不是递归删除<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/WorkspaceSkillRepository.java:272-308">:272-308</span>。要真删，得自己清 <code>.archive/</code>。</dd>
+            <dt>改成</dt>
+            <dd>把 <code>.archive/</code> 纳入备份/清理流程；不要期待框架帮你回收磁盘。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">6. <code>patch</code> 总是匹配不上</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>报错说 <code>old_string</code> 不唯一或找不到，即使那段文字确实在 SKILL.md 里。</dd>
+            <dt>因为</dt>
+            <dd><code>load_skill_through_path</code> 返回的是<strong>含 front matter 的完整文档</strong>，模型复述 <code>old_string</code> 时可能少写了 <code>---</code> 或空行；<code>patch</code> 是在磁盘原文上做精确替换。</dd>
+            <dt>改成</dt>
+            <dd>让模型先 <code>path="SKILL.md"</code> 读一次、直接从返回内容里复制要替换的片段；大批修改用 <code>edit</code> 整篇重写更稳。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">7. 改了 <code>skills/&lt;name&gt;/SKILL.md</code>，下一轮还是旧内容</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>磁盘上是新文本，prompt 里的 description 还是旧的，加载出来的正文也是旧的。</dd>
+            <dt>因为</dt>
+            <dd>只有关掉动态合并（<code>disableDynamicSkills()</code>）才会冻结快照；默认是每轮重新读，所以更可能的原因是改了<strong>另一个仓库</strong>的同名技能（被更高优先级覆盖）或改的是一份被市场版本顶掉的副本。</dd>
+            <dt>改成</dt>
+            <dd>打印 catalog 里胜出条目的 <code>source</code>，确认到底是哪一层在生效；再对照四层优先级表。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>Git 市场、工作区共用目录、用户目录各有一个 <code>code-reviewer</code>，模型最终看到几个？</summary>
+          <p>
+            一个。<code>mergeRepositories</code> 按 compose 顺序写同一个 <code>LinkedHashMap</code>，键是技能名，后面的覆盖前面的<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/HarnessSkillMiddleware.java:344-376">:344-376</span>。compose 顺序是项目全局 → 市场 → 工作区共用 → 用户目录，所以用户目录那份胜出；另外两份不会出现在 <code>&lt;available_skills&gt;</code> 里。注意「看到几个」和「磁盘上有几个」是两件事。
+          </p>
+        </details>
+        <details>
+          <summary>为什么 <code>skill_manage(create)</code> 写的草稿，<code>load_skill_through_path</code> 加载不到？</summary>
+          <p>
+            因为草稿落在 <code>skills/_drafts/&lt;name&gt;/</code>，而枚举时 <code>hasMetadataAncestor</code> 会跳过 <code>skills</code> 下第一段以 <code>_</code> 或 <code>.</code> 开头的路径<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/WorkspaceSkillRepository.java:501-559">:501-559</span>；同时 <code>draftsRepo</code> 不是第 4 层那个 <code>workspace-namespaced</code> 视图，四个合成仓库里没有任何一个扫 <code>_drafts</code>。所以草稿既不进 prompt，也不进 catalog——这是设计，不是权限问题。
+          </p>
+        </details>
+        <details>
+          <summary>默认闸门叫 <code>RejectAllGate</code>，为什么说它其实什么都不拒绝？</summary>
+          <p>
+            因为它返回的是 <code>PromotionDecision.Defer</code>，不是 <code>Reject</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/curator/RejectAllGate.java:23-46">:23-46</span>。<code>Defer</code> 只表示「这次不批」，草稿保留、随时可以再 promote；<code>Reject</code> 才带「这份不行的理由」。它的真实用途是：没有审核系统时，把「自动晋升」关掉，逼业务层显式调 <code>promoteSkill</code>。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">看见 skillId 与 files-root</span>
+            <div>
+              建一个 <code>skills/hello/SKILL.md</code>（带 <code>name</code>/<code>description</code>/正文），用 <code>LocalFilesystemSpec</code> + 默认 shell 起一个 agent，开 DEBUG 日志，问它「有哪些技能」。从日志里抄下 <code>&lt;skill-id&gt;</code> 和 <code>&lt;files-root&gt;</code>，确认后缀是 <code>workspace-namespaced</code>，路径是宿主绝对路径。
+            </div>
+          </li>
+          <li>
+            <span class="sh">验证四层覆盖</span>
+            <div>
+              在 <code>workspace/skills/hello/</code> 与 <code>workspace/alice/skills/hello/</code> 各放一份 description 不同的同名技能，用 <code>userId=alice</code> 调一次，确认 prompt 里只有一份、且是 alice 那份。再把 alice 那份删掉，确认回落到共用版。
+            </div>
+          </li>
+          <li>
+            <span class="sh">走一遍「草稿 → 晋升 → 可见」</span>
+            <div>
+              <code>.enableSkillManageTool(SkillManageConfig.defaults())</code>，让模型调 <code>skill_manage(action="create", ...)</code>，确认文件落在 <code>skills/_drafts/</code> 且下一轮 prompt 里<strong>没有</strong>它。然后手动 <code>agent.promoteSkill(name, "me", ctx).block()</code>，观察返回值是 <code>deferred</code>（默认闸门），目录仍在草稿区；再加上一个直接返回 <code>Approve</code> 的自定义 gate 重试，确认目录被 move 到 <code>skills/&lt;name&gt;/</code>、下一轮出现。
+            </div>
+          </li>
+          <li>
+            <span class="sh">看 curator 真的只归档</span>
+            <div>
+              把 <code>.usage.json</code> 里某个 agent 技能的 <code>created_at</code> 改到 100 天前，调 <code>runCuratorOnce()</code>，确认返回值 <code>archived=1</code>、目录出现在 <code>skills/.archive/</code>、状态变成 <code>archived</code>。再检查 <code>skills/.curator_reports/&lt;ts&gt;/REPORT.md</code>，确认里面只有前缀聚类和空的 <code>consolidations: []</code>——没有 LLM 结论。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">完成这一章之后</h2>
+        <p>
+          到这里，「能力怎么被组织、怎么被治理」就闭环了：技能负责程序性知识，工具负责原子动作，三件治理设施（闸门、计数、curator）负责不让这套东西失控。下一章回到「一次任务怎么被约束」：计划模式的只读边界、<code>tools.json</code> 的加载与过滤，以及 Harness 侧的 MCP 注册。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="17-plan-mode-tools.html">17 计划模式、工具装配与 MCP</a></td><td>技能靠工具落地；<code>tools.json</code> 能 deny 掉 `load_skill_through_path`，两章要连着看</td></tr>
+              <tr><td><a href="15-compaction-memory.html">15 压缩、记忆与逐出</a></td><td>技能清单是另一种「按需注入」，和 MEMORY.md 的预算注入正好对照</td></tr>
+              <tr><td><a href="12-workspace-filesystem.html">12 工作区与文件系统</a></td><td><code>skills/</code> 的命名空间与 <code>AbstractFilesystem</code> 路由</td></tr>
+              <tr><td><a href="09-middleware-hook.html">9 中间件与 Hook</a></td><td><code>onSystemPrompt</code> 的管道语义与 <code>onActing</code> 的时机</td></tr>
+              <tr><td><a href="../appendix/api-cheatsheet.html#h-skill">附录 C：Harness ⑤技能治理</a></td><td>这一章所有 builder 方法的一页清单</td></tr>
+              <tr><td>官方 <code>docs/v2/zh/docs/harness/skill.md</code></td><td>四层来源与文件系统部分可直接参考；闸门、计数、伞合并的结论以本章为准</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">一句话记住这一章</span>
+          <p>
+            技能的身份是 <code>name_source</code>、可见性靠 catalog 而不是提示词、草稿因为 <code>_</code> 前缀在枚举阶段就被丢掉、默认闸门只是 <code>Defer</code>、curator 只会 <code>move</code> 到 <code>.archive/</code>——把五句话对上 <code>AgentSkill:267</code>、<code>SkillRuntime:125</code>、<code>WorkspaceSkillRepository:515</code>、<code>RejectAllGate:42</code>、<code>SkillCurator:224</code>，剩下的细节都能推。
+          </p>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

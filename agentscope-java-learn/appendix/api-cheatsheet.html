@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="ReActAgent.Builder 有 43 个 public Builder xxx(...)，HarnessAgent.Builder 有 97 个。这份表把两边合起来按能力分组：共有的 28 个名字先看一次，剩下的再分成「core 独有」和「Harness 专有的七组」。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="附录 C API 速查：Builder 方法按能力分组 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="ReActAgent.Builder 有 43 个 public Builder xxx(...)，HarnessAgent.Builder 有 97 个。这份表把两边合起来按能力分组：共有的 28 个名字先看一次，剩下的再分成「core 独有」和「Harness 专有的七组」。" />
+    <title>附录 C API 速查：Builder 方法按能力分组 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="api-cheatsheet" data-root="..">
+    <main>
+      <article class="article">
+        <h1>附录 C · API 速查：Builder 方法按能力分组</h1>
+        <p class="lede">
+          <code>ReActAgent.Builder</code> 有 <strong>43</strong> 个 <code>public Builder xxx(...)</code>，
+          <code>HarnessAgent.Builder</code> 有 <strong>97</strong> 个。这份表把两边合起来按能力分组：
+          共有的 28 个名字先看一次，剩下的再分成「core 独有」和「Harness 专有的七组」。
+          每个方法一句话，标了默认值和容易踩的点，不重复章节里的讲解。
+        </p>
+
+        <h2 id="how">怎么用这一页</h2>
+        <ul class="goals">
+          <li><strong>先看共有组</strong>：28 个名字覆盖了 90% 的日常配置，学会这些就能写出第 11 章那种工程</li>
+          <li>所有方法都返回 <code>this</code>，可以链式调用；<strong>校验大多发生在 <code>build()</code> 或首次调用</strong>，不是设置的那一刻</li>
+          <li>表里的「默认」只写框架自己的默认值；你写了就以你为准</li>
+          <li>两个数字可以自己数：在类文件里搜 <code>public Builder</code>。数出来 <code>ReActAgent</code> 43、<code>HarnessAgent</code> 97（含重载）</li>
+        </ul>
+        <div class="callout tip">
+          <span class="ct">一个数字对不上的地方：43 + 66 ≠ 97 的直觉</span>
+          <p>
+            因为重载算了多次。按「名字」去重后：<strong>共有 28 个名字</strong>（31 个方法签名），
+            <strong>core 独有 12 个</strong>，<strong>Harness 独有 58 个</strong>。28 + 58 = 86 个名字，
+            再加上 <code>model</code>、<code>fallbackModel</code>、<code>workspace</code>、<code>filesystem</code> 等重载，正好凑成 97。
+          </p>
+        </div>
+        <p class="src-line">
+          core 的 builder：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4888">ReActAgent.java:4888</span>；Harness 的 builder：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1506">HarnessAgent.java:1506</span>
+        </p>
+
+        <h2 id="shared">两边都有：28 个名字（31 个签名）</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>作用</th><th>默认 / 注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>name(String)</code></td><td>agent 的名字，出现在事件、日志、Harness 的状态目录里</td><td>不设会得到类名派生的默认值</td></tr>
+              <tr><td><code>description(String)</code></td><td>给「别人」看的描述：当这个 agent 被包成工具或子 agent 时用得上</td><td>随便写也能跑，但多 agent 场景会误导对方</td></tr>
+              <tr><td><code>sysPrompt(String)</code></td><td>系统提示词；Harness 里还会拼上工作区上下文</td><td>支持文本块；<code>null</code> 等于不设</td></tr>
+              <tr><td><code>checkRunning(boolean)</code></td><td>历史开关，2.0.4 里只被保存和转发</td><td><strong>不再做并发门禁</strong>；同 session 并发是排队，见第 10 章</td></tr>
+              <tr><td><code>model(String)</code> / <code>model(Model)</code></td><td>模型 id 或实例</td><td>id 走 <code>ModelRegistry</code> 解析；不设则 <code>build()</code> 失败</td></tr>
+              <tr><td><code>toolkit(Toolkit)</code></td><td>工具集</td><td>Harness 会在你这份之上再挂内置工具</td></tr>
+              <tr><td><code>maxIters(int)</code></td><td>一轮对话最多几次「推理 → 行动」</td><td>默认 10；触顶不是异常，是多调一次模型写摘要</td></tr>
+              <tr><td><code>generateOptions(GenerateOptions)</code></td><td>温度、topP、maxTokens、responseFormat</td><td>模型 id 本身不带参数，参数全在这里</td></tr>
+              <tr><td><code>modelExecutionConfig(ExecutionConfig)</code></td><td>模型调用的超时与重试</td><td>默认 5 分钟 / 3 次，退避 2s → 30s</td></tr>
+              <tr><td><code>toolExecutionConfig(ExecutionConfig)</code></td><td>工具执行的超时与重试</td><td>默认 5 分钟 / 1 次（工具重试有副作用风险）</td></tr>
+              <tr><td><code>toolExecutionContext(ToolExecutionContext)</code></td><td>把自定义 POJO 按类型注入工具方法</td><td><strong>已废弃</strong>，改用 <code>RuntimeContext</code> 携带</td></tr>
+              <tr><td><code>hook(Hook)</code> / <code>hooks(List&lt;Hook&gt;)</code></td><td>注册切点回调</td><td>按优先级排序后执行；可叠加</td></tr>
+              <tr><td><code>middleware(MiddlewareBase)</code> / <code>middlewares(...)</code></td><td>注册中间件，包住模型调用 / 推理 / 行动</td><td>顺序敏感：后面的看不到前面改之前的样子</td></tr>
+              <tr><td><code>enableMetaTool(boolean)</code></td><td>注册 <code>reset_equipped_tools</code>，让模型自己切换工具分组</td><td>默认关；工具很多时才值得开</td></tr>
+              <tr><td><code>enableTaskList()</code> / <code>enableTaskList(boolean)</code></td><td>打开内置任务清单工具，让模型自己拆 TODO</td><td>默认关；长任务效果好，短问答是噪音</td></tr>
+              <tr><td><code>enablePendingToolRecovery(boolean)</code></td><td>允许恢复「挂起的工具调用」</td><td>用外部工具时几乎必须开</td></tr>
+              <tr><td><code>stateStore(AgentStateStore)</code></td><td>状态存储</td><td>core 不设=只在内存；Harness 不设=默认文件存储</td></tr>
+              <tr><td><code>defaultSessionId(String)</code></td><td>没给 <code>RuntimeContext</code> 时用的会话 id</td><td>两侧都没给，存储会抛 <code>sessionId must not be blank</code></td></tr>
+              <tr><td><code>maxRetries(int)</code></td><td>模型调用重试次数</td><td>默认取 <code>ModelConfig.DEFAULT_MAX_RETRIES</code>；必须 &gt; 0</td></tr>
+              <tr><td><code>fallbackModel(Model)</code> / <code>fallbackModel(String)</code></td><td>主模型失败时切换</td><td>两套 key 都要在；只对「可重试」错误生效</td></tr>
+              <tr><td><code>failoverListener(FailoverListener)</code></td><td>监听「切到备用模型」这件事</td><td>打日志、告警用</td></tr>
+              <tr><td><code>stopOnReject(boolean)</code></td><td>这一轮工具全被拒时是否直接停</td><td>默认 <code>ReactConfig.DEFAULT_STOP_ON_REJECT</code></td></tr>
+              <tr><td><code>permissionContext(PermissionContextState)</code></td><td>权限模式 + 规则表</td><td>不设=<code>@Tool</code> 默认 <code>PASSTHROUGH</code>，危险工具会直接跑</td></tr>
+              <tr><td><code>skillRepository(AgentSkillRepository)</code> / <code>skillRepositories(...)</code></td><td>技能仓库</td><td>core 也能用技能，只是没有 Harness 那套默认目录</td></tr>
+              <tr><td><code>skillFilter(SkillFilter)</code></td><td>过滤可见技能</td><td>按名字/标签筛，减少提示词体积</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="react">只有 <code>ReActAgent</code> 有：12 个</h2>
+        <p>
+          这 12 个都在解决两件事：<strong>长期记忆 / RAG</strong> 和 <strong>会话状态冲突</strong>。Harness 走了另一套（<code>memory(...)</code> 与分布式存储），所以没有转发这些。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>作用</th><th>默认 / 注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>conflictPolicy(ConflictPolicy)</code></td><td>多副本写同一会话时的策略</td><td><code>OVERWRITE</code> / <code>FAIL</code> / <code>APPEND_MERGE</code></td></tr>
+              <tr><td><code>longTermMemory(LongTermMemory)</code></td><td>接入长期记忆实现</td><td>不接就只有上下文里的短期记忆</td></tr>
+              <tr><td><code>longTermMemoryMode(LongTermMemoryMode)</code></td><td>谁来决定存取</td><td><code>AGENT_CONTROL</code> / <code>STATIC_CONTROL</code> / <code>BOTH</code></td></tr>
+              <tr><td><code>longTermMemoryAsyncRecord(boolean)</code></td><td>写入长期记忆是否异步</td><td>异步快，但失败不会阻塞主流程，也不好发现</td></tr>
+              <tr><td><code>knowledge(Knowledge)</code> / <code>knowledges(List)</code></td><td>挂知识库（RAG）</td><td>会配合检索工具/hook 使用</td></tr>
+              <tr><td><code>ragMode(RAGMode)</code></td><td>检索模式：每次自动检索 / 交给模型决定</td><td>自动检索稳，但每轮都花 token</td></tr>
+              <tr><td><code>retrieveConfig(RetrieveConfig)</code></td><td>召回条数与分数阈值</td><td>阈值必须 0.0–1.0，条数必须为正</td></tr>
+              <tr><td><code>skillBox(SkillBox)</code></td><td>更细的技能容器（按需加载/执行）</td><td>比 <code>skillRepository</code> 更重，先不用</td></tr>
+              <tr><td><code>dynamicSkillsEnabled(boolean)</code></td><td>允许运行时动态加载技能</td><td>默认关</td></tr>
+              <tr><td><code>skillCodeExecutionEnabled(boolean)</code></td><td>允许技能里执行代码</td><td>默认关；开了就要认真配权限</td></tr>
+              <tr><td><code>skillWorkDir(Path)</code></td><td>技能的工作目录</td><td>相对路径按进程 cwd 解析，建议绝对路径</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="h-identity">Harness 独有 ①：身份、工作区与可观测</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>作用</th><th>默认 / 注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>agentId(String)</code></td><td>Harness 的身份 id：文件系统命名空间与默认状态目录都用它</td><td>不设则退回 <code>name</code>；默认状态在 <code>~/.agentscope/state/&lt;agentId&gt;/</code></td></tr>
+              <tr><td><code>workspace(Path)</code> / <code>workspace(String)</code></td><td>文件与 Shell 工具的根目录</td><td>空白字符串直接抛异常；相对路径按 cwd 解析</td></tr>
+              <tr><td><code>environmentMemory(String)</code></td><td>注入「环境记忆」文本：项目背景、约定</td><td>会进提示词，别塞太长</td></tr>
+              <tr><td><code>additionalContextFile(String)</code></td><td>额外读取一个上下文文件（相对工作区）</td><td>适合 <code>AGENTS.md</code> 这类约定文件</td></tr>
+              <tr><td><code>maxContextTokens(int)</code></td><td>工作区上下文（AGENTS.md、环境记忆等）注入时的 token 上限</td><td>默认 <code>8000</code>；<strong>不是</strong>压缩开关，压缩看的是模型上下文窗口</td></tr>
+              <tr><td><code>useLegacyXmlWorkspaceContext(boolean)</code></td><td>用旧版 XML 形式拼工作区上下文</td><td>兼容老提示词，新项目别开</td></tr>
+              <tr><td><code>environment(String)</code></td><td>环境标签</td><td>默认 <code>"prod"</code>；技能/权限可能按它分支</td></tr>
+              <tr><td><code>artifactDeliveryTarget(ArtifactDeliveryTarget)</code></td><td>注册 <code>deliver_artifact</code> 工具，把产物送出沙箱 / 工作区</td><td>不设就不注册；只给主 agent，<code>disableFilesystemTools</code> 时也不注册</td></tr>
+              <tr><td><code>enableAgentTracingLog(boolean)</code></td><td>开关 <code>AgentTraceMiddleware</code>（agent 级链路日志）</td><td><strong>默认开</strong>；嫌日志吵才关</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="h-fs">Harness 独有 ②：文件系统与沙箱</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>作用</th><th>默认 / 注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>abstractFilesystem(AbstractFilesystem)</code></td><td>直接给一个文件系统实现</td><td>最灵活，也最需要自己保证线程安全</td></tr>
+              <tr><td><code>filesystem(LocalFilesystemSpec)</code></td><td>本地目录文件系统</td><td>最常用；根目录就是 workspace</td></tr>
+              <tr><td><code>filesystem(SandboxFilesystemSpec)</code></td><td>沙箱文件系统</td><td>不能逃逸到宿主目录</td></tr>
+              <tr><td><code>filesystem(RemoteFilesystemSpec)</code></td><td>远程文件系统</td><td>网络 IO，延迟要算进工具超时</td></tr>
+              <tr><td><code>filesystemRoute(String, AbstractFilesystem)</code></td><td>按路径前缀分流到不同文件系统</td><td>例如 <code>/shared</code> 走远程、其余走本地</td></tr>
+              <tr><td><code>disableFilesystemTools()</code></td><td>不挂内置文件工具</td><td>只读场景常用</td></tr>
+              <tr><td><code>disableShellTool()</code></td><td>不挂 Shell 工具</td><td>生产环境默认建议关</td></tr>
+              <tr><td><code>disableWebTools()</code></td><td>不挂联网工具</td><td>内网/离线部署</td></tr>
+              <tr><td><code>webHttpClient(HttpClient)</code></td><td>自定义联网工具用的 HTTP 客户端</td><td>需要代理/证书时用</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="h-context">Harness 独有 ③：上下文、压缩与记忆</h2>
+        <p>
+          这一组是 Harness 和 core 差距最大的地方。core 只给你一个 <code>maxIters</code>；Harness 把
+          「上下文总会满」当常态，默认就装了压缩、工具结果驱逐、长期记忆三条管线，还各留了一个
+          <code>disableXxx()</code>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>作用</th><th>默认 / 注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>compaction(CompactionConfig)</code></td><td>覆盖上下文压缩（分段摘要）配置</td><td><strong>默认开启</strong>，按模型上下文窗口动态触发；传 <code>null</code> 等于关</td></tr>
+              <tr><td><code>disableCompaction()</code></td><td>彻底关掉 <code>CompactionMiddleware</code></td><td>长会话慎用：省了摘要调用，但会直接撞模型上限</td></tr>
+              <tr><td><code>memory(MemoryConfig)</code></td><td>长期记忆管线：flush + 后台 consolidation + 维护</td><td>不设用 <code>MemoryConfig.defaults()</code>；和压缩是两件事</td></tr>
+              <tr><td><code>toolResultEviction(ToolResultEvictionConfig)</code></td><td>超长工具结果挪出上下文、只留占位和指针</td><td>默认开，约 8 万字符触发</td></tr>
+              <tr><td><code>disableToolResultEviction()</code></td><td>关掉工具结果驱逐</td><td>关了以后全靠压缩兜底，一次大输出就可能顶满</td></tr>
+              <tr><td><code>disableTranscript()</code></td><td>关掉独立的会话转录（transcript）中间件</td><td>javadoc 建议保留；它和 memory hooks 相互独立</td></tr>
+              <tr><td><code>transcriptStore(TranscriptStore)</code></td><td>自定义分段追加存储</td><td>不设时按文件系统选实现，本地默认落在工作区 <code>.agentscope/transcripts</code></td></tr>
+              <tr><td><code>transcriptTenant(String)</code></td><td>transcript 对象 key 里的租户段</td><td>默认 <code>"default"</code>；多租户共用一个存储桶时必改</td></tr>
+              <tr><td><code>disableSessionPersistence()</code></td><td>2.0 起是<strong>空操作</strong></td><td>会话持久化已由 <code>ReActAgent</code> 自己管；写它不会有任何效果</td></tr>
+              <tr><td><code>disableWorkspaceContext()</code></td><td>不注入工作区上下文（AGENTS.md 等）</td><td>关了就只剩你手写的 <code>sysPrompt</code></td></tr>
+              <tr><td><code>disableAtPathExpansion()</code></td><td>不展开消息里的 <code>@path</code> 引用</td><td>默认展开：按活动文件系统读文件，在消息末尾附 <code>&lt;attached_file&gt;</code></td></tr>
+              <tr><td><code>disableMemoryTools()</code></td><td>不注册 <code>memory_search</code> / <code>memory_get</code> / <code>memory_save</code> / <code>session_search</code></td><td>不想让模型自己翻记忆时关</td></tr>
+              <tr><td><code>disableMemoryHooks()</code></td><td>停掉记忆 flush 与后台 consolidation</td><td>再叠加 <code>disableMemoryTools()</code> 时，连 <code>MEMORY.md</code> 都不注入</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          压缩与记忆：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1867">HarnessAgent.java:1867</span>；几个 disable 开关：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2227">HarnessAgent.java:2227</span>
+        </p>
+
+        <h2 id="h-tools">Harness 独有 ④：工具面与外部接入</h2>
+        <p>
+          这一组的关键词是「接进来」和「派出去」：MCP、外部 schema、子 agent、消息总线、分布式存储。
+          注意 <code>messageBus</code> 一开，会顺带注册 <code>wait_async_results</code> 工具，工具面就变了。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>作用</th><th>默认 / 注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>toolsConfig(ToolsConfig)</code></td><td>用代码覆盖 <code>workspace/tools.json</code></td><td>不想让用户改文件时用</td></tr>
+              <tr><td><code>disableToolsConfig()</code></td><td>完全不读 <code>tools.json</code></td><td>配置只留在代码里，部署更可预期</td></tr>
+              <tr><td><code>registerExternalSchemas(List&lt;ToolSchema&gt;)</code></td><td>注册「只有 schema」的外部工具，调用时挂起等外部 worker 执行</td><td><code>self_hosted</code> 环境用；不执行也不报错，结果是挂起</td></tr>
+              <tr><td><code>mcpServerRegistrationListener(...)</code></td><td>监听构建期 MCP server 的注册结果（成功/失败）</td><td>不会传给动态创建的子 agent；传 <code>null</code> 关闭投递</td></tr>
+              <tr><td><code>subagent(SubagentDeclaration)</code> / <code>subagents(List)</code></td><td>声明子 agent（名字、描述、模型、工具范围）</td><td>声明式最稳；描述写不好，编排者就选错人</td></tr>
+              <tr><td><code>subagentFactory(name, factory)</code> / <code>(name, description, factory)</code></td><td>用工厂函数完全自定义子 agent</td><td>工厂收到的是子 agent 自己的名字（不是任务文本）；description 为空则退回 name</td></tr>
+              <tr><td><code>disableSubagents()</code></td><td>不装子 agent 中间件</td><td>连预声明的也不可用；叶子 agent 常用</td></tr>
+              <tr><td><code>disableDynamicSubagents()</code></td><td>禁止运行时动态创建，只保留预声明</td><td>想控住「模型自己拉人」就开</td></tr>
+              <tr><td><code>externalSubagentTool(Object)</code></td><td>注入外部子 agent 工具（典型是 <code>SessionsTool</code>）</td><td>给「子 agent 不在本进程」的场景</td></tr>
+              <tr><td><code>asyncToolTimeout(Duration)</code></td><td>超时工具转后台执行，结果从收件箱回来</td><td><strong>必须先设 <code>messageBus</code></strong>，否则不生效</td></tr>
+              <tr><td><code>asyncToolRegistry(AsyncToolRegistry)</code></td><td>跟踪异步工具执行，检测并清理僵死任务</td><td>不设就跳过生命周期跟踪</td></tr>
+              <tr><td><code>messageBus(MessageBus)</code></td><td>注册 <code>InboxMiddleware</code>：每次推理前收件箱</td><td>同时注册 <code>wait_async_results</code>；跨进程投递的基础</td></tr>
+              <tr><td><code>taskRepository(TaskRepository)</code></td><td>后台子 agent 的任务仓库</td><td>要把「跑了多久、结果在哪」查出来就设它</td></tr>
+              <tr><td><code>modelResolver(Function&lt;String, Model&gt;)</code></td><td>把子 agent 写的模型名解析成实例</td><td>子 agent 用字符串模型名时必须有</td></tr>
+              <tr><td><code>distributedStore(DistributedStore)</code></td><td>一次给齐状态存储、Base Store、沙箱快照、执行守卫</td><td>显式的 <code>stateStore()</code> / <code>filesystem()</code> 优先于它</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          子 agent 与消息总线：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1933">HarnessAgent.java:1933</span>；<code>distributedStore</code> 的优先级说明：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1649">HarnessAgent.java:1649</span>
+        </p>
+
+        <h2 id="h-skill">Harness 独有 ⑤：技能治理</h2>
+        <p>
+          技能有「四层来源」：市场仓库、工作区目录、项目级目录、默认工作区仓库。这几个方法决定哪几层生效、
+          谁能改、改完怎么晋升。<strong>只记住一个顺序</strong>：<code>skillsEnabled</code> 负责总闸，
+          <code>enableSkills</code> / <code>disableSkills</code> 是在总闸之上换一个过滤器。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>作用</th><th>默认 / 注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>projectGlobalSkillsDir(Path)</code></td><td>项目级技能目录，优先级最低</td><td>和 <code>skillRepository</code> 叠加，不替换</td></tr>
+              <tr><td><code>disableDynamicSkills()</code></td><td>禁止每次调用从工作区动态加载技能</td><td>技能改了要重启才生效，换来的是稳定</td></tr>
+              <tr><td><code>disableDefaultWorkspaceSkills()</code></td><td>跳过默认的 Layer-4 工作区仓库</td><td>只少这一层；自定义仓库和 Layer-3 目录仍在</td></tr>
+              <tr><td><code>enableSkillManageTool(SkillManageConfig)</code> / <code>(boolean autoPromote)</code></td><td>给 agent <code>skill_manage</code> 工具，可建/改/归档自己的技能</td><td>会把工作区仓库升级成可写变体；参数是「是否自动晋升」</td></tr>
+              <tr><td><code>enableSkillPromotionGate(gate, visibilityFilter)</code></td><td>技能晋升门禁 + 可见性过滤链</td><td>团队共用技能库时的治理点</td></tr>
+              <tr><td><code>enableSkillCurator(SkillCuratorConfig)</code></td><td>后台技能整理（去重、合并、淘汰）</td><td><strong>依赖 <code>enableSkillManageTool</code></strong></td></tr>
+              <tr><td><code>skillsEnabled(boolean)</code></td><td>总闸：等价 <code>SkillFilter.all()</code> / <code>none()</code></td><td>它写的是同一个 <code>skillFilter</code> 字段</td></tr>
+              <tr><td><code>enableSkills(String...)</code></td><td>只留指定名字的技能</td><td>等价 <code>SkillFilter.only(...)</code>；后调用的会覆盖前面的 filter</td></tr>
+              <tr><td><code>disableSkills(String...)</code></td><td>排除指定名字的技能</td><td>等价 <code>SkillFilter.except(...)</code>；同样会覆盖</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          技能仓库与目录：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1742">HarnessAgent.java:1742</span>；技能开关：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2104">HarnessAgent.java:2104</span>
+        </p>
+
+        <h2 id="h-plan">Harness 独有 ⑥：计划模式与团队</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>作用</th><th>默认 / 注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>enablePlanMode()</code> / <code>enablePlanMode(boolean)</code></td><td>只读设计阶段：<code>plan_enter</code> / <code>plan_write</code> / <code>plan_exit</code> + 只读强制</td><td>默认关；开了以后写文件类工具会被拦</td></tr>
+              <tr><td><code>planFileDirectory(String)</code></td><td>计划文件放在哪</td><td>空白字符串直接忽略</td></tr>
+              <tr><td><code>allowShellInPlanMode()</code> / <code>(boolean)</code></td><td>计划模式下允许 shell</td><td>默认<strong>禁止</strong>（shell 是双用途，按名字判不出只读）；开了也要求只读用法</td></tr>
+              <tr><td><code>teamsMode(TeamClient, TeamContext)</code> / <code>(..., String sessionId)</code></td><td>挂 <code>TeamsMiddleware</code> 和按角色裁剪的 <code>team</code> 工具</td><td>三参版把控制面 TeamEvents 绑到指定 session，否则收不到</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          计划模式：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2161">HarnessAgent.java:2161</span>；团队模式：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1304">HarnessAgent.java:1304</span>
+        </p>
+
+        <h2 id="h-gateway">Harness 独有 ⑦：网关、渠道与异步</h2>
+        <p>
+          这一组不是「多一个功能」，而是「把 agent 装成服务」：前四个决定消息怎么进来、结果怎么回来，最后一个
+          （<code>channel</code>）是实例方法，不在 builder 上。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>作用</th><th>默认 / 注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>messageBus(MessageBus)</code></td><td>跨轮次投递底座：注册 <code>InboxMiddleware</code>（每个 reasoning step 开头排水）、注册 <code>wait_async_results</code> 工具，并给 teams / 子 agent 接线</td><td>不写也会自动造 <code>WorkspaceMessageBus(filesystem, ".agentscope/bus")</code>，因为 filesystem 默认非 null → inbox 实际总开着</td></tr>
+              <tr><td><code>asyncToolTimeout(Duration)</code></td><td>开启异步工具：工具超过时限先回占位结果，后台跑完再回灌</td><td>默认<strong>关</strong>；必须同时有 messageBus，否则整块不装</td></tr>
+              <tr><td><code>asyncToolRegistry(AsyncToolRegistry)</code></td><td>异步任务登记表，供 <code>InboxMiddleware</code> 做 stale 检测</td><td>不写会自动造 <code>WorkspaceAsyncToolRegistry(..., ".agentscope/bus/async-tools")</code>（与注释说的「跳过追踪」不一致）</td></tr>
+              <tr><td><code>agent.channel(T)</code><span class="no-key">实例方法</span></td><td>懒建一个内部 <code>HarnessGateway</code> 并把 channel 接上去</td><td>这个网关<strong>没有</strong> <code>ChannelManager</code> / <code>MessageBus</code>：能路由、能串行，不能主动投递、不能事件回放</td></tr>
+              <tr><td><code>GatewayBootstrap.builder()…build()</code></td><td>多 agent + 外部渠道的统一装配：注册 agent、建 <code>ChannelManager</code>、装分布式子 agent registry</td><td><code>build()</code> 不启动渠道、不建 bus；要自己 <code>start()</code>，并自己 new <code>WakeupDispatcher</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          三个 builder 方法：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1967-1996">HarnessAgent.java:1967-1996</span>；workspace 默认 bus / registry：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2504-2516">HarnessAgent.java:2504-2516</span>；<code>channel(T)</code>：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:646-650">HarnessAgent.java:646-650</span>；<code>build()</code> 里的装配：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/GatewayBootstrap.java:264-329">GatewayBootstrap.java:264-329</span>
+        </p>
+
+        <h2 id="recipes">五份配方：直接抄的完整 builder</h2>
+        <p>
+          五段都只省了 <code>main</code> 方法和少量 import，其余可以直接粘。原则是<strong>按场景挑一份，别叠加</strong>：
+          每多一个中间件，出问题时你就多一层要排查的东西。
+        </p>
+
+        <h3 id="snippet-minimal">1. 最小可跑（core，不到 12 行）</h3>
+        <pre data-lang="java" data-file="MinimalCore.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.UserMessage;
+
+ReActAgent agent = ReActAgent.builder()
+        .name("assistant")
+        .sysPrompt("你是一个简洁的中文助手。")
+        .model("dashscope:qwen-plus")
+        .build();
+
+RuntimeContext ctx = RuntimeContext.builder().userId("alice").sessionId("s-1").build();
+Msg reply = agent.call(new UserMessage("用一句话解释什么是 Agent"), ctx).block();
+System.out.println(reply.getTextContent());</pre>
+
+        <h3 id="snippet-production">2. 生产级 core：持久化 + 超时 + 权限</h3>
+        <pre data-lang="java" data-file="ProductionCore.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.model.ExecutionConfig;
+import io.agentscope.core.permission.PermissionContextState;
+import io.agentscope.core.permission.PermissionMode;
+import io.agentscope.core.state.AgentStateStore;
+import io.agentscope.core.state.JsonFileAgentStateStore;
+
+import java.nio.file.Path;
+import java.time.Duration;
+
+AgentStateStore store = new JsonFileAgentStateStore(
+        Path.of(System.getProperty("user.home"), ".agentscope", "state", "ops"));
+
+ReActAgent agent = ReActAgent.builder()
+        .name("ops-assistant")
+        .model("dashscope:qwen-plus")
+        .fallbackModel("openai:gpt-5.5")
+        .maxRetries(2)                                  // 只算重试次数
+        .modelExecutionConfig(ExecutionConfig.builder()
+                .timeout(Duration.ofSeconds(60))
+                .build())
+        .toolExecutionConfig(ExecutionConfig.builder()
+                .timeout(Duration.ofSeconds(30))
+                .build())
+        .permissionContext(PermissionContextState.builder()
+                .mode(PermissionMode.DEFAULT)
+                .build())
+        .stateStore(store)
+        .build();</pre>
+        <div class="callout">
+          <span class="ct">两个重试旋钮别写混</span>
+          <p>
+            <code>maxRetries(2)</code> 是「重试 2 次」；<code>ExecutionConfig.maxAttempts(3)</code>
+            是「总共 3 次尝试」= 1 次首发 + 2 次重试。两者作用在不同层，别一个填 3 一个填 2 然后对不上日志。
+          </p>
+        </div>
+
+        <h3 id="snippet-harness">3. Harness 全功能骨架：工作区 + 压缩 + 子 agent</h3>
+        <pre data-lang="java" data-file="HarnessFull.java">import io.agentscope.harness.agent.HarnessAgent;
+import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
+
+import java.nio.file.Paths;
+
+HarnessAgent agent = HarnessAgent.builder()
+        .name("coding-agent")
+        .agentId("coding-agent")                       // 状态目录与文件系统命名空间
+        .model("dashscope:qwen-plus")
+        .workspace(Paths.get(".agentscope/workspace"))
+        .compaction(CompactionConfig.builder()
+                .triggerMessages(30)
+                .keepMessages(10)
+                .build())
+        .enableTaskList()                              // 长任务让它自己拆 TODO
+        .enablePlanMode()                              // 先出方案，再动手
+        .disableWebTools()                             // 内网/离线部署
+        .subagentFactory("reviewer", agentName -> HarnessAgent.builder()
+                .name(agentName)
+                .model("dashscope:qwen-plus")
+                .sysPrompt("你是代码审查员，只报告真正的问题。")
+                .build())
+        .build();</pre>
+        <p>
+          <code>subagentFactory</code> 的 lambda 参数是<strong>子 agent 自己的名字</strong>，不是任务文本：
+          框架在物化子 agent 时用这个名字调用工厂，任务则是之后通过 <code>call</code> 传进去的。返回值必须是
+          <code>Agent</code>；<code>HarnessAgent</code> 本身实现了 <code>Agent</code>，所以可以直接返回。
+        </p>
+
+        <h3 id="snippet-explore">4. 只读分析：EXPLORE 不是「先问一下」</h3>
+        <pre data-lang="java" data-file="ReadOnly.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.permission.PermissionContextState;
+import io.agentscope.core.permission.PermissionMode;
+
+ReActAgent agent = ReActAgent.builder()
+        .name("explorer")
+        .model("dashscope:qwen-plus")
+        // EXPLORE：只读工具放行，其余一律 DENY —— 不是挂起等人，是根本不执行
+        .permissionContext(PermissionContextState.builder()
+                .mode(PermissionMode.EXPLORE)
+                .build())
+        .build();</pre>
+        <p>
+          判断依据是工具的 <code>isReadOnly()</code>：内置工具已经标好，自己写的要加
+          <code>@Tool(readOnly = true)</code>。所以「我只想让 agent 看代码」用这一份，比事后过滤输出可靠。
+        </p>
+
+        <h3 id="snippet-unattended">5. 无人值守：不挂起、全拒就停</h3>
+        <pre data-lang="java" data-file="Unattended.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.permission.PermissionContextState;
+import io.agentscope.core.permission.PermissionMode;
+import io.agentscope.core.state.JsonFileAgentStateStore;
+
+import java.nio.file.Path;
+
+ReActAgent agent = ReActAgent.builder()
+        .name("nightly-job")
+        .model("dashscope:qwen-plus")
+        // DONT_ASK：本该 ASK 的降级成 DENY，永远不会挂起等人
+        .permissionContext(PermissionContextState.builder()
+                .mode(PermissionMode.DONT_ASK)
+                .build())
+        .stopOnReject(true)                            // 全被拒就结束，不再烧 token
+        .stateStore(new JsonFileAgentStateStore(
+                Path.of(System.getProperty("user.home"), ".agentscope", "state", "nightly")))
+        .build();</pre>
+        <p>
+          跑完记得 <code>agent.close()</code>：它实现了 <code>AutoCloseable</code>，会把在跑的请求收尾再退出。
+        </p>
+
+        <h2 id="noapi">五种「以为有、其实没有」的写法</h2>
+        <p>
+          这些写法在旧版本、别的框架或官方 Python 示例里都出现过，在 2.0.4 的 Java 里会对不上。编译器报
+          「找不到符号」时先来这里扫一眼。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>不存在的写法</th><th>为什么</th><th>改成</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>.modelOptions(...)</code></td><td>生成参数不在模型 id 上，也没有这个方法</td><td><code>.generateOptions(GenerateOptions.builder()...build())</code></td></tr>
+              <tr><td><code>toolUseBlock.withInput(...)</code></td><td>内容块是不可变的，没有 <code>withXxx</code></td><td><code>ToolUseBlock.builder().id(原 id).name(原名).input(新参数).build()</code>，<strong>id 必须保留</strong></td></tr>
+              <tr><td><code>new RedisAgentStateStore(pool)</code></td><td>没有这个构造器</td><td><code>RedisAgentStateStore.builder().jedisClient(unifiedJedis).build()</code>，也支持 Lettuce / Redisson 适配</td></tr>
+              <tr><td><code>agent.getAgentName()</code></td><td><code>Agent</code> 接口没有这个名字</td><td><code>ReActAgent#getName()</code>；别和 <code>EventSource#getAgentName()</code> 混</td></tr>
+              <tr><td><code>ExecutionConfig.builder().maxRetries(3)</code></td><td>方法叫 <code>maxAttempts</code>，且含首次尝试</td><td><code>.maxAttempts(3)</code> = 1 次首发 + 2 次重试</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="next">接着看什么</h2>
+        <ul class="goals">
+          <li>名字记得住、但想不起在哪一章讲过：查 <a href="glossary.html">附录 A 术语表</a></li>
+          <li>编译过了、跑起来却抛异常：查 <a href="errors.html">附录 B 报错速查</a>，31 条错误文本与源码逐字一致</li>
+          <li>想知道某个类到底在哪个包、哪一层：查 <a href="source-map.html">附录 D 源码地图</a></li>
+          <li>想把这页的 builder 串成一个能跑的工程：回到 <a href="../chapters/11-capstone.html">第 11 章综合案例</a></li>
+        </ul>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

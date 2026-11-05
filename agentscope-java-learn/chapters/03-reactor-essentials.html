@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Mono、Flux、.block()、.blockLast() 这四个东西，如果你不弄明白，后面每一章的示例都会「看起来能跑、但什么都不输出」。本章只讲框架真正用到的那部分，不铺全套 Reactor。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="03 响应式必修：只讲框架用到的那 20% · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="Mono、Flux、.block()、.blockLast() 这四个东西，如果你不弄明白，后面每一章的示例都会「看起来能跑、但什么都不输出」。本章只讲框架真正用到的那部分，不铺全套 Reactor。" />
+    <title>03 响应式必修：只讲框架用到的那 20% · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="03-reactor-essentials" data-root="..">
+    <main>
+      <article class="article">
+        <h1>03 · 响应式必修</h1>
+        <p class="lede">
+          <code>Mono</code>、<code>Flux</code>、<code>.block()</code>、<code>.blockLast()</code> 这四个东西，如果你不弄明白，
+          后面每一章的示例都会「看起来能跑、但什么都不输出」。本章只讲框架<strong>真正用到</strong>的那部分，不铺全套 Reactor。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>解释为什么 <code>agent.call(...)</code> 少写一个 <code>.block()</code> 就完全没有反应</li>
+          <li>用 <code>streamEvents(...).doOnNext(...).blockLast()</code> 写出一个边生成边打印的控制台程序</li>
+          <li>判断一段代码该用 <code>block</code>、<code>blockLast</code> 还是 <code>subscribe</code>，并说出在哪个线程里写 <code>block</code> 会卡死</li>
+        </ul>
+
+        <h2 id="why">先说为什么：Agent 调用是「流水线」，不是「函数」</h2>
+        <p>
+          普通函数调用像<strong>去窗口点餐</strong>：你递钱，然后站在那儿等，直到饭做好（返回值）。Agent 调用更像<strong>下单后
+          拿一张取餐凭证</strong>：对方立刻给你一张凭证（<code>Mono</code>），你去干别的；什么时候想看结果，再拿凭证去取
+          （<code>.block()</code>）。而流式输出更像<strong>看厨房直播</strong>：每个动作都变成一条推送（<code>Flux</code>），你爱看
+          多久看多久，也可以随时关掉。
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h4>如果 API 是同步阻塞的 <code>Msg call(...)</code></h4>
+            <ul>
+              <li>一次调用 30 秒，Web 服务的请求线程就被占 30 秒，并发 10 个就把线程池打满</li>
+              <li>用户想「算了别答了」时，你没有任何把手可以停下来</li>
+              <li>想边生成边显示？没法在函数返回前插进去</li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4>框架实际给的 <code>Mono&lt;Msg&gt;</code> / <code>Flux&lt;AgentEvent&gt;</code></h4>
+            <ul>
+              <li>返回的是描述，不是结果：<strong>不订阅就一行代码都不执行</strong></li>
+              <li>能取消、能超时、能与其他流组合（<code>timeout</code>、<code>zip</code>）</li>
+              <li>流式场景天然合适：每个 token 是一条 <code>onNext</code></li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          框架里两个最核心的返回值就是这个形态：<code>call(...)</code> 给 <code>Mono&lt;Msg&gt;</code><span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:849"
+            >ReActAgent.java:849</span
+          >，<code>streamEvents(...)</code> 给 <code>Flux&lt;AgentEvent&gt;</code><span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1133"
+            >ReActAgent.java:1133</span
+          >。官方文档一句话总结了两者关系：<code>call</code> 在内部消费所有事件，等智能体完成（或因外部交互暂停）后返回最终
+          <code>Msg</code><span class="src" data-src="docs/v2/zh/docs/building-blocks/agent.md:273">agent.md:273</span>。
+        </p>
+
+        <h2 id="minimal">最小可跑：边生成边打印</h2>
+        <p>
+          沿用第 01 章的两段依赖（<code>agentscope-core</code> + <code>agentscope-extensions-model-dashscope</code>，或直接
+          <code>agentscope-harness</code>），主程序如下。写法与官方示例
+          <code>BasicChatExample.java</code> 的流式段完全一致，只是把「从控制台读输入」换成了固定问题：
+        </p>
+        <pre data-lang="java" data-file="StreamOnce.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.event.TextBlockDeltaEvent;
+import io.agentscope.core.message.UserMessage;
+import io.agentscope.core.tool.Toolkit;
+
+public class StreamOnce {
+    public static void main(String[] args) {
+        ReActAgent agent = ReActAgent.builder()
+                .name("Assistant")
+                .sysPrompt("You are a helpful AI assistant. Be friendly and concise.")
+                .model("dashscope:qwen-plus")
+                .toolkit(new Toolkit())
+                .build();
+
+        agent.streamEvents(new UserMessage("用三句话解释什么是 ReAct。"))
+                .doOnNext(event -&gt; {
+                    if (event instanceof TextBlockDeltaEvent e) {
+                        System.out.print(e.getDelta());
+                    }
+                })
+                .blockLast();
+        System.out.println();
+    }
+}</pre>
+        <p class="src-line">
+          官方原版（带交互式输入循环）：<span
+            class="src"
+            data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/quickstart/BasicChatExample.java:86"
+            >BasicChatExample.java:86</span
+          >；<code>TextBlockDeltaEvent.getDelta()</code>：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/event/TextBlockDeltaEvent.java:59"
+            >TextBlockDeltaEvent.java:59</span
+          >
+        </p>
+        <div class="callout tip">
+          <span class="ct">同样的效果，用 <code>call</code> 只改三行</span>
+          <p>只要最终文本、不要过程时，把流式那段换掉即可：</p>
+          <pre data-lang="java" data-file="换成阻塞式">import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.Msg;
+import java.util.List;
+
+Msg answer = agent.call(List.of(new UserMessage("用三句话解释什么是 ReAct。")),
+        RuntimeContext.empty()).block();
+System.out.println(answer.getTextContent());</pre>
+        </div>
+
+        <h2 id="line-by-line">逐行解读：这 5 行是整个响应式的心脏</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>这一行</th>
+                <th>容易懵的点</th>
+                <th>实际上</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>agent.streamEvents(...)</code></td>
+                <td>我调了它，为什么控制台没动静？</td>
+                <td>
+                  它返回的是一个<strong>冷流</strong>：描述「将来会产生哪些事件」，本身不启动任何工作。真正启动发生在订阅那一刻。
+                </td>
+              </tr>
+              <tr>
+                <td><code>.doOnNext(event -&gt; ...)</code></td>
+                <td>这是不是「消费」事件？</td>
+                <td>
+                  不是。它只是<strong>旁路观察</strong>，事件仍会继续往下游走。所以你可以把多个 <code>doOnNext</code> 串起来各干各的，
+                  互不影响。
+                </td>
+              </tr>
+              <tr>
+                <td><code>event instanceof TextBlockDeltaEvent e</code></td>
+                <td>为什么不直接用 <code>getTextContent()</code>？</td>
+                <td>
+                  流式阶段还没有「完整消息」，只有增量片段。<code>TextBlockDeltaEvent</code> 携带的是这一小段文本<span
+                    class="src"
+                    data-src="agentscope-core/src/main/java/io/agentscope/core/event/TextBlockDeltaEvent.java:59"
+                    >TextBlockDeltaEvent.java:59</span
+                  >，要自己拼。这是 Java 17 的模式匹配写法，等价于 <code>if (event instanceof X) { X e = (X) event; ... }</code>。
+                </td>
+              </tr>
+              <tr>
+                <td><code>.blockLast()</code></td>
+                <td>为什么不是 <code>.block()</code>？</td>
+                <td>
+                  <code>block()</code> 是 <code>Mono</code> 的（取那唯一一个值）；<code>Flux</code> 有 0~N 个元素，要说清「等到最后一个
+                  元素到达为止」，就是 <code>blockLast()</code>。返回类型是最后一个元素，这里用不到所以直接丢弃。
+                </td>
+              </tr>
+              <tr>
+                <td><code>.toolkit(new Toolkit())</code></td>
+                <td>空工具箱有什么意义？</td>
+                <td>
+                  显式声明「这个 agent 没有任何工具」。不传也行，但显式写出来能避免「以为是框架没给工具，其实是我没注册」的误判。
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="ct">最关键的一句话：不订阅 = 不执行</span>
+          <p>
+            响应的「惰性」不是性能优化，而是<strong>语义</strong>：没有订阅者，框架就没有理由去花你的 token。所以看到「程序秒退、
+            什么也没打印」时，第一个要检查的不是模型配置，而是<strong>流有没有被订阅</strong>。
+          </p>
+        </div>
+
+        <h2 id="timeline">端到端：一次 <code>blockLast()</code> 到底触发了什么</h2>
+        <ul class="timeline">
+          <li>
+            <div class="who">你的线程</div>
+            <div class="what">调用 <code>streamEvents(msg)</code>，拿到 <code>Flux&lt;AgentEvent&gt;</code>——此刻<strong>零副作用</strong></div>
+          </li>
+          <li>
+            <div class="who">订阅</div>
+            <div class="what"><code>blockLast()</code> 内部 <code>subscribe()</code>：从这一步开始，请求才真正进入 agent 生命周期</div>
+          </li>
+          <li>
+            <div class="who">推理</div>
+            <div class="what">模型按流式返回，每个增量文本块转成一条 <code>TextBlockDeltaEvent</code>，推给下游</div>
+          </li>
+          <li>
+            <div class="who">你的回调</div>
+            <div class="what"><code>doOnNext</code> 对每条事件同步执行一次——它跑在<strong>发布事件的那个线程</strong>上</div>
+          </li>
+          <li>
+            <div class="who">工具（若有）</div>
+            <div class="what">模型要调工具时，事件流里会出现工具调用开始/结束事件，循环继续，直到模型不再要求调工具</div>
+          </li>
+          <li>
+            <div class="who">完成</div>
+            <div class="what">流发出 <code>onComplete</code>，<code>blockLast()</code> 返回，你的线程继续往下走</div>
+          </li>
+          <li>
+            <div class="who">出错</div>
+            <div class="what">流发出 <code>onError</code>，<code>blockLast()</code> 在这里<strong>抛出异常</strong>（不是返回 null）</div>
+          </li>
+        </ul>
+        <div class="swim">
+          <div class="lane">
+            <div class="lh">响应式：三个信号</div>
+            <div class="lb">
+              <ul>
+                <li><code>onNext(value)</code>：来了一条数据（可能很多条）</li>
+                <li><code>onComplete()</code>：正常结束，不会再有数据</li>
+                <li><code>onError(e)</code>：异常结束；<strong>之后不会再有数据，也不会再 onComplete</strong></li>
+              </ul>
+            </div>
+          </div>
+          <div class="lane">
+            <div class="lh">阻塞式：你熟悉的对应物</div>
+            <div class="lb">
+              <ul>
+                <li><code>block()</code>：onNext 有值 → 返回；空流 → 返回 <code>null</code>；onError → 抛异常</li>
+                <li><code>blockLast()</code>：等到 onComplete → 返回最后一个值；onError → 抛异常</li>
+                <li><code>collectList().block()</code>：把整条流收成一个 <code>List</code> 再返回</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <h2 id="control">取消、超时、中断：响应式换来的三个能力</h2>
+        <p>
+          既然拿到的是句柄而不是结果，就能做同步 API 做不到的事。框架把「一次执行」抽象成 <code>AgentRun&lt;T&gt;</code>：
+          <code>prepareRun(...)</code> 拿事件流句柄，<code>prepareCall(...)</code> 拿最终回复句柄，都带一个唯一
+          <code>runId()</code>；<strong>创建句柄不会执行</strong>，订阅 <code>stream()</code> 才开始<span
+            class="src"
+            data-src="docs/v2/zh/docs/building-blocks/agent.md:215"
+            >agent.md:215</span
+          >。
+        </p>
+        <pre data-lang="java" data-file="HandleDemo.java">import io.agentscope.core.agent.AgentRun;
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.event.AgentEvent;
+import io.agentscope.core.message.UserMessage;
+import java.util.List;
+
+RuntimeContext ctx = RuntimeContext.empty();
+AgentRun&lt;AgentEvent&gt; run = agent.prepareRun(List.of(new UserMessage("你好")), ctx);
+
+String runId = run.runId();          // 先登记到你的运行管理器
+run.stream().subscribe(this::onEvent, this::onError);
+
+// 另一条请求链路（比如用户点了「停止」）可以根据 runId 找到它并取消
+run.cancel();</pre>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>你想要的</th>
+                <th>怎么写</th>
+                <th>出处</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>跑一次并等结果</td>
+                <td><code>agent.call(msgs, ctx).block()</code></td>
+                <td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:849">ReActAgent.java:849</span></td>
+              </tr>
+              <tr>
+                <td>跑一次并看过程</td>
+                <td><code>agent.streamEvents(msg).doOnNext(...).blockLast()</code></td>
+                <td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1133">ReActAgent.java:1133</span></td>
+              </tr>
+              <tr>
+                <td>最多等 60 秒</td>
+                <td><code>.block(Duration.ofSeconds(60))</code> 或 <code>flux.timeout(Duration)</code></td>
+                <td>Reactor 原生算子</td>
+              </tr>
+              <tr>
+                <td>拿可取消/可查状态的句柄</td>
+                <td><code>prepareRun(...)</code> / <code>prepareCall(...)</code></td>
+                <td>
+                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1101">ReActAgent.java:1101</span>
+                  /
+                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1106">ReActAgent.java:1106</span>
+                </td>
+              </tr>
+              <tr>
+                <td>立即取消（订阅前也行）</td>
+                <td><code>run.cancel()</code></td>
+                <td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RunControl.java:69">RunControl.java:69</span></td>
+              </tr>
+              <tr>
+                <td>在检查点协作式中断（会带恢复消息）</td>
+                <td><code>agent.interrupt(target)</code> / <code>agent.interrupt(target, msg)</code></td>
+                <td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RunControl.java:82">RunControl.java:82</span></td>
+              </tr>
+              <tr>
+                <td>查状态 / 等终态</td>
+                <td><code>run.status()</code>、<code>run.termination()</code></td>
+                <td>
+                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RunControl.java:44">RunControl.java:44</span>
+                  /
+                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RunControl.java:119">RunControl.java:119</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          <span class="ct"><code>cancel()</code> 与 <code>interrupt()</code> 不是一回事</span>
+          <p>
+            <code>cancel()</code> 立即取消响应式执行，订阅者会收到 <code>CancellationException</code>；<code>interrupt()</code>
+            是<strong>在下一个检查点</strong>（推理开始、工具开始、每个流式 chunk）才生效，agent 会返回一个带
+            <code>GenerateReason.INTERRUPTED</code> 标记的 <code>Msg</code>，并且对话上下文会保存下来，下次同 session 可以从中断点继续
+            <span class="src" data-src="docs/v2/zh/docs/building-blocks/agent.md:255">agent.md:255</span>。要做「优雅停止」用后者，
+            要「立刻不管了」用前者。
+          </p>
+        </div>
+
+        <h2 id="cheatsheet">只记这 10 个算子</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>算子</th>
+                <th>作用</th>
+                <th>用在本框架的哪里</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>subscribe()</code></td>
+                <td>触发执行，不阻塞</td>
+                <td>Web 服务里想把事件推给 SSE 时</td>
+              </tr>
+              <tr>
+                <td><code>block()</code></td>
+                <td>阻塞取 <code>Mono</code> 的唯一值</td>
+                <td><code>call(...)</code> 后面</td>
+              </tr>
+              <tr>
+                <td><code>blockLast()</code></td>
+                <td>阻塞到流结束</td>
+                <td><code>streamEvents(...)</code> 后面</td>
+              </tr>
+              <tr>
+                <td><code>block(Duration)</code></td>
+                <td>最多等这么久，超时返回 <code>null</code></td>
+                <td>命令行工具里防止挂死</td>
+              </tr>
+              <tr>
+                <td><code>doOnNext</code></td>
+                <td>旁路观察，不改数据</td>
+                <td>打印/计数/埋点</td>
+              </tr>
+              <tr>
+                <td><code>doOnError</code></td>
+                <td>旁路观察错误</td>
+                <td>日志，然后继续往上抛</td>
+              </tr>
+              <tr>
+                <td><code>map</code></td>
+                <td>一对一转换</td>
+                <td>把 <code>Msg</code> 转成 DTO</td>
+              </tr>
+              <tr>
+                <td><code>flatMap</code></td>
+                <td>一对一转换并「摊平」一个内部流</td>
+                <td>拿到结果后再发起一次调用</td>
+              </tr>
+              <tr>
+                <td><code>onErrorResume</code></td>
+                <td>出错时切换到备用流</td>
+                <td>降级到小模型/固定答案</td>
+              </tr>
+              <tr>
+                <td><code>timeout</code></td>
+                <td>超时抛 <code>TimeoutException</code></td>
+                <td>给整条流设上限</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+
+        <div class="pitfall">
+          <div class="pf-h">1. 程序秒退，什么都不打印</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>命令运行完立刻结束，没有报错，也没有输出。</dd>
+            <dt>因为</dt>
+            <dd>你写了 <code>agent.call(...)</code> 或 <code>agent.streamEvents(...)</code>，但没订阅——<code>Mono</code>/<code>Flux</code> 是描述，不订阅就不执行。</dd>
+            <dt>改成</dt>
+            <dd><code>Mono</code> 加 <code>.block()</code>，<code>Flux</code> 加 <code>.blockLast()</code>，服务端场景用 <code>.subscribe(...)</code> 并接住异常。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">2. 在 <code>doOnNext</code> 里再调 <code>.block()</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>程序卡住不动，或者抛 <code>IllegalStateException: block()/blockFirst()/blockLast() are blocking, which is not supported in thread ...</code></dd>
+            <dt>因为</dt>
+            <dd>回调跑在事件发布线程上，你在「流内部」等这条流自己完成——自己等自己，永远等不到；Reactor 检测到在非阻塞线程上 block 时也会直接拒绝。</dd>
+            <dt>改成</dt>
+            <dd>回调里只做轻量累积（<code>List.add</code>、<code>StringBuilder</code>、计数）；需要「拿到结果再干一件事」请用 <code>flatMap</code>，不要在回调里阻塞。</dd>
+            <dt>延伸</dt>
+            <dd>这句异常的完整上下文与三种解法：<a href="../appendix/errors.html#err-block-in-reactor-thread">附录 B · 在非阻塞线程里 block</a>。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">3. 在 UI 线程 / 事件循环线程里 <code>block()</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>桌面程序界面完全无响应；Web 服务里所有请求一起变慢直到超时。</dd>
+            <dt>因为</dt>
+            <dd><code>block()</code> 会一直占住当前线程。Swing 的 EDT、JavaFX 的 Application Thread、Netty 的 event loop 都不能被占用。</dd>
+            <dt>改成</dt>
+            <dd>UI 里用 <code>subscribe(value -&gt; SwingUtilities.invokeLater(...))</code>；服务端直接把 <code>Flux</code> 交给框架的响应式管道。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">4. <code>subscribe()</code> 只传一个参数，异常被吞掉</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>调用发出去了，界面没有任何反应，日志里只有一行不太显眼的 <code>onErrorDropped</code>。</dd>
+            <dt>因为</dt>
+            <dd><code>subscribe(consumer)</code> 没提供错误处理，错误被丢弃（dropped），不会抛到你的调用栈上。</dd>
+            <dt>改成</dt>
+            <dd>至少写两参版本：<code>subscribe(onNext, onError)</code>；生产代码再补 <code>onComplete</code> 与 <code>doFinally</code> 做清理。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">5. 不设超时，模型一慢就永久等待</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>程序卡在 <code>block()</code> 上很久，看起来像死机。</dd>
+            <dt>因为</dt>
+            <dd><code>block()</code> 无参版本会一直等；网络层默认超时可能长达数十秒到分钟级。</dd>
+            <dt>改成</dt>
+            <dd>命令行工具用 <code>block(Duration.ofSeconds(60))</code>；流式用 <code>.timeout(Duration.ofSeconds(90))</code>，并在 <code>onErrorResume</code> 里给出可读提示。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary><code>agent.call(msg)</code> 返回的是结果吗？</summary>
+          <p>
+            不是，返回的是 <code>Mono&lt;Msg&gt;</code> 这个描述。真正执行发生在订阅（<code>block</code> / <code>subscribe</code>）时。
+          </p>
+        </details>
+        <details>
+          <summary>为什么 <code>streamEvents</code> 要用 <code>blockLast()</code> 而不是 <code>block()</code>？</summary>
+          <p>
+            因为它是 <code>Flux</code>（0~N 个事件）。<code>block()</code> 是 <code>Mono</code> 的 API，对 <code>Flux</code>
+            语义上要说「等到最后一个元素」，对应 <code>blockLast()</code>。
+          </p>
+        </details>
+        <details>
+          <summary><code>cancel()</code> 和 <code>interrupt()</code> 该怎么选？</summary>
+          <p>
+            想立刻停止、不需要恢复消息时用 <code>cancel()</code>；想「优雅停下并把当前进度存下来」时用 <code>interrupt()</code>——它会返回
+            带 <code>INTERRUPTED</code> 标记的 <code>Msg</code> 并保存上下文<span
+              class="src"
+              data-src="docs/v2/zh/docs/building-blocks/agent.md:256"
+              >agent.md:256</span
+            >。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">把死代码救活</span>
+            <div>
+              把 <code>StreamOnce</code> 里的 <code>.blockLast()</code> 删掉再跑一次，确认「什么都不输出」。然后把
+              <code>doOnNext</code> 也删掉、只留 <code>blockLast()</code>，确认「程序确实跑了，只是没打印」——这两种「没输出」的原因完全不同。
+            </div>
+          </li>
+          <li>
+            <span class="sh">加上耗时统计</span>
+            <div>
+              用 <code>long t0 = System.currentTimeMillis();</code> 包住整条流，结束后打印总耗时；再在
+              <code>doOnNext</code> 里统计事件条数。你会直观看到「一次回答 = 几十到几百个事件」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">给一个必定失败的调用加超时</span>
+            <div>
+              把 model 改成不存在的 id，用 <code>.timeout(Duration.ofSeconds(5))</code> + <code>onErrorResume</code> 捕获并打印一行
+              「抱歉，模型暂时不可用」。这一步就是 11 章综合案例的容错雏形。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          现在你知道「流」是什么了，下一章拆流里到底流了哪些东西：<a href="04-message-and-event.html">04 消息与事件</a>。如果你想先看
+          <code>Msg</code> 的结构，可以直接跳到那章的「ContentBlock」一节；想回到能跑的第一个完整 Agent，去
+          <a href="02-first-agent.html">02 第一个 Agent</a>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>想确认的事</th>
+                <th>去哪看</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>call</code> 与 <code>streamEvents</code> 的官方说明</td>
+                <td><span class="src" data-src="docs/v2/zh/docs/building-blocks/agent.md:267">agent.md:267</span></td>
+              </tr>
+              <tr>
+                <td>可取消句柄与状态机</td>
+                <td><span class="src" data-src="docs/v2/zh/docs/building-blocks/agent.md:213">agent.md:213</span></td>
+              </tr>
+              <tr>
+                <td>中断后的恢复行为</td>
+                <td><span class="src" data-src="docs/v2/zh/docs/building-blocks/agent.md:233">agent.md:233</span></td>
+              </tr>
+              <tr>
+                <td>可编译的流式示例</td>
+                <td>
+                  <span
+                    class="src"
+                    data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/quickstart/BasicChatExample.java:44"
+                    >BasicChatExample.java:44</span
+                  >
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

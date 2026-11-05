@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 24 章拆 Team 协作：Leader 如何评估与委派、成员如何领取任务、Issue / Run / Node / Task / Attempt 如何分层记录，以及策略默认值、失败收敛和三种混合后端案例。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="24 Team 协作：Leader、成员与结果收敛 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 24 章拆 Team 协作：Leader 如何评估与委派、成员如何领取任务、Issue / Run / Node / Task / Attempt 如何分层记录，以及策略默认值、失败收敛和三种混合后端案例。" />
+    <title>24 Team 协作：Leader、成员与结果收敛 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="24-team-collaboration" data-root="..">
+    <main>
+      <article class="article">
+        <h1>24 · Team 协作：Leader、成员与结果收敛</h1>
+        <p class="lede">
+          第 23 章把一台主机接进控制面；这一章把多个 Agent 组织成团队。Team 不是「同时启动所有成员」，
+          而是一个由 Leader 驱动的动态决策循环：Issue 给出目标，Leader 选择成员、拆出任务，成员的执行结果再回到同一个协调节点。
+          真正难的不是建队，而是分清 <strong>任务完成、Attempt 成功、协调节点收敛、Issue 验收</strong>是四层不同的事实。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 Team、Workflow 与单个 Agent 的分工，知道什么工作不该交给 Team</li>
+          <li>按 Issue → Run → Node → AgentTask → Attempt 的顺序读懂一次协作</li>
+          <li>创建 Leader 与成员，写出可验证的角色职责，而不是复制同一段宽泛指令</li>
+          <li>解释七类协作策略的零值语义，以及创建表单为什么和零值不一样</li>
+          <li>定位「Team 显示就绪但任务不派发」「成员完成但 Run 不结束」分别卡在哪一层</li>
+          <li>在 Managed、Hosted、External 混合团队中，按同一套验收顺序排查问题</li>
+        </ul>
+
+        <h2 id="why">边界：Team 是动态决策器，不是并行加速器</h2>
+        <p>
+          Team 适合目标明确、但实现步骤需要临场决定的工作。它和 Workflow 的差别不在「有没有多个 Agent」，
+          而在<strong>谁决定下一步</strong>：Team 由 Leader 根据当前事实选择成员与拆分方式；Workflow 由预先声明的 DAG
+          决定节点何时可运行<span class="src" data-src="docs/v2/zh/service/team-collaboration.md:10">team-collaboration.md:10</span>。
+          需要固定顺序、条件分支或人工关口时，应该用 Workflow，而不是在 Team 指令里写一段「必须按 1、2、3 执行」的伪流程。
+        </p>
+        <p>
+          Team 是持久定义；一次团队工作会创建 Run 和团队快照，由 Leader 驱动协调，而不是每次无条件并行运行所有成员
+          <span class="src" data-src="docs/v2/zh/service/team-execution.md:10">team-execution.md:10</span>。
+          官方概览也把这点写得很直接：Leader 决定一项请求需要哪些成员，<strong>并不保证每次都运行整个名单</strong>；
+          团队配置描述的是可用能力，不是固定执行图
+          <span class="src" data-src="docs/v2/zh/service/teams.md:34">teams.md:34</span>。
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h3>适合 Team</h3>
+            <ul>
+              <li>目标明确，但需要先调研再决定派谁</li>
+              <li>成员产出需要互相复核、追问、返工</li>
+              <li>希望保留讨论、任务图与每次执行的证据</li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h3>更适合 Workflow</h3>
+            <ul>
+              <li>步骤顺序固定，失败要回到指定节点</li>
+              <li>审批、条件、汇合规则必须可预测</li>
+              <li>要把 Team 当成其中一个动态节点来调用</li>
+            </ul>
+          </div>
+        </div>
+        <div class="callout">
+          <span class="ct">一句话判断</span>
+          <p>
+            如果「下一步做什么」需要模型看上下文再决定，用 Team；如果「下一步做什么」在运行前就能画出来，用 Workflow。
+            Team 的动态性来自 Leader 每回合的一次评估，而不是成员越多越自动。
+          </p>
+        </div>
+
+        <h2 id="objects">对象模型：Issue、Run、Node、Task、Attempt 各记什么</h2>
+        <p>
+          读 Team 排障信息时，最容易把几个状态混成一个。官方把职责拆成六行，先把这张表记住：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>对象</th><th>在协作中记录什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><strong>Issue</strong></td><td>目标、负责人、讨论、交付与验收</td></tr>
+              <tr><td><strong>Run / Node</strong></td><td>本次协作及协调步骤的状态</td></tr>
+              <tr><td><strong>AgentTask</strong></td><td>指派给一个 Agent 的工作义务</td></tr>
+              <tr><td><strong>Attempt</strong></td><td>某个后端上的一次实际执行</td></tr>
+              <tr><td><strong>Comment / Artifact</strong></td><td>持久沟通与共享结果</td></tr>
+              <tr><td><strong>Child Issue</strong></td><td>可独立跟踪的子目标</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          表源：<span class="src" data-src="docs/v2/zh/service/team-execution.md:32-39">team-execution.md:32-39</span>。
+          同一 AgentTask 可以因重试产生多个 Attempt
+          <span class="src" data-src="docs/v2/zh/service/team-execution.md:41">team-execution.md:41</span>。
+        </p>
+        <p>
+          源码里，AgentTask 把这些关系真正落成字段：它同时带 <code>issueId</code>、<code>orchestrationRunId</code>、
+          <code>runNodeId</code>、<code>teamId</code>、<code>teamRole</code>、<code>leaderTask</code>、<code>parentTaskId</code>
+          与 <code>currentAttemptId</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/collaboration.go:257-295">collaboration.go:257-295</span>。
+          所以「谁派的、属于哪个节点、是不是 Leader 的任务、重试了第几次」都能沿字段回溯，不需要猜。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>层</th><th>状态取值（节选）</th><th>含义</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Run</td><td><code>planned</code> / <code>running</code> / <code>waiting</code> / <code>succeeded</code> / <code>partial_succeeded</code> / <code>failed</code></td><td>一次可观察的协作实例</td></tr>
+              <tr><td>Node</td><td><code>ready</code> / <code>running</code> / <code>waiting</code> / <code>succeeded</code> / <code>failed</code></td><td>协作中的一个步骤；Team 通常只有一个协调节点</td></tr>
+              <tr><td>AgentTask</td><td><code>queued</code> / <code>dispatched</code> / <code>running</code> / <code>waiting</code> / <code>completed</code> / <code>failed</code> / <code>cancelled</code></td><td>一份定向工作义务</td></tr>
+              <tr><td>Attempt</td><td>由执行后端报告</td><td>某一后端上的一次物理尝试</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          Run 状态与节点类型见
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/orchestration.go:36-98">orchestration.go:36-98</span>；
+          AgentTask 状态与终态判定见
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/collaboration.go:220-234">collaboration.go:220-234</span>。
+        </p>
+
+        <h2 id="create">建队：一个 Leader，若干有角色的成员</h2>
+        <p>
+          创建入口在 <strong>DESIGN → Teams</strong>。先分别验证成员 Agent 能独立完成小任务，再选择统一接收任务的
+          Leader，添加可协作成员；需要约束委派时再展开高级协作指令
+          <span class="src" data-src="docs/v2/zh/service/teams.md:26-32">teams.md:26-32</span>。
+          官方的最小复核团队是「资料助手 + 复核助手」：Leader 先整理材料，再委派复核，最后修订并交付统一结果
+          <span class="src" data-src="docs/v2/zh/service/create-team.md:10-26">create-team.md:10-26</span>。
+        </p>
+        <p>
+          数据模型里，Team 包含名称、描述、团队指令、状态、<code>leaderAgentId</code>、策略、版本与成员列表；
+          成员再带 <code>agentId</code>、<code>role</code>、成员指令、能力要求与运行绑定策略
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/collaboration.go:356-385">collaboration.go:356-385</span>。
+          角色不是装饰：它既进入 Leader 的路由上下文，也会写进派发出去的任务记录。
+        </p>
+        <p>创建 API 的校验比表单更硬，下面几条会直接决定你看到 400 还是 409：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>规则</th><th>结果</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>name</code> 或 <code>leaderAgentId</code> 为空</td><td>400，提示两者必填</td></tr>
+              <tr><td>tenant / namespace 为空</td><td>400</td></tr>
+              <tr><td>状态不是 <code>active</code> 或 <code>disabled</code></td><td>400</td></tr>
+              <tr><td>Leader 不在当前范围或不是有效 Agent</td><td>400 / 对应目录错误</td></tr>
+              <tr><td>Leader 同时出现在成员列表</td><td>409</td></tr>
+              <tr><td>成员 Agent 重复，或角色名重复</td><td>409</td></tr>
+              <tr><td>成员缺少 <code>agentId</code> 或 <code>role</code></td><td>400</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          校验与 201 返回见
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/collaboration_handler.go:1550-1622">collaboration_handler.go:1550-1622</span>；
+          Leader / 成员冲突见
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/collaboration_handler.go:1589-1600">collaboration_handler.go:1589-1600</span>。
+        </p>
+        <p>
+          如果不想点控制台，CLI 也能建队：<code>agentscope team apply -f team.yaml</code> 会向
+          <code>POST /api/v1/teams</code> 提交 YAML / JSON，另有 <code>list</code>、<code>get</code> 与
+          <code>members</code> 三个只读入口
+          <span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/team.go:24-40">team.go:24-40</span>。
+        </p>
+        <pre data-lang="yaml" data-file="team.yaml：最小研究团队">tenant: default
+namespace: default
+name: research-review
+description: 技术调研与证据复核
+leaderAgentId: &lt;leader-agent-uuid&gt;
+instructions: |
+  先明确问题与验收标准，再决定是否需要委派。
+  成员结果必须回到主 Issue 复核；未完成项要明确说明。
+members:
+  - agentId: &lt;researcher-agent-uuid&gt;
+    role: researcher
+    instructions: 收集带来源的事实，区分已确认与待确认。
+  - agentId: &lt;reviewer-agent-uuid&gt;
+    role: reviewer
+    instructions: 检查证据缺口、矛盾与未验证的承诺。
+policy:
+  maxActiveTasks: 4
+  maxFanout: 3
+  maxHops: 4
+  maxChildDepth: 2
+  maxChildIssues: 8
+  requireReview: true</pre>
+
+        <h2 id="roster">成员字段：角色、指令、能力要求、运行策略</h2>
+        <p>
+          官方字段表把 Team 与 Member 分开：Team 管名称、描述、Leader、团队指令与启停状态；Member 管这个 Agent
+          在团队里的角色、专项指令、能力要求和运行候选
+          <span class="src" data-src="docs/v2/zh/service/team-configuration.md:12-26">team-configuration.md:12-26</span>。
+          最容易被写坏的是指令：团队 Instructions 定义共同交付要求，成员 Instructions 定义专项职责
+          <span class="src" data-src="docs/v2/zh/service/team-collaboration.md:44">team-collaboration.md:44</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>写法</th><th>问题</th><th>改法</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>五个成员复制同一段「负责分析并输出报告」</td><td>Leader 无法判断该选谁，成员也无法证明自己完成了什么</td><td>一个角色一个可验证产出：来源清单、能力映射、测试日志、复核结论</td></tr>
+              <tr><td>只在 Team 指令里写「最后汇总」</td><td>成员不知道自己的边界，Leader 不知道何时算齐</td><td>团队写共同验收，成员写专项交付与停止条件</td></tr>
+              <tr><td>把「必须按固定顺序」写进 Team</td><td>Leader 的动态决策被伪流程绑死，失败也无法回退</td><td>固定顺序交给 Workflow，Team 只描述角色与协作边界</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Leader 不是「权限更高的成员」。它必须具备委派、查看结果、节点完成 / 失败等协调能力；
+          普通成员只需要完成自己承担的角色，<strong>并非所有能进行 Chat 的 Agent 都适合当 Leader</strong>
+          <span class="src" data-src="docs/v2/zh/service/team-configuration.md:73">team-configuration.md:73</span>。
+          成员可以混用 Managed、Hosted 与 External，但必须验证对应的任务派发与协作能力
+          <span class="src" data-src="docs/v2/zh/service/team-collaboration.md:16">team-collaboration.md:16</span>。
+        </p>
+
+        <h2 id="policy">协作上限：七个策略字段与两种默认值</h2>
+        <p>
+          策略不是「建议值」，而是服务端在委派、提及和子 Issue 创建时真正检查的预算。零值语义并不统一，
+          先看官方表：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th><code>policy</code> 字段</th><th>控制内容</th><th>零值语义</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>maxActiveTasks</code></td><td>并发任务上限</td><td>默认 32</td></tr>
+              <tr><td><code>maxHops</code></td><td>委派跳数</td><td>默认 8</td></tr>
+              <tr><td><code>maxFanout</code></td><td>单次委派接收者数量</td><td>不增加 Team 专属限制</td></tr>
+              <tr><td><code>maxChildDepth</code></td><td>子 Issue 深度</td><td>默认 4</td></tr>
+              <tr><td><code>maxChildIssues</code></td><td>每个父 Issue 的子 Issue 数量</td><td>不增加 Team 专属限制</td></tr>
+              <tr><td><code>maxTaskRetries</code></td><td>每个任务的重试限制</td><td>不增加 Team 专属限制</td></tr>
+              <tr><td><code>allowExternalDelegation</code></td><td>是否允许委派给名单外 Agent / Team</td><td><code>false</code></td></tr>
+              <tr><td><code>allowMentionAll</code></td><td>是否允许面向全体成员的委派</td><td><code>false</code></td></tr>
+              <tr><td><code>requireReview</code></td><td>按执行策略要求人工复核</td><td><code>false</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          表源：<span class="src" data-src="docs/v2/zh/service/team-configuration.md:28-40">team-configuration.md:28-40</span>。
+          当前创建表单会写入显式值：并发 32、fanout 8、hops 8、child depth 8、child issues 64
+          <span class="src" data-src="docs/v2/zh/service/team-configuration.md:44">team-configuration.md:44</span>，
+          源码里也能看到这条默认组合
+          <span class="src" data-src="agentscope-service/frontend/src/features/teams/TeamsOverviewPage.tsx:72">TeamsOverviewPage.tsx:72</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">「零值」不等于「表单默认」</span>
+          <p>
+            同样是 <code>maxChildDepth</code>：留空走服务端默认 4；从创建表单建队会显式写 8。两者都不是
+            「无限制」。而 <code>maxFanout</code>、<code>maxChildIssues</code> 与 <code>maxTaskRetries</code>
+            的零值才是「不加 Team 专属限制」。排障时先看详情页实际值，不要拿文档的零值表去解释表单建出来的 Team
+            <span class="src" data-src="docs/v2/zh/service/team-configuration.md:44">team-configuration.md:44</span>。
+          </p>
+        </div>
+        <p>
+          服务端默认值写在委派守卫里：<code>maxHops</code> 8、<code>maxActiveTasks</code> 32
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:1084-1095">service.go:1084-1095</span>；
+          跳数超限会以 <code>max_hops_exceeded</code> 阻断，自触发会以 <code>self_trigger</code> 阻断
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:1097-1107">service.go:1097-1107</span>；
+          活跃任务达到上限则以 <code>active_task_budget_exceeded</code> 阻断
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:1109-1119">service.go:1109-1119</span>。
+          另外三个上限有平台安全边界：<code>maxHops</code> ≤ 64、<code>maxChildDepth</code> ≤ 32、<code>maxFanout</code> ≤ 256
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:50-51">service.go:50-51</span>。
+        </p>
+        <p>
+          单次提及的接收者数量在路由阶段检查，超过 <code>maxFanout</code> 直接失败
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:778-779">service.go:778-779</span>。
+          子 Issue 则同时检查深度和数量
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:589-613">service.go:589-613</span>。
+          修改 Team 时 API 用 <code>expectedVersion</code> 做乐观锁，版本不一致会返回冲突
+          <span class="src" data-src="docs/v2/zh/service/team-configuration.md:63">team-configuration.md:63</span>。
+        </p>
+
+        <h2 id="runtimes">混合后端：Managed、Hosted、External 只在 Attempt 以下不同</h2>
+        <p>
+          同一个 Team 可以混用三种成员，但加入前要验证的东西不同：Managed 看模型、Environment / Memory / Vault 绑定；
+          Hosted 看 Host 在线、provider 可用、定义映射与协作工具；External 看任务入口和真实完成 / 失败回报
+          <span class="src" data-src="docs/v2/zh/service/team-configuration.md:65-71">team-configuration.md:65-71</span>。
+          「能在 Chat 里回答」不等于「能作为 Team 成员完成派发」。
+        </p>
+        <p>
+          成员的 <code>runtimeBindingPolicy</code> 是可选的有序候选：每个候选包含 <code>binding</code>、
+          <code>requiredCapabilities</code> 与 <code>securityConstraints</code>，外层还有
+          <code>selectionMode</code>、<code>fallbackMode</code> 与可选的 <code>retryPolicy</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/orchestration.go:246-263">orchestration.go:246-263</span>。
+          校验要求 <code>selectionMode=ordered</code>、至少一个候选，<code>fallbackMode</code> 只能是
+          <code>disabled</code> 或 <code>fresh</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:66-82">service.go:66-82</span>。
+        </p>
+        <p>
+          选择顺序是<strong>节点覆盖 → 成员覆盖 → Agent 策略</strong>；显式启用 fresh fallback 后，跨后端重试会从
+          持久 Issue、评论与 Artifact 重建上下文，不迁移原进程或私有会话
+          <span class="src" data-src="docs/v2/zh/service/team-configuration.md:77-79">team-configuration.md:77-79</span>。
+          所以混合团队的第一条验收不是「三种成员都在名单里」，而是「每个成员都能独立完成一次小任务」。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>成员</th><th>加入前至少验证</th><th>本章前面的章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Managed</td><td>模型可用，资源绑定正确，能完成一次带工具的任务</td><td><a href="21-managed-agent-deep.html">21 Managed Agent 深入</a></td></tr>
+              <tr><td>Hosted</td><td>Host 在线，provider 已登录，能力映射与协作 MCP / CLI 可用</td><td><a href="23-hosted-agent.html">23 Hosted Agent 与 Runtime Host</a></td></tr>
+              <tr><td>External</td><td>应用已注册，任务入口、完成 / 失败回报与 SessionBridge 正常</td><td><a href="22-external-agent.html">22 External Agent</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="readiness">就绪度：Ready、Degraded、Unavailable 各查什么</h2>
+        <p>
+          控制台的就绪检查是「现在能不能开始有效协作」，不是「定义是否存在」。官方三态是：
+          Ready 可做小任务验证；Degraded 有部分成员或能力不可用；Unavailable 当前无法开始有效协作，优先修 Leader 或运行时依赖
+          <span class="src" data-src="docs/v2/zh/service/teams.md:38-43">teams.md:38-43</span>。
+        </p>
+        <p>
+          源码把这三态算得更具体：先默认 <code>ready</code>，Team 非 active 直接 <code>unavailable</code>；
+          然后逐个检查 Leader 与成员 Agent 是否在当前范围、是否 active、绑定的 Runtime 候选是否可派发。
+          成员不是 <code>ready</code> 时，Leader 不是 <code>degraded</code> 就把整队判为 <code>unavailable</code>，
+          否则降为 <code>degraded</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/team_detail_handler.go:73-107">team_detail_handler.go:73-107</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>现象</th><th>最可能的原因</th><th>先查</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>整队 Unavailable</td><td>Team 被禁用，或 Leader 不可派发</td><td>Team 状态、Leader 的 Runtime 绑定</td></tr>
+              <tr><td>整队 Degraded</td><td>某个成员不可用，但 Leader 还能工作</td><td>成员卡片上的原因与 Runtime 候选</td></tr>
+              <tr><td>成员显示可用，派发仍失败</td><td>能力要求、池名或策略不匹配</td><td>成员的 <code>runtimeBindingPolicy</code> 与目标后端</td></tr>
+              <tr><td>运行中才报能力错误</td><td>就绪检查通过，但 Workspace 请求了 provider 不支持的能力</td><td>第 23 章的能力矩阵与执行前复检</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          就绪检查按成员自己的运行候选走，而不是只看 Agent 是否存在
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/team_detail_handler.go:93-98">team_detail_handler.go:93-98</span>。
+          这也是为什么「目录里能看到 Agent」不能替代「这个成员能接任务」。
+        </p>
+
+        <h2 id="start">从 Issue 启动：冻结快照，只建一个协调节点</h2>
+        <p>
+          一次协作从 Issue、Automation 或 Endpoint job 开始。控制面先冻结 Team 快照并创建 Run，
+          然后只创建一个协调节点和一份初始 Leader 任务，而不是给每个成员都创建一次调用
+          <span class="src" data-src="docs/v2/zh/service/team-execution.md:12-26">team-execution.md:12-26</span>。
+          源码中的入口写得很明确：先校验 Team 是 active、范围与 Run 一致且有 Leader，再写团队快照，
+          最后创建 <code>team-coordinator</code> 节点和初始 Leader 任务
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/team.go:42-98">team.go:42-98</span>。
+        </p>
+        <ul class="timeline">
+          <li>
+            <span class="who">分配</span>
+            <span class="what">人、Automation 或 Endpoint 把 Issue 交给 Team；团队定义是持久模板，不是这次运行的实时配置。</span>
+          </li>
+          <li>
+            <span class="who">冻结</span>
+            <span class="what">序列化 Team 并写入 Run 快照，后续排障看的是当时那份名单、角色与策略，而不是今天改过的版本<span class="src" data-src="agentscope-service/aistio/internal/orchestration/team.go:55-63">team.go:55-63</span>。</span>
+          </li>
+          <li>
+            <span class="who">建节点</span>
+            <span class="what">创建类型为 <code>team</code>、角色为 <code>leader</code> 的协调节点；同一 Run 与 NodeKey 会复用已有节点，避免重复建图<span class="src" data-src="agentscope-service/aistio/internal/orchestration/team.go:64-85">team.go:64-85</span>。</span>
+          </li>
+          <li>
+            <span class="who">建任务</span>
+            <span class="what">给 Leader 创建一条 <code>leader=true</code>、带 <code>teamId</code> 与 <code>teamRole=leader</code> 的任务；已有任务则直接复用<span class="src" data-src="agentscope-service/aistio/internal/orchestration/team.go:86-98">team.go:86-98</span>。</span>
+          </li>
+          <li>
+            <span class="who">运行</span>
+            <span class="what">自适应 Run 进入 running / waiting，Leader 的每次决策只消耗一个回合，协调节点保持 waiting 直到显式收敛。</span>
+          </li>
+        </ul>
+        <p class="footnote">
+          Run 模式里 <code>adaptive</code> 与 <code>declared</code> 是两种不同编排
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/orchestration.go:29-34">orchestration.go:29-34</span>。
+          Team 默认是前者：拓扑可以在运行时增长；Workflow 的 team node 则把动态协作嵌进声明式外壳。
+        </p>
+
+        <h2 id="leader">Leader 回合：评估、委派、等待、收敛</h2>
+        <p>
+          Leader 不是「一直跑到所有成员结束」的长任务。它每被唤醒一次，只处理一个协调回合：读取新增事实，
+          作出一次可观察的评估，然后委派、等待、升级或收敛。设计契约把评估结果分成
+          <code>delegate</code>、<code>complete</code>、<code>blocked/escalate</code> 与 <code>no_action</code>
+          <span class="src" data-src="agentscope-service/docs/controlplane/team-collaboration-v5.md:100-106">team-collaboration-v5.md:100-106</span>。
+          这份文档标明是目标架构，具体字段仍以当前实现为准，但它解释了为什么 Leader 必须留下「看过但没有动作」的记录。
+        </p>
+        <p>
+          委派后，Leader 调用等待逻辑结束本回合；协调节点保持 waiting，下一条唤醒由成员结果、子 Issue 状态变化或人类评论触发
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/leader_wait.go:92-110">leader_wait.go:92-110</span>。
+          这避免一个模型调用无限等待，也让「成员还在跑」与「Leader 卡死」在时间线上可区分。
+        </p>
+        <p>
+          服务端还会限制 Leader 能做什么：只有 active 的 Team Leader 任务可以创建子 Issue
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:553">service.go:553</span>；
+          子 Issue 的接收者必须在冻结的 Team 快照里，除非显式允许名单外委派
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:579-587">service.go:579-587</span>；
+          深度与数量也受策略约束
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:589-613">service.go:589-613</span>。
+        </p>
+        <div class="callout tip">
+          <span class="ct">Leader 的交付长什么样</span>
+          <p>
+            最终汇总要包含必要成员的结果、证据位置和未完成项；如果仍有必要子工作没结束，应该等待、调整计划或明确失败，
+            不能用「报告已生成」掩盖未完成义务
+            <span class="src" data-src="docs/v2/zh/service/team-execution.md:49-53">team-execution.md:49-53</span>。
+          </p>
+        </div>
+
+        <h2 id="worker">成员回合：只做被指派的事，结果必须回到协调节点</h2>
+        <p>
+          成员只收到自己的 assignment、所属 Issue / 子 Issue、触发输入和允许的工具。它可以写进度、结果与 Artifact，
+          但不能替 Leader 创建 Team 子任务、验收 Issue、重规划或完成协调节点
+          <span class="src" data-src="agentscope-service/docs/controlplane/team-collaboration-v5.md:108-115">team-collaboration-v5.md:108-115</span>。
+          这也是「成员回复」与「团队完成」必须分开的原因。
+        </p>
+        <p>
+          成员结果通过持久对象回流：评论、mention、Artifact 和子 Issue 都属于共享事实；Managed Environment、Hosted
+          工作目录与 External 私有文件不会因为同在一个 Team 就自动合并
+          <span class="src" data-src="docs/v2/zh/service/team-execution.md:43-47">team-execution.md:43-47</span>。
+          评论里的本地绝对路径不是可下载文件，Leader 要打开真实 Artifact 核对
+          <span class="src" data-src="docs/v2/zh/service/team-collaboration.md:66">team-collaboration.md:66</span>。
+        </p>
+        <p>
+          Hosted / Shell 型成员还能使用任务范围命令读写 Issue、发进度、上传产物；MCP 型成员使用对应的 collaboration 工具。
+          这些命令在 Host 启动的任务环境里运行，不是拿管理员令牌在普通终端模拟
+          <span class="src" data-src="docs/v2/zh/service/team-collaboration.md:28-40">team-collaboration.md:28-40</span>。
+        </p>
+        <p>
+          源码层面，成员完成任务会同时完成当前的 Task / Attempt、处理输入、写结果评论，并把评论路由成 Leader 的后继输入
+          <span class="src" data-src="agentscope-service/docs/controlplane/team-collaboration-v5.md:113-115">team-collaboration-v5.md:113-115</span>。
+          这里的目标是「每个成员结果恰好形成一个 Leader 后继输入」，避免重试或重放把同一结果算两次。
+        </p>
+
+        <h2 id="taskboard">任务板与邮箱：服务端 Team 和 Harness 本地 Team 不是一回事</h2>
+        <p>
+          Service 的 Team 以 Issue、AgentTask、Comment、Artifact 为持久事实；框架里的 <code>TeamTool</code>
+          则提供一套更轻的「任务板 + 邮箱」接口，用于本地或会话内的协作。两者共享词汇，但不是同一个存储。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>能力</th><th>Service Team</th><th>Harness TeamTool</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>任务载体</td><td>Issue / AgentTask / RunNode</td><td><code>TeamTask</code> 任务板</td></tr>
+              <tr><td>持久消息</td><td>Comment、mention、路由结果</td><td><code>TeamMessage</code> 邮箱</td></tr>
+              <tr><td>并发控制</td><td>数据库事务、版本与租约</td><td><code>BaseStore</code> CAS 与 <code>expectedVersion</code></td></tr>
+              <tr><td>唤醒</td><td>控制面调度与持久输入</td><td><code>TeamWakeups</code> 注册的运行时 Hook</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          <code>TeamClient</code> 的注释直接把它定义为 task board + mailbox，并列出本地 BaseStore 与 control-plane HTTP
+          两种实现
+          <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/team/TeamClient.java:21-26">TeamClient.java:21-26</span>；
+          本地实现明确使用 CAS，唤醒委托给 <code>TeamWakeups</code>
+          <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/team/LocalTeamClient.java:30-34">LocalTeamClient.java:30-34</span>。
+          本地任务状态只有 pending / in_progress / completed / failed
+          <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/team/TeamTask.java:36-44">TeamTask.java:36-44</span>。
+        </p>
+        <p>
+          <code>TeamTool</code> 的动作按角色分权：Lead 可创建、指派、动态增减成员、审批计划与结束团队；
+          worker 主要做列表、领取与消息
+          <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/TeamTool.java:34-37">TeamTool.java:34-37</span>。
+          第 14 章已经拆过这套本地实现；本章后面的「Team」若无特别说明，都指 Service 的持久 Team。
+        </p>
+
+        <h2 id="convergence">结果收敛：四种「完成」不能互相代替</h2>
+        <p>
+          这是整章最重要的一节。官方与设计契约都反复强调：成员回复、Attempt 成功、协调节点完成、Run 终态与 Issue 验收
+          分别表达不同层次
+          <span class="src" data-src="docs/v2/zh/service/team-execution.md:49-53">team-execution.md:49-53</span>。
+          设计文档把链路写得更细：
+        </p>
+        <pre data-lang="text" data-file="四层完成：从物理执行到业务验收">provider turn 结束
+  ≠ ExecutionAttempt 成功
+  ≠ AgentTask 语义完成
+  ≠ Team coordinator 收敛
+  ≠ Issue 被验收</pre>
+        <p class="footnote">
+          链路来源：<span class="src" data-src="agentscope-service/docs/controlplane/team-collaboration-v5.md:77-83">team-collaboration-v5.md:77-83</span>。
+          注意这是设计契约对目标状态的描述，当前实现仍需逐层核对。
+        </p>
+        <p>
+          服务端的协调节点收敛不是「Leader 说完成就完成」。它要检查：当前 Leader 任务之外没有活跃 worker 任务；
+          没有未终态节点；所有子 Issue 都是 done 或 cancelled；Leader 任务必须先完成，节点才能完成
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:360-457">service.go:360-457</span>。
+          代码注释也把顺序写死了：Run 不能在「作出决定的 Leader 义务」还活着时变成成功
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:465-470">service.go:465-470</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>你看到的</th><th>它保证什么</th><th>它不保证什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>成员回复了一条结果</td><td>消息已持久化，Leader 可能收到后继输入</td><td>任务已完成，或结果已被采用</td></tr>
+              <tr><td>Attempt succeeded</td><td>某后端这一次物理执行成功</td><td>语义目标已完成</td></tr>
+              <tr><td>AgentTask completed</td><td>这份定向工作义务已结束</td><td>Team 已收敛，或 Issue 已验收</td></tr>
+              <tr><td>Coordinator node succeeded</td><td>Team barrier 已满足</td><td>业务验收一定通过</td></tr>
+              <tr><td>Run succeeded / partial_succeeded</td><td>这次执行图到达终态</td><td>Issue 一定 done，尤其人工验收场景</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          当所有节点终态后，引擎决定 Run 的终态：没有失败就是 succeeded；有失败、有成功且允许部分成功时是
+          partial_succeeded；其余有失败则 failed
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:437-443">engine.go:437-443</span>。
+          Run 结束后，协调总结会先写回根 Issue，再按完成策略把 Issue 留在 <code>in_review</code> 或自动置为 done；
+          失败则写 blocked 并保留已完成内容
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/coordinator_summary.go:52-58">coordinator_summary.go:52-58</span>。
+        </p>
+
+        <h2 id="failure">失败与重试：Attempt 失败不等于 Task 失败</h2>
+        <p>
+          Team 里最常见的误判是「一个成员报错，整队就失败」。实际分层是：物理 Attempt 失败可以重试同一份 AgentTask；
+          重试预算耗尽或错误不可恢复时，子 Issue 才转 blocked，并把失败事实作为普通输入交给 Leader 决策
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:1740-1749">service.go:1740-1749</span>。
+          这条输入会明确列出失败码、原因、已消耗尝试次数，以及 Leader 可选的下一步
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:1815-1819">service.go:1815-1819</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>场景</th><th>Task / Attempt</th><th>子 Issue</th><th>Leader</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>瞬时故障，预算未耗尽</td><td>新 Attempt，Task 仍可继续</td><td>保持进行中</td><td>继续等待，不唤醒</td></tr>
+              <tr><td>缺凭据 / 权限 / 能力，原样重试无意义</td><td>Task failed</td><td>blocked</td><td>收到失败输入，决定重派、降级或求助</td></tr>
+              <tr><td>瞬时故障耗尽重试</td><td>Task failed</td><td>blocked</td><td>同上</td></tr>
+              <tr><td>Leader 接受降级 / 部分结果</td><td>失败记录保留</td><td>可显式取消</td><td>协调节点可收敛，Run 可能 partial_succeeded</td></tr>
+              <tr><td>Leader 判定目标不可恢复</td><td>失败记录保留</td><td>保持 blocked</td><td>失败协调节点，Run failed</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          故障矩阵的设计意图见
+          <span class="src" data-src="agentscope-service/docs/controlplane/team-collaboration-v5.md:147-160">team-collaboration-v5.md:147-160</span>；
+          当前实现中，只有 Leader 能显式取消 blocked 子 Issue，且仍存在活跃 worker 时会被拒绝
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:261-295">service.go:261-295</span>。
+          <code>maxTaskRetries</code> 的预算按重试链计数，超限返回
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:1062-1074">service.go:1062-1074</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">不要用「重试」掩盖配置错误</span>
+          <p>
+            缺 API key、凭据、权限或 provider 能力时，重试只会消耗预算并制造更多失败记录。先把失败码和证据写进
+            子 Issue，让 Leader 明确选择重派、换后端、请求人工，或判定目标不可恢复。
+          </p>
+        </div>
+
+        <h2 id="acceptance">验收：Run succeeded 不等于 Issue done</h2>
+        <p>
+          Issue 的 done 需要满足验收策略，而不是只看 Run 的终态。服务端在 Issue 转 done 前会走 acceptance guard；
+          Team 策略要求人工复核时，Leader 从任务里直接接受子 Issue 会被拒绝
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:117-132">service.go:117-132</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:238-240">service.go:238-240</span>。
+        </p>
+        <p>
+          人工验收要检查最终结果、重要来源和失败说明，再决定接受还是要求修改；Run 的
+          succeeded / partial_succeeded 不能单独证明业务目标已达成
+          <span class="src" data-src="docs/v2/zh/service/team-collaboration.md:50-53">team-collaboration.md:50-53</span>。
+          概览文档也要求：需要复核的工作保留人工验收，Team 可以用于 Issue、Automation 与 Endpoint，但更新团队后要验证新执行使用的是新成员配置
+          <span class="src" data-src="docs/v2/zh/service/teams.md:48-50">teams.md:48-50</span>。
+        </p>
+        <div class="callout tip">
+          <span class="ct">验收清单</span>
+          <ul>
+            <li>每个必要成员的结果都能在 Task map / 评论 / Artifact 里找到，而不是只在 Leader 的总结里出现</li>
+            <li>关键结论有来源或真实工具记录；没有验证的条件明确标出</li>
+            <li>失败与未完成项没有被「报告已生成」掩盖</li>
+            <li>人工验收的 Issue 仍在 Inbox 里等待决定，不因 Run 成功自动通过</li>
+          </ul>
+        </div>
+
+        <h2 id="cases">三种案例：同一套协作契约，不同的后端组合</h2>
+        <p>
+          官方三个案例正好覆盖三种极端组合。不要只记角色名，重点看每种组合在加入前需要验证什么。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>案例</th><th>后端组合</th><th>适合学什么</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>售前方案</strong></td>
+                <td>五个 Managed 起步，再扩 External 实时查询与 Hosted PoC 实施</td>
+                <td>混合团队如何围绕同一交付扩展；知识、实时能力与代码执行各自归谁<span class="src" data-src="docs/v2/zh/service/cases/presales-team.md:11-13">presales-team.md:11-13</span></td>
+              </tr>
+              <tr>
+                <td><strong>研发闭环</strong></td>
+                <td>Leader、Developer、Reviewer、QA 全部 Hosted</td>
+                <td>同一提交上的实现、Review、CI、返工与合并；GitHub 身份与 Hosted 身份分开<span class="src" data-src="docs/v2/zh/service/cases/sdlc-team.md:11-15">sdlc-team.md:11-15</span></td>
+              </tr>
+              <tr>
+                <td><strong>订单履约</strong></td>
+                <td>五个 Agent 全部 External，包括 Leader</td>
+                <td>跨订单、库存、物流、售后的业务系统协作；Service 负责目录、派发与观察<span class="src" data-src="docs/v2/zh/service/cases/order-fulfillment.md:11-13">order-fulfillment.md:11-13</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          三个案例都遵循同一条边界：Team 只负责组织与记录，真正的模型、工具、业务系统与权限仍在各后端。售前案例的
+          知识来自 Memory，实时能力来自 External 应用，代码执行来自 Hosted；研发案例的代码与 CI 在 GitHub；履约案例的
+          订单与库存规则在企业系统。把这些能力都写进 Leader 的 Instructions，不会让它们自动出现。
+        </p>
+
+        <h2 id="cheatsheet">速查：字段、默认值、状态与状态码</h2>
+        <p>先看建队与策略的「不填会怎样」：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>默认 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Team 状态</td><td>不传时 <code>active</code>；只接受 active / disabled</td><td><span class="src" data-src="agentscope-service/aistio/internal/httpapi/collaboration_handler.go:1560-1566">collaboration_handler.go:1560-1566</span></td></tr>
+              <tr><td>创建成功</td><td>201 Created</td><td><span class="src" data-src="agentscope-service/aistio/internal/httpapi/collaboration_handler.go:1621">collaboration_handler.go:1621</span></td></tr>
+              <tr><td>更新成功</td><td>200 OK，使用 <code>expectedVersion</code> 乐观锁</td><td><span class="src" data-src="agentscope-service/aistio/internal/httpapi/collaboration_handler.go:1715-1723">collaboration_handler.go:1715-1723</span></td></tr>
+              <tr><td><code>maxActiveTasks</code> 零值</td><td>32</td><td><span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:1084-1086">service.go:1084-1086</span></td></tr>
+              <tr><td><code>maxHops</code> 零值 / 上限</td><td>8 / 64</td><td><span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:50-51">service.go:50-51</span></td></tr>
+              <tr><td><code>maxChildDepth</code> 零值 / 上限</td><td>4 / 32</td><td><span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:50-51">service.go:50-51</span></td></tr>
+              <tr><td><code>maxFanout</code> 零值 / 上限</td><td>不限 / 256</td><td><span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:50-51">service.go:50-51</span></td></tr>
+              <tr><td>创建表单默认</td><td>32 / 8 / 8 / 8 / 64（并发 / fanout / hops / depth / child issues）</td><td><span class="src" data-src="agentscope-service/frontend/src/features/teams/TeamsOverviewPage.tsx:72">TeamsOverviewPage.tsx:72</span></td></tr>
+              <tr><td>运行策略校验</td><td><code>ordered</code> + 至少一个候选；fallback 只能是 disabled / fresh</td><td><span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:77-82">service.go:77-82</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>再看对象状态与常见阻断码：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>值</th><th>含义</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>queued</code></td><td>任务已创建，尚未派发</td><td>就绪度、运行策略、并发上限</td></tr>
+              <tr><td><code>dispatched</code> / <code>running</code></td><td>已交给后端或正在执行</td><td>后端状态、Attempt、租约</td></tr>
+              <tr><td><code>waiting</code></td><td>任务等待输入或协调节点等待成员</td><td>未处理输入、活跃 worker、子 Issue</td></tr>
+              <tr><td><code>max_hops_exceeded</code></td><td>委派链超过策略上限</td><td>是否形成环、<code>maxHops</code></td></tr>
+              <tr><td><code>active_task_budget_exceeded</code></td><td>同一 Issue / Team 的活跃任务已达上限</td><td><code>maxActiveTasks</code> 与未终态任务</td></tr>
+              <tr><td><code>target_not_in_team_snapshot</code></td><td>提及或委派给名单外 Agent</td><td>成员名单、<code>allowExternalDelegation</code></td></tr>
+              <tr><td><code>self_trigger</code></td><td>Agent 把结果路由回自己</td><td>结果评论的接收者与路由规则</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          状态与路由结果见
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/collaboration.go:183-202">collaboration.go:183-202</span>
+          与
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/collaboration.go:220-234">collaboration.go:220-234</span>；
+          路由阻断码见
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:740-780">service.go:740-780</span>。
+        </p>
+
+        <h2 id="pitfalls">六个坑：先看层级，再看配置</h2>
+        <p>
+          <strong>坑一：以为建了 Team 就会并行跑所有成员。</strong>Team 是动态决策器，Leader 只选择它认为需要的成员；
+          团队名单描述可用能力，不是固定执行图
+          <span class="src" data-src="docs/v2/zh/service/teams.md:34">teams.md:34</span>。
+          想每次固定运行某几个节点，应该用 Workflow。
+        </p>
+        <p>
+          <strong>坑二：把零值当成表单默认。</strong>零值下 <code>maxChildDepth</code> 是 4，创建表单却显式写 8；
+          <code>maxFanout</code> 零值不限，表单写 8。排障时看详情页实际策略，不要拿文档零值表硬套
+          <span class="src" data-src="docs/v2/zh/service/team-configuration.md:44">team-configuration.md:44</span>。
+        </p>
+        <p>
+          <strong>坑三：让不能协调的 Agent 当 Leader。</strong>Leader 要能委派、查看结果、完成 / 失败协调节点；
+          只会 Chat 的 Agent 不足以承担这些动作
+          <span class="src" data-src="docs/v2/zh/service/team-configuration.md:73">team-configuration.md:73</span>。
+          先把 Leader 单独跑通，再加成员。
+        </p>
+        <p>
+          <strong>坑四：假设成员共享文件系统。</strong>Managed Environment、Hosted 工作目录与 External 私有文件不会自动合并；
+          共享结果必须走 Issue、评论与 Artifact
+          <span class="src" data-src="docs/v2/zh/service/team-execution.md:47">team-execution.md:47</span>。
+          评论里写本地路径，不等于另一个成员能读到。
+        </p>
+        <p>
+          <strong>坑五：把 Run succeeded 当成 Issue done。</strong>Run 只代表执行图到达终态；人工验收的 Issue 仍要
+          在 Inbox 接受，策略要求复核时 Leader 也不能直接接受子 Issue
+          <span class="src" data-src="docs/v2/zh/service/team-collaboration.md:50-53">team-collaboration.md:50-53</span>。
+        </p>
+        <p>
+          <strong>坑六：用加成员解决「太慢」。</strong>增加并发前要检查共享文件冲突、工具副作用与预算；成员越多，
+          Leader 的路由与收敛成本越高
+          <span class="src" data-src="docs/v2/zh/service/team-collaboration.md:46">team-collaboration.md:46</span>。
+          先确认瓶颈在成员执行、Leader 决策还是后端排队。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>Team 建好以后，一次 Issue 会并行运行全部成员吗？</summary>
+          <p>
+            不会。控制面只创建一个协调节点和一份初始 Leader 任务，Leader 根据目标选择成员并委派；成员结果回到同一个
+            协调节点，再触发下一轮 Leader 决策
+            <span class="src" data-src="docs/v2/zh/service/team-execution.md:24-28">team-execution.md:24-28</span>。
+            团队名单是能力池，不是固定执行图。
+          </p>
+        </details>
+        <details>
+          <summary><code>maxActiveTasks</code> 留空，是不是表示不限制并发？</summary>
+          <p>
+            不是。零值会走默认 32；只有 <code>maxFanout</code>、<code>maxChildIssues</code> 与
+            <code>maxTaskRetries</code> 的零值才是「不加 Team 专属限制」
+            <span class="src" data-src="docs/v2/zh/service/team-configuration.md:30-40">team-configuration.md:30-40</span>。
+            另外，创建表单会显式写 32，而不是留空。
+          </p>
+        </details>
+        <details>
+          <summary>Run 显示 succeeded，是否可以直接把 Issue 标成 done？</summary>
+          <p>
+            不一定。Run 成功只说明执行图到达终态；Issue 的 done 还要过验收策略。人工验收的 Issue 需要人在 Inbox
+            接受，<code>requireReview</code> 也会阻止 Leader 直接从任务里接受子 Issue
+            <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:238-240">service.go:238-240</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：让一个三人团队完成一次带返工的调研</h2>
+        <p>目标不是「看到一次成功」，而是能解释每个结论来自哪个成员、哪次执行。建议 40 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先单独验证三个 Agent</span>
+            <div>准备 Leader、Researcher、Reviewer 三个 Agent，各自完成一次小任务。Researcher 要能给出带来源的事实，Reviewer 要能指出证据缺口；此时先不要建 Team。</div>
+          </li>
+          <li>
+            <span class="sh">建队并写清角色边界</span>
+            <div>选择 Leader，添加两个成员，分别写专项 Instructions。团队 Instructions 只写共同目标、交付格式与失败处理，不复制成员职责。</div>
+          </li>
+          <li>
+            <span class="sh">检查就绪度</span>
+            <div>记录 Team 的 readiness 与每个成员的原因。临时禁用一个成员，确认整队变为 Degraded；恢复后再确认回到 Ready。</div>
+          </li>
+          <li>
+            <span class="sh">用一个小 Issue 启动</span>
+            <div>创建「比较两种部署方案，给出带来源的结论」Issue，选择 Team。观察是否只创建了一个协调节点，以及 Leader 是否按需委派而不是一次叫齐所有人。</div>
+          </li>
+          <li>
+            <span class="sh">制造一次返工</span>
+            <div>让 Reviewer 指出一个来源缺口。确认 Leader 收到结果后安排修订，而不是把 Reviewer 的评论直接当成最终交付；记录 Task map 上新增或重试的任务。</div>
+          </li>
+          <li>
+            <span class="sh">验证策略边界</span>
+            <div>把 <code>maxChildIssues</code> 设成 1，尝试让 Leader 创建第二个子 Issue，确认出现预算错误；再恢复策略。记录错误来自路由、子 Issue 还是执行阶段。</div>
+          </li>
+          <li>
+            <span class="sh">验证收敛与验收</span>
+            <div>等协调节点完成后，检查根 Issue 是否进入 in_review；在 Inbox 接受或要求修改。确认 Run 终态与 Issue 状态是两个独立事实。</div>
+          </li>
+          <li>
+            <span class="sh">可选：混合一个 Hosted 成员</span>
+            <div>把一个成员换成 Hosted Agent，先单独验证它的任务与协作工具，再重新跑同一个小 Issue。对照第 23 章确认 Host 在线、provider 可用与能力映射。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          到这里，Team 的四个层次已经拆开：Issue 保存目标与验收，Run / Node 保存协作拓扑，AgentTask 表示工作义务，
+          Attempt 表示一次真实执行。Team 的动态性来自 Leader 每回合的评估，而不是成员数量。
+        </p>
+        <p>
+          下一章看 <strong>Workflow、自动化与 Issue 闭环</strong>：当步骤顺序、条件分支和人工关口必须提前确定时，
+          应该把动态 Team 放进声明式外壳，而不是继续往 Leader 指令里堆规则。那一章会把「谁在什么时候运行」
+          从模型决策变成可验证的图。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方「Team：概览与创建」</td><td>建队、就绪度、试运行与发布的总览<span class="src" data-src="docs/v2/zh/service/teams.md:10-50">teams.md:10-50</span></td></tr>
+              <tr><td>官方「Team 协作：委派、汇总与扩展」</td><td>角色设计、持久沟通、策略与验收<span class="src" data-src="docs/v2/zh/service/team-collaboration.md:10-52">team-collaboration.md:10-52</span></td></tr>
+              <tr><td>官方「Team 角色、成员与策略参数」</td><td>字段表、零值语义与运行策略<span class="src" data-src="docs/v2/zh/service/team-configuration.md:12-79">team-configuration.md:12-79</span></td></tr>
+              <tr><td>官方「Team 工作原理与结果收敛」</td><td>快照、对象分层、结束与恢复<span class="src" data-src="docs/v2/zh/service/team-execution.md:10-59">team-execution.md:10-59</span></td></tr>
+              <tr><td><a href="23-hosted-agent.html">23 Hosted Agent 与 Runtime Host</a></td><td>混合团队里 Hosted 成员的接入、能力与恢复</td></tr>
+              <tr><td><a href="22-external-agent.html">22 External Agent</a></td><td>混合团队里 External 成员的任务入口与回报</td></tr>
+              <tr><td><a href="14-subagent-team.html">14 子 Agent 与团队</a></td><td>Harness 本地 TeamTool、任务板与邮箱的实现细节</td></tr>
+              <tr><td><a href="../appendix/errors.html">附录 B · 报错速查</a></td><td>400 / 409 与常见路由阻断码的排查顺序</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的 Team 文档在 2.0.4 仓库里仍带「预览」提示<span
+            class="src"
+            data-src="docs/v2/zh/service/teams.md:6-8"
+            >teams.md:6-8</span
+          >。凡文档与实现有出入的地方（例如零值与创建表单默认值、设计契约与当前收敛逻辑），正文都以源码为准并标了出来。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

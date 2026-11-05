@@ -1,0 +1,1001 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 11 章那个笔记 Agent 里，工具是自己写 Files.writeString 的——路径、权限、并发全靠你。HarnessAgent 不这么干：它把「读文件、写文件、跑命令」收敛成一个 AbstractFilesystem 接口，然后在上面叠了三层东西——路径边界、两层合并、后端实现。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="12 工作区与文件系统：agent 的手能伸到哪 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 11 章那个笔记 Agent 里，工具是自己写 Files.writeString 的——路径、权限、并发全靠你。HarnessAgent 不这么干：它把「读文件、写文件、跑命令」收敛成一个 AbstractFilesystem 接口，然后在上面叠了三层东西——路径边界、两层合并、后端实现。" />
+    <title>12 工作区与文件系统：agent 的手能伸到哪 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="12-workspace-filesystem" data-root="..">
+    <main>
+      <article class="article">
+        <h1>12 · 工作区与文件系统：agent 的手能伸到哪</h1>
+        <p class="lede">
+          第 11 章那个笔记 Agent 里，工具是自己写 <code>Files.writeString</code> 的——路径、权限、并发全靠你。
+          <code>HarnessAgent</code> 不这么干：它把「读文件、写文件、跑命令」收敛成一个
+          <code>AbstractFilesystem</code> 接口，然后在上面叠了<strong>三层东西</strong>——路径边界、两层合并、后端实现。
+          换部署模式（本机 / 共享存储 / 沙箱）只改一行 <code>filesystem(...)</code>，模型看到的工具名一个都不变。
+          这一章把这三层拆开，每个默认值都对到 2.0.4 的行号上。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 <code>.filesystem(...)</code> 的四种写法各自的产物是什么对象，不写的时候默认拿到哪一个</li>
+          <li>判断一次 <code>write_file("note.txt")</code> 到底落在磁盘哪个位置：namespace 前缀、overlay 上层、PathPolicy 各管哪一段</li>
+          <li>解释 overlay 的 copy-on-write：为什么读得到项目里的文件、写却永远进 workspace，删下层文件为什么会失败</li>
+          <li>用 <code>LocalFsMode</code> + <code>PathPolicy</code> 把 agent 能碰的宿主目录收紧到白名单，并知道 <code>/note.txt</code> 这种写法为什么没出 workspace</li>
+          <li>排查「AGENTS.md 没被注入」「workspace 上下文被截断」「@path 没展开」这三类问题的定位顺序</li>
+        </ul>
+
+        <h2 id="why">先说为什么：为什么「手」要单独做一层</h2>
+        <p>
+          官方给的理由是一句话：所有文件工具和可选的 <code>execute</code> 都从同一个抽象走，于是能在三种部署模式之间切换而不改
+          agent 代码<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:9">filesystem.md:9</span>。
+          但这句话背后其实有三个互相独立的关注点，混在一起写就会变成一坨 if：
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">工具层：模型看到的世界</span>
+            <div class="ld">
+              <code>read_file</code> / <code>write_file</code> / <code>edit_file</code> / <code>grep_files</code> /
+              <code>glob_files</code> / <code>list_files</code>，外加可选的 <code>execute</code>。它们只认
+              <code>AbstractFilesystem</code> 的 11 个方法<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:111"
+                >FilesystemTool.java:111</span
+              >。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">边界层：这只手能够到多远</span>
+            <div class="ld">
+              <code>LocalFsMode</code> 决定绝对路径怎么解释，<code>PathPolicy</code> 是绝对路径的白名单，
+              <code>NamespaceFactory</code> 决定相对路径前面加不加 <code>alice/</code>。<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/PathPolicy.java:99"
+                >PathPolicy.java:99</span
+              >
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">合并层：两份根目录怎么变成一份视图</span>
+            <div class="ld">
+              <code>OverlayFilesystem</code>（workspace 盖住 project）、<code>CompositeFilesystem</code>（按前缀路由到
+              KV）、<code>ProjectAwareOverlay</code>（写按路径类型分流）。
+            </div>
+          </div>
+          <div class="layer">
+            <span class="lt">后端层：字节真正存在哪</span>
+            <div class="ld">
+              <code>LocalFilesystem</code> / <code>LocalFilesystemWithShell</code> /
+              <code>RemoteFilesystem</code>（KV）/ <code>SandboxBackedFilesystem</code>（容器）。沙箱那一族在第 13 章。
+            </div>
+          </div>
+        </div>
+        <div class="callout">
+          <span class="ct">最关键的分工：路径是「字符串」，不是「磁盘位置」</span>
+          <p>
+            <code>AbstractFilesystem</code> 的每个方法第一个参数都是 <code>RuntimeContext</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:44"
+              >AbstractFilesystem.java:44</span
+            >，因为<strong>同一个字符串路径在不同 userId 下指向不同位置</strong>。这跟第 07 章「状态按 sessionId
+            分槽位」是同一个设计：身份从上下文来，不从全局字段来。所以你自己实现一个 filesystem 时，千万不要把它存成实例字段。
+          </p>
+        </div>
+
+        <h2 id="minimal">最小可跑：一个 workspace + 两个用户</h2>
+        <p>
+          下面这段是官方示例 <code>WorkspaceLocalShellExample</code> 的核心，去掉了打印部分<span
+            class="src"
+            data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/harness/workspace/WorkspaceLocalShellExample.java:58"
+            >WorkspaceLocalShellExample.java:58</span
+          >。它是「模式 3：本机 + shell」的显式写法：
+        </p>
+        <pre data-lang="java" data-file="WorkspaceLocalShellExample（节选）">Path workspace = Files.createTempDirectory("agentscope-local-fs-example");
+
+Files.writeString(
+        workspace.resolve("AGENTS.md"),
+        """
+        # Local Shell Agent
+
+        You are a helpful assistant that can execute shell commands.
+        Keep answers concise (under two sentences).
+        """);
+
+HarnessAgent agent =
+        HarnessAgent.builder()
+                .name("local-shell-agent")
+                .sysPrompt("You are a helpful assistant with shell access.")
+                .model("dashscope:qwen-plus")
+                .workspace(workspace)
+                .filesystem(
+                        new LocalFilesystemSpec()
+                                .executeTimeoutSeconds(30)
+                                .env("EXAMPLE_VAR", "hello-from-agentscope")
+                                .inheritEnv(true))
+                .build();
+
+RuntimeContext aliceCtx = RuntimeContext.builder().userId("alice").sessionId("alice-s1").build();
+agent.streamEvents(new UserMessage("Run 'echo $EXAMPLE_VAR' and show the output."), aliceCtx)
+        .blockLast();
+
+RuntimeContext bobCtx = RuntimeContext.builder().userId("bob").sessionId("bob-s1").build();
+agent.call(new UserMessage("Write 'hello bob' to a file named note.txt."), bobCtx).block();</pre>
+        <p>跑完之后把 workspace 的目录树打印出来，你会看到两件「没人写过」的事：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">AGENTS.md 在根上，bob 的 note.txt 不在</span>
+            <div>
+              bob 说的是 <code>note.txt</code>（相对路径），实际落点是
+              <code>workspace/bob/note.txt</code>。原因是默认的 <code>IsolationScope.USER</code> 给相对路径加了
+              <code>bob/</code> 前缀<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/IsolationScope.java:102">IsolationScope.java:102</span>；而
+              <code>AGENTS.md</code> 是 <code>WorkspaceManager</code> 用工作区根直接读的模板<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:251"
+                >WorkspaceManager.java:251</span
+              >，不走 namespace。
+            </div>
+          </li>
+          <li>
+            <span class="sh">bob 看不见 alice 的文件，但模型不知道自己少看了什么</span>
+            <div>
+              <code>list_files</code> 会把 namespace 前缀剥掉再报给模型<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:761"
+                >LocalFilesystem.java:761</span
+              >，所以两个用户各自看到的都是「根目录里只有我的东西」。这是特性不是 bug——提示词里不用解释「你的文件在
+              <code>/bob/</code> 下」。
+            </div>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <span class="ct">不写 filesystem(...) 也一样能跑</span>
+          <p>
+            把上面那五行 <code>.filesystem(new LocalFilesystemSpec()...)</code> 整段删掉，行为只变三点：filesystem
+            层的默认 shell 超时回到 120 秒<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystemWithShell.java:55">LocalFilesystemWithShell.java:55</span>、
+            不继承父进程环境变量、<code>EXAMPLE_VAR</code> 不存在<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:54"
+              >LocalFilesystemSpec.java:54</span
+            >。而示例里写的 <code>executeTimeoutSeconds(30)</code> 其实<strong>改不动模型的体验</strong>：
+                        <code>execute</code> 工具总会自己传一个非 null 的秒数（没填就是 30），filesystem 只在拿到
+                        <code>null</code> 时才用自己那个默认值<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:78">ShellExecuteTool.java:78</span><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystemWithShell.java:327">LocalFilesystemWithShell.java:327</span>。
+                        因为「不写」和「写一个默认的 <code>LocalFilesystemSpec</code>」走的是同一行代码<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:167"
+              >HarnessAgentBuilderSupport.java:167</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="resolve">入口：resolveFilesystem 的四条分支</h2>
+        <p>
+          不管你写没写 <code>filesystem(...)</code>，最终都从这一个静态方法出来，优先级从上到下短路<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:147"
+            >HarnessAgentBuilderSupport.java:147</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>顺序</th><th>条件</th><th>返回</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>1</td><td><code>abstractFilesystem != null</code></td><td>原样返回你给的对象，框架不做任何包装</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:153">:153</span></td></tr>
+              <tr><td>2</td><td><code>remoteFilesystemSpec != null</code></td><td>先把 <code>workspaceIndex</code> 注进去，再 <code>toFilesystem(workspace, agentId, nsFactory)</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:156">:156</span></td></tr>
+              <tr><td>3</td><td><code>localFilesystemSpec != null</code></td><td><code>toFilesystem(workspace, nsFactory)</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:162">:162</span></td></tr>
+              <tr><td>4</td><td>三个都没写</td><td><code>new LocalFilesystemSpec().toFilesystem(...)</code>，即 <code>project = ${user.dir}</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:167">:167</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          沙箱分支在这四步<strong>之后</strong>：因为 <code>specCount</code> 互斥校验保证配了沙箱 spec 时前三个字段都是
+          null，所以 <code>resolveFilesystem</code> 走的是第 4 条（一个默认本地 overlay），紧接着
+          <code>build()</code> 就把这个返回值整个丢弃、换成 <code>SandboxBackedFilesystem</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2450"
+            >HarnessAgent.java:2450</span
+          >。读源码时别被骗——那一次构造是纯粹的浪费，不影响行为。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>build() 里的校验</th><th>触发条件</th><th>后果</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>三个 spec 只能有一个<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2366">HarnessAgent.java:2366</span></td>
+                <td>同时传了 <code>DockerFilesystemSpec</code> 和 <code>RemoteFilesystemSpec</code></td>
+                <td><code>IllegalStateException: At most one of sandboxFilesystemSpec, remoteFilesystemSpec, localFilesystemSpec may be configured</code></td>
+              </tr>
+              <tr>
+                <td>逃生口互斥<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2371">:2371</span></td>
+                <td><code>abstractFilesystem(...)</code> 与任意 spec 同时出现</td>
+                <td><code>IllegalStateException: abstractFilesystem() is an escape hatch and is mutually exclusive with filesystem(...) specs</code></td>
+              </tr>
+              <tr>
+                <td>共享存储必须配分布式状态<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431">:2431</span></td>
+                <td><code>RemoteFilesystemSpec</code> + <code>JsonFileAgentStateStore</code>（默认）</td>
+                <td>直接抛异常。注意沙箱模式<strong>同样条件只 log.warn</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2459">:2459</span></td>
+              </tr>
+              <tr>
+                <td>workspace 路径不能空白<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1794">:1794</span></td>
+                <td><code>.workspace("  ")</code></td>
+                <td><code>IllegalArgumentException: workspace path must not be blank</code><br /><a href="../appendix/errors.html#err-workspace-blank">附录 B · 完整条目</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="modes">三种模式对照</h2>
+        <p>官方文档把它们编号成模式 1 / 2 / 3<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:21">filesystem.md:21</span>，源码里的对应关系如下（shell 一列是重点）：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模式</th><th>声明</th><th>build 完拿到的对象</th><th>提供 shell？</th><th>isolationScope 实际默认</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1 共享存储</td>
+                <td><code>filesystem(new RemoteFilesystemSpec(store))</code></td>
+                <td><code>CompositeFilesystem</code>（默认后端是 <code>LocalFilesystem</code>）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/RemoteFilesystemSpec.java:285">RemoteFilesystemSpec.java:285</span></td>
+                <td>❌ 故意不支持<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/CompositeFilesystem.java:46">CompositeFilesystem.java:46</span></td>
+                <td>字段就是 <code>USER</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/RemoteFilesystemSpec.java:80">:80</span></td>
+              </tr>
+              <tr>
+                <td>2 沙箱</td>
+                <td><code>filesystem(new DockerFilesystemSpec()...)</code> 等</td>
+                <td><code>SandboxBackedFilesystem</code>（有路由则 <code>RoutedSandboxFilesystem</code>）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2451">HarnessAgent.java:2451</span></td>
+                <td>✅ 在沙箱内</td>
+                <td>字段是 <code>null</code> → <code>build()</code> 落 <code>USER</code></td>
+              </tr>
+              <tr>
+                <td>3 本机 + shell（默认）</td>
+                <td><code>filesystem(new LocalFilesystemSpec()...)</code> 或不写</td>
+                <td><code>ShellAwareOverlay</code>（<code>OverlayFilesystem</code> 的私有子类）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:104">OverlayFilesystem.java:104</span></td>
+                <td>✅ 宿主 <code>sh -c</code></td>
+                <td>字段是 <code>null</code> → <code>build()</code> 落 <code>USER</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:63">LocalFilesystemSpec.java:63</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「字段是 null」这件事很值得记：三种 spec 的 <code>isolationScope</code> 字段默认值并不统一（remote 直接是
+          <code>USER</code>，local 与 sandbox 是 <code>null</code>），真正生效的地方是
+          <code>build()</code> 里那段 if-else 链，起点写死 <code>IsolationScope.USER</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2415"
+            >HarnessAgent.java:2415</span
+          >。所以任何 spec 的 scope 没设，结果都是 <code>USER</code>。
+        </p>
+        <h3 id="local-fs-defaults">模式 3 的 LocalFilesystemSpec 全部默认值</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>默认值</th><th>出处</th><th>备注</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>executeTimeoutSeconds(int)</code></td><td><code>LocalFilesystemWithShell.DEFAULT_EXECUTE_TIMEOUT</code> = 120</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:51">:51</span></td><td>≤ 0 抛 <code>IllegalArgumentException: timeout must be positive</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:119">:119</span>；只在调用方传 <code>null</code> timeout 时生效，模型走 <code>execute</code> 时恒为工具层的 30<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:78">ShellExecuteTool.java:78</span></td></tr>
+              <tr><td><code>maxOutputBytes(int)</code></td><td>100_000</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:52">:52</span></td><td>单条命令最多捕获这么多字节</td></tr>
+              <tr><td><code>inheritEnv(boolean)</code></td><td><code>false</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:54">:54</span></td><td>关了就只有 <code>env(...)</code> 显式加的变量可见</td></tr>
+              <tr><td><code>mode(LocalFsMode)</code></td><td><code>ROOTED</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:61">:61</span></td><td>null 传入抛 <code>mode must not be null</code></td></tr>
+              <tr><td><code>project(Path)</code></td><td><code>null</code>，到 <code>toFilesystem</code> 才换成 <code>${user.dir}</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:75">:75</span></td><td>既是 overlay 下层，也是 shell 的 <code>pwd</code></td></tr>
+              <tr><td><code>projectWritable(boolean)</code></td><td><code>false</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:93">:93</span></td><td>开了换成 <code>ProjectAwareOverlay</code></td></tr>
+              <tr><td><code>sharedLocalWorkspace(boolean)</code></td><td><code>false</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:110">:110</span></td><td>开了直接丢掉 namespace 前缀，<strong>多租户下不安全</strong></td></tr>
+              <tr><td><code>addRoot(Path)</code> / <code>additionalRoots(Collection)</code></td><td>空列表</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:325">:325</span></td><td>后者是整体替换，不是追加</td></tr>
+              <tr><td><code>virtualMode(boolean)</code></td><td>已 <code>@Deprecated</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:176">:176</span></td><td><code>true→SANDBOXED</code>，<code>false→UNRESTRICTED</code>，够不到 ROOTED</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>toFilesystem</code> 里真正拼出来的是两件套：上层
+          <code>LocalFilesystemWithShell(workspace, mode, pathPolicy, ...)</code>，下层
+          <code>new LocalFilesystem(effectiveProject, true, 10, null)</code>（<code>true</code> = legacy
+          virtualMode → <code>SANDBOXED</code>，只读），<code>PathPolicy</code> 的白名单恰好是
+          <code>project + workspace + additionalRoots</code> 三段<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:318"
+            >LocalFilesystemSpec.java:318</span
+          >。
+        </p>
+
+        <h2 id="family">后端族：AbstractFilesystem 的 11 个方法</h2>
+        <p>
+          它是接口不是抽象类，方法集合非常克制——注意<strong>没有 rename 之外的删除语义</strong>，也
+          <strong>没有 chmod / 权限位</strong>：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>契约里写明的事</th><th>行号</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>ls(rc, path)</code></td><td>path 必须以 <code>/</code> 开头（接口注释如此，实现其实更宽松）</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:53">:53</span></td></tr>
+              <tr><td><code>read(rc, filePath, offset, limit)</code></td><td>javadoc 说 offset 默认 0、<strong>limit 默认 2000</strong></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:64">:64</span></td></tr>
+              <tr><td><code>write(rc, filePath, content)</code></td><td><strong>文件已存在就报错</strong>，不是覆盖</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:74">:74</span></td></tr>
+              <tr><td><code>edit(rc, filePath, old, new, replaceAll)</code></td><td><code>oldString</code> 不唯一时要求 <code>replaceAll=true</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:86">:86</span></td></tr>
+              <tr><td><code>grep(rc, pattern, path, glob)</code></td><td>pattern 是<strong>字面量</strong>不是正则（底层给 <code>rg -F</code>）</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:102">:102</span></td></tr>
+              <tr><td><code>glob(rc, pattern, path)</code></td><td>path 默认 <code>"/"</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:112">:112</span></td></tr>
+              <tr><td><code>uploadFiles / downloadFiles</code></td><td>批量字节数组，返回 list 与输入<strong>同序</strong></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:121">:121</span></td></tr>
+              <tr><td><code>delete(rc, path)</code></td><td>幂等：删不存在的路径算成功</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:142">:142</span></td></tr>
+              <tr><td><code>move(rc, from, to)</code></td><td>跨后端时允许退化成 read + write + delete</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:156">:156</span></td></tr>
+              <tr><td><code>exists(rc, path)</code></td><td>允许用「读一小段」近似实现，但别读全文</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:168">:168</span></td></tr>
+              <tr><td><code>static validatePath(path)</code></td><td>唯一的静态工具：只拦空白和 <strong><code>..</code> 段</strong></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:178">:178</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="ct"><code>validatePath</code> 不是安全边界</span>
+          <p>
+            它只做两件事：非空白、逐段（<code>\</code> 会被换成 <code>/</code>）里没有
+            <code>..</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:182">AbstractFilesystem.java:182</span>。
+            符号链接、Windows 短名、URL 编码都不管。真正的边界是 <code>LocalFsMode</code> +
+            <code>PathPolicy</code>（下一节）。所以「我调了 validatePath 就安全了」这个结论是错的。
+          </p>
+        </div>
+
+        <h2 id="layering">合并层：读是并集，写是单层</h2>
+        <h3 id="overlay-fs">OverlayFilesystem（模式 3 与模式 1 的每一条路由都用它）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>操作</th><th>行为</th><th>行号</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>ls</code></td><td>上下两层都查，按路径做并集，<strong>上层同名条目覆盖下层</strong>；两边都失败才返回错误</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:139">:139</span></td></tr>
+              <tr><td><code>read</code></td><td>上层 <code>exists</code> 就走上层，否则走下层</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:162">:162</span></td></tr>
+              <tr><td><code>write</code></td><td><strong>永远写上层</strong>，下层从不被修改</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:170">:170</span></td></tr>
+              <tr><td><code>edit</code></td><td>上层有就直接改；只有下层有则先整份读上来 <code>write</code> 到上层，再在上层改（copy-on-write）</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:175">:175</span></td></tr>
+              <tr><td><code>delete</code></td><td>上层有则删上层；<strong>只有下层有 → 返回失败 <code>Cannot delete shared file</code></strong></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:263">:263</span></td></tr>
+              <tr><td><code>move</code></td><td>下层来源会被复制成上层的新文件（下层原件仍在）</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:274">:274</span></td></tr>
+              <tr><td><code>exists</code></td><td>上层 <code>||</code> 下层</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:289">:289</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>OverlayFilesystem.of(upper, lower)</code> 有个容易漏看的分支：当 upper
+          <code>instanceof AbstractSandboxFilesystem</code> 时，返回的是私有子类
+          <code>ShellAwareOverlay</code>，它把 <code>execute()</code> 和 <code>id()</code> 委托给上层，同时保留
+          <code>AbstractSandboxFilesystem</code> 这个类型<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:116"
+            >OverlayFilesystem.java:116</span
+          >。<strong>这就是默认模式下 shell 工具还能装上的原因</strong>：<code>build()</code> 里判断的是
+          <code>filesystem instanceof AbstractSandboxFilesystem</code>，而 overlay 伪装成功了<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2722"
+            >HarnessAgent.java:2722</span
+          >。
+        </p>
+        <h3 id="composite-fs">CompositeFilesystem（模式 1 的外壳）</h3>
+        <ol class="steps">
+          <li>
+            <span class="sh">最长前缀优先</span>
+            <div>
+              构造时把路由按前缀长度<strong>倒序</strong>排好<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/CompositeFilesystem.java:89">:89</span>，所以
+              <code>agents/x/sessions/</code> 会先于 <code>memory/</code> 之类被匹配；都不匹配才落到默认后端。
+            </div>
+          </li>
+          <li>
+            <span class="sh">两边都剥掉开头的 <code>/</code> 再比</span>
+            <div>
+              这样 <code>/skills/foo</code>（接口约定）和 <code>skills/foo</code>（<code>WorkspaceManager</code>
+              的写法）路由到同一个后端<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/CompositeFilesystem.java:108">:108</span>；
+              返回给调用方时再用 <code>prependRoute</code> 拼回去<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/CompositeFilesystem.java:152">:152</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">ls("/") 会伪造目录条目</span>
+            <div>
+              列根目录时，除了默认后端的真实条目，还会把每条路由前缀变成一个目录项<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/CompositeFilesystem.java:205"
+                >:205</span
+              >；精确文件路由（如 <code>AGENTS.md</code>）只在后端真的存在时才冒出来<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/CompositeFilesystem.java:212">:212</span>。
+              所以模式 1 下 <code>list_files("/")</code> 看到的 <code>memory/</code>、<code>skills/</code>
+              是<strong>一定存在的</strong>，哪怕 KV 里一条数据都没有。
+            </div>
+          </li>
+          <li>
+            <span class="sh">就是不给 shell</span>
+            <div>
+              类注释直接写了理由：跨多个 store 路由命令语义不清，而这种模式的主场景（分布式记忆）不需要它<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/CompositeFilesystem.java:46"
+                >:46</span
+              >。要 shell 请用沙箱或 <code>LocalFilesystemWithShell</code>。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="policy">边界层：PathPolicy 与 LocalFsMode</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模式</th><th>绝对路径</th><th>相对路径</th><th>定位</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>SANDBOXED</code></td><td>剥掉 Windows 盘符后<strong>重新锚定到 root</strong>，所以 <code>/etc/passwd</code> 变成 <code>&lt;root&gt;/etc/passwd</code></td><td>锚到 root</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:609">LocalFilesystem.java:609</span></td></tr>
+              <tr><td><code>ROOTED</code>（默认）</td><td>只有落在 <code>cwd</code> 或 <code>PathPolicy</code> 白名单内才放行</td><td>锚到 root</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:633">:633</span></td></tr>
+              <tr><td><code>UNRESTRICTED</code></td><td>原样透传</td><td>锚到 root</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:681">:681</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><code>LocalFsMode</code> 的三值定义在工作区包里<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/LocalFsMode.java:38">LocalFsMode.java:38</span>。真正烧脑的是 <code>ROOTED</code> 的判定顺序，把 <code>resolveRooted</code> 拆成四步：</p>
+        <ul class="timeline">
+          <li><span class="who">先 validatePath</span><div class="what">空白字符和 <code>..</code> 段直接 <code>IllegalArgumentException</code>，而不是 <code>SecurityException</code>。<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:634">:634</span></div></li>
+          <li><span class="who">绝对路径先放行</span><div class="what">normalize 之后 <code>startsWith(cwd)</code> 或 <code>pathPolicy.isAllowed(...)</code> 命中就返回。注意 <code>PathPolicy.isAllowed</code> <strong>对相对路径一律返回 false</strong>，所以白名单只服务于绝对路径。<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/PathPolicy.java:99">PathPolicy.java:99</span></div></li>
+          <li><span class="who">不在白名单：看磁盘在不在</span><div class="what">目标<strong>真实存在</strong> → 抛 <code>Absolute path ... is not within an allowed root</code>；不存在且输入不是以 <code>/</code> 开头 → 同样抛。<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:641">:641</span></div></li>
+          <li><span class="who">以 / 开头但不存在 → 当相对路径处理</span><div class="what">把前导 <code>/</code> 剥掉，<code>cwd.resolve(stripped)</code>。于是 <code>/etc/whatever</code> 在文件不存在时会被解析成 <code>&lt;workspace&gt;/etc/whatever</code> 并<strong>允许写</strong>。<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:649">:649</span></div></li>
+        </ul>
+        <div class="callout tip">
+          <span class="ct">最后一行不是漏洞，是「工具里的 path 更像 URL」这个约定的代价</span>
+          <p>
+            接口的 javadoc 说路径「must start with '/'」<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:59"
+              >AbstractFilesystem.java:59</span
+            >，而 <code>ROOTED</code> 为了同时支持「<code>/src/Main.java</code> 表示工作区内的相对路径」和「<code>D:\proj\x</code>
+            表示宿主绝对路径」才做这套两难判定。实践中记住一句：<strong>想让模型写宿主绝对路径，就必须把它放进
+            <code>addRoot(...)</code></strong>；否则模型写的 <code>/xxx</code> 只会落在 workspace 里，看起来像「没生效」。
+          </p>
+        </div>
+        <p>
+          namespace 前缀只加在<strong>相对路径</strong>上：如果传入的字符串看起来是绝对路径（Unix 的
+          <code>/</code>、Windows 的 <code>C:\</code> 与 UNC 的 <code>\\</code>），<code>applyNamespacePrefix</code>
+          会原样返回<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:689">LocalFilesystem.java:689</span>。
+          所以 <code>workspace/alice/note.txt</code>（相对）和 <code>/absolute/path</code> 是两套语义，别混。
+        </p>
+
+        <h2 id="manager">WorkspaceManager：两层读，但写只有一条路</h2>
+        <p>
+          <code>WorkspaceManager</code> 不是文件系统，它是文件系统<strong>之上的</strong>那层「我知道 AGENTS.md 在哪、
+          memory 目录在哪」的业务门面。它的读和写不对称，是这一章最容易踩的地方：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>动作</th><th>源码事实</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>读</td>
+                <td>先走 filesystem，<strong>返回内容为空字符串</strong>就回落到本地磁盘 <code>workspace.resolve(rel)</code>。判据是「空」不是「失败」。</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:818">WorkspaceManager.java:818</span></td>
+              </tr>
+              <tr>
+                <td>写</td>
+                <td>注释一句话：<em>All writes go through the filesystem.</em> 只有 <code>filesystem == null</code> 时才写本地临时文件 + <code>ATOMIC_MOVE</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:710">:710</span></td>
+              </tr>
+              <tr>
+                <td>校验</td>
+                <td><code>validate()</code> 只 <code>log.warn</code>，<strong>一个目录都不创建</strong>；缺 AGENTS.md 也只是警告</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:202">:202</span></td>
+              </tr>
+              <tr>
+                <td>并发</td>
+                <td><code>pathLocks</code> 明确写了「in-process lock only」，跨副本是 last-writer-wins，真正的 CAS 在 <code>BaseStore#putIfVersion</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:110">:110</span></td>
+              </tr>
+              <tr>
+                <td>相对路径安全</td>
+                <td>每个入口先过 <code>requireSafeRelativePath</code>，它转手就调 <code>AbstractFilesystem.validatePath</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:926">:926</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>还有一处不对称，很容易让人写出「换个模式就找不到文件」的代码：</p>
+        <div class="compare">
+          <div class="col">
+            <h4>带 namespace 的目录</h4>
+            <ul>
+              <li><code>getMemoryDir(rc)</code> → <code>resolveRuntimeDataPath(rc, "memory")</code></li>
+              <li>运行时数据：会话、任务、每日记忆</li>
+              <li>同一逻辑路径按 userId 分桶</li>
+            </ul>
+          </div>
+          <div class="col">
+            <h4>不带 namespace 的目录</h4>
+            <ul>
+              <li><code>getSkillsDir()</code>、<code>getKnowledgeDir()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:288">WorkspaceManager.java:288</span></li>
+              <li>静态资产：技能、知识库、AGENTS.md</li>
+              <li>设计成全体用户共享一份模板</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          工作区里那几个常量全在一个 final 类里<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceConstants.java:23"
+            >WorkspaceConstants.java:23</span
+          >：<code>DEFAULT_WORKSPACE_ROOT = ".agentscope/workspace"</code>、<code>AGENTS.md</code> /
+          <code>MEMORY.md</code> / <code>tools.json</code>、<code>memory</code> / <code>skills</code> /
+          <code>knowledge</code> / <code>rules</code>、<code>agents</code> / <code>sessions</code> /
+          <code>tasks</code>，以及会话文件的两种扩展名：<code>.jsonl</code>（给模型看、会被压缩）与
+          <code>.log.jsonl</code>（全量、只追加、永不压缩）<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceConstants.java:45"
+            >WorkspaceConstants.java:45</span
+          >。默认根目录的解析顺序是系统属性 <code>agentscope.workspace</code> → 环境变量
+          <code>AGENTSCOPE_WORKSPACE</code> → 字面量默认值<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1166"
+            >HarnessAgent.java:1166</span
+          >。
+        </p>
+        <div class="callout">
+          <span class="ct">workspaceFor(userId, sessionId)：给宿主应用开的后门</span>
+          <p>
+            <code>build()</code> 会造一个 <code>workspaceFactoryFn</code>，它把 <code>uid/sid</code> 烤进一个
+            <code>RuntimeContext</code>，再用 <code>BakedContextFilesystem</code> 包住主 filesystem，使得<strong>调用方传的
+            上下文无法覆盖</strong>这个身份<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2492">HarnessAgent.java:2492</span>。
+            UI 想直接读 agent 写的文件时用它，不要自己 <code>Files.read</code>。
+          </p>
+        </div>
+
+        <h2 id="isolation">IsolationScope：谁和谁共用同一份</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Scope</th><th>toNamespaceFactory() 得到的前缀</th><th>RemoteFilesystemSpec 的 KV 命名空间</th><th>缺字段时</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>USER</code>（默认）</td><td><code>List.of(userId)</code></td><td><code>agents/&lt;agentId&gt;/users/&lt;uid&gt;/&lt;route&gt;</code></td><td>退到 sessionId；都没有 → 空前缀<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/IsolationScope.java:104">IsolationScope.java:104</span></td></tr>
+              <tr><td><code>SESSION</code></td><td><code>List.of(sessionId)</code></td><td><code>agents/&lt;agentId&gt;/sessions/&lt;sid&gt;/&lt;route&gt;</code></td><td>sid 为空 → 空前缀；KV 侧兜 <code>"default"</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/RemoteFilesystemSpec.java:339">RemoteFilesystemSpec.java:339</span></td></tr>
+              <tr><td><code>AGENT</code></td><td><code>List.of()</code>（不加前缀）</td><td><code>agents/&lt;agentId&gt;/shared/&lt;route&gt;</code></td><td>不会降级<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/IsolationScope.java:124">IsolationScope.java:124</span></td></tr>
+              <tr><td><code>GLOBAL</code></td><td><code>List.of()</code></td><td><code>global/&lt;route&gt;</code></td><td>同上，慎用</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>userId</code> 为空时 KV 侧的兜底标识是 <code>anonymousUserId</code>，默认
+          <code>"_default"</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/RemoteFilesystemSpec.java:79">RemoteFilesystemSpec.java:79</span>。
+          另外注意 <code>IsolationScope</code> 的注释里一句话：沙箱模式下它是<strong>顺序复用</strong>，不是实例共享——同
+          scope 的并发调用各自起容器，最后写入的快照胜出<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/IsolationScope.java:40"
+            >IsolationScope.java:40</span
+          >。需要真串行要另配 <code>executionGuard</code>，第 13 章展开。
+        </p>
+        <p>
+          模式 1 的路由表是硬编码的十条<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/RemoteFilesystemSpec.java:254">RemoteFilesystemSpec.java:254</span>：
+          <code>AGENTS.md</code> / <code>MEMORY.md</code> / <code>tools.json</code> 三条走
+          <code>root</code> 段（精确文件路由），<code>memory/</code>、<code>skills/</code>、<code>subagents/</code>、
+          <code>knowledge/</code>、<strong><code>plans/</code></strong>各一条，再加
+          <code>agents/&lt;id&gt;/sessions/</code> 与 <code>agents/&lt;id&gt;/tasks/</code>；其余路径落到本地
+          <code>LocalFilesystem</code>。要额外挂前缀用 <code>addSharedPrefix("prompts/")</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/RemoteFilesystemSpec.java:134"
+            >:134</span
+          >。
+        </p>
+
+        <h2 id="tools">工具层：六个文件工具 + 一个 shell</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>工具名</th><th>参数</th><th>要命的细节</th><th>@Tool 行号</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>read_file</code></td><td><code>path</code>, <code>offset</code>, <code>limit</code></td><td>工具层传 <code>limit</code> 缺省 0，而 <strong>0 = 不截行</strong>；javadoc 那句「默认 2000」在这条路径上不成立</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:110">:110</span></td></tr>
+              <tr><td><code>write_file</code></td><td><code>path</code>, <code>content</code></td><td>目标已存在 → 失败，返回「Read and then make an edit, or write to a new path.」</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:139">:139</span></td></tr>
+              <tr><td><code>edit_file</code></td><td><code>path</code>, <code>old_string</code>, <code>new_string</code>, <code>replace_all</code></td><td>底层对同一文件加 <code>ReentrantLock</code>，并把 CRLF 归一成 LF</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:151">:151</span></td></tr>
+              <tr><td><code>grep_files</code></td><td><code>pattern</code>, <code>path</code>, <code>glob</code>, <code>limit</code></td><td>pattern 是字面量；<code>limit</code> 被 <code>Math.min(requested, 1000)</code> 夹住</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:179">:179</span></td></tr>
+              <tr><td><code>glob_files</code></td><td><code>pattern</code>, <code>path</code>, <code>limit</code></td><td>同样受 1000 上限</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:229">:229</span></td></tr>
+              <tr><td><code>list_files</code></td><td><code>path</code></td><td><strong>双上限</strong>：200 条 或 16000 字符，先到先截，并在结果尾部提示被截断</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:283">:283</span></td></tr>
+              <tr><td><code>execute</code>（<code>ShellExecuteTool</code>）</td><td><code>command</code>, 可选 timeout</td><td>只在 <code>filesystem instanceof AbstractSandboxFilesystem</code> 且没 <code>disableShellTool()</code> 时注册</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2722">HarnessAgent.java:2722</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          常量在 <code>FilesystemTool</code> 顶部：
+          <code>MAX_SEARCH_LIMIT = 1_000</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:41">:41</span>、
+          <code>MAX_LISTING_ENTRIES = 200</code> 与 <code>MAX_LISTING_CHARS = 16000</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:56"
+            >:56</span
+          >。想整块关掉：<code>disableFilesystemTools()</code> / <code>disableShellTool()</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2062"
+            >HarnessAgent.java:2062</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">关掉文件工具会连带关掉 artifact 投递</span>
+          <p>
+            <code>artifactDeliveryEnabled = artifactDeliveryTarget != null &amp;&amp; !disableFilesystemTools</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2525"
+              >HarnessAgent.java:2525</span
+            >。也就是说 <code>disableFilesystemTools()</code> 会<strong>静默让
+            <code>artifactDeliveryTarget(...)</code> 失效</strong>，第 13 章讲「沙箱产物怎么回流」时会再遇到这条。
+          </p>
+        </div>
+
+        <h2 id="end-to-end">端到端：三条链路走一遍</h2>
+        <h3 id="agents-md">① AGENTS.md 是怎么进到系统提示里的</h3>
+        <ul class="timeline">
+          <li><span class="who">装配</span><div class="what">没 <code>disableWorkspaceContext()</code> 时 new 一个 <code>WorkspaceContextMiddleware</code>，把 agent 名、<code>environmentMemory</code>、<code>maxContextTokens</code> 传进去<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2527">HarnessAgent.java:2527</span></div></li>
+          <li><span class="who">每次推理前</span><div class="what"><code>onSystemPrompt(agent, ctx, prompt)</code> 被调用<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:199">WorkspaceContextMiddleware.java:199</span>，它是 <code>HarnessRuntimeMiddleware</code> 的 18 个实现之一</div></li>
+          <li><span class="who">读三份文件</span><div class="what"><code>readAgentsMd(rc)</code> + <code>readKnowledgeMd(rc)</code>（路径是 <code>knowledge/KNOWLEDGE.md</code>）+ <code>readMemoryMd(rc)</code>，全部走两层读<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:251">WorkspaceManager.java:251</span></div></li>
+          <li><span class="who">算预算</span><div class="what">预算 <strong>只用来截 MEMORY.md</strong>：先算 session/agents/knowledge/additional 的 token，剩下的额度给 memory<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:229">:229</span></div></li>
+          <li><span class="who">拼 ## Workspace 段</span><div class="what">按 filesystem 的实际类型分四支文案（本地 overlay / 沙箱 / composite / 其它），沙箱那支会额外提 <code>deliver_artifact</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:323">:323</span></div></li>
+        </ul>
+        <p>
+          <code>maxContextTokens</code> 的默认值是 8000<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:128"
+            >WorkspaceContextMiddleware.java:128</span
+          >，token 估算是最朴素的一档启发式<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:559">:559</span>。
+          <strong>它是工作区上下文的预算，不是压缩开关</strong>——压缩在第 15 章。
+        </p>
+
+        <h3 id="write-file-path">② 一次 write_file("note.txt") 的完整旅程（默认模式）</h3>
+        <ol class="steps">
+          <li>
+            <span class="sh">模型给参数</span>
+            <div><code>path = "note.txt"</code>，<code>content = "hello bob"</code>。工具入口先过一次 <code>norm()</code> 做路径归一<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/FilesystemTool.java:106">FilesystemTool.java:106</span>。</div>
+          </li>
+          <li>
+            <span class="sh">进 overlay</span>
+            <div><code>ShellAwareOverlay.write()</code> 不看下层，直接 <code>upper.write(...)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:170">OverlayFilesystem.java:170</span>。</div>
+          </li>
+          <li>
+            <span class="sh">加 namespace</span>
+            <div>相对路径 + <code>USER</code> scope → 前缀 <code>bob/</code>，得到 <code>bob/note.txt</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:689">LocalFilesystem.java:689</span>。</div>
+          </li>
+          <li>
+            <span class="sh">ROOTED 判定</span>
+            <div><code>cwd.resolve("bob/note.txt").normalize()</code>，仍在 workspace 内 → 放行<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:664">:664</span>。</div>
+          </li>
+          <li>
+            <span class="sh">落盘</span>
+            <div><code>&lt;workspace&gt;/bob/note.txt</code>。已存在则整次失败并回一句「先读再改，或者写新路径」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:328">:328</span>。</div>
+          </li>
+          <li>
+            <span class="sh">回填给模型</span>
+            <div>结果里的路径会被剥掉 namespace 前缀再报出去<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:761">:761</span>，模型看到的仍是 <code>note.txt</code>。</div>
+          </li>
+        </ol>
+
+        <h3 id="at-path">③ 用户消息里的 @path 怎么变成 &lt;attached_file&gt;</h3>
+        <ul class="timeline">
+          <li><span class="who">拦 USER</span><div class="what"><code>onAgent</code> 里只改角色为 <code>USER</code> 的消息，其它原样透传<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AtPathExpansionMiddleware.java:110">AtPathExpansionMiddleware.java:110</span></div></li>
+          <li><span class="who">先看 fs 类型</span><div class="what">filesystem 是 <code>CompositeFilesystem</code> 时<strong>整条展开直接关掉</strong>——分布式部署没有宿主路径<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AtPathExpansionMiddleware.java:128">:128</span></div></li>
+          <li><span class="who">正则抓取</span><div class="what">token 必须含 <code>/</code>、<code>.</code> 或 <code>~</code> 之一才算路径，句末标点（含中文全角）被排除在外，避免把「@张三。」整段吞掉<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AtPathExpansionMiddleware.java:77">:77</span></div></li>
+          <li><span class="who">读文件</span><div class="what"><code>fs.read(rc, resolved, 0, 1000)</code>：<code>MAX_ATTACHED_LINES = 1000</code> 防一个 <code>@log</code> 炸穿上下文<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AtPathExpansionMiddleware.java:86">:86</span>；base64 内容直接跳过<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AtPathExpansionMiddleware.java:176">:176</span></div></li>
+          <li><span class="who">追加不是插入</span><div class="what">原文保持不变，附件块 <code>&lt;attached_file path="..."&gt;</code> 拼在<strong>末尾</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AtPathExpansionMiddleware.java:158">:158</span></div></li>
+        </ul>
+        <p>
+          <code>~/</code> 会被展成 <code>user.home</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AtPathExpansionMiddleware.java:189">:189</span>，
+          读失败只 <code>log.debug</code>，不报错给模型——所以「@path 没生效」的第一现场永远是 debug 日志，不是回复文本。
+        </p>
+
+        <h2 id="assemble">这块什么时候装上</h2>
+        <p>
+          全部以 <code>HarnessAgent.build()</code> 为准，顺序自上而下<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2356"
+            >HarnessAgent.java:2356</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>行号</th><th>发生什么</th><th>条件</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>:2362-2375</code></td><td>spec 互斥 + 逃生口互斥校验</td><td>无条件</td></tr>
+              <tr><td><code>:2376</code></td><td><code>resolvedWorkspace</code>：显式 workspace 或默认解析</td><td>无条件</td></tr>
+              <tr><td><code>:2384-2407</code></td><td><code>distributedStore</code> 注入 stateStore / baseStore / snapshot / guard / bus</td><td>配了 store</td></tr>
+              <tr><td><code>:2415-2425</code></td><td>算出 <code>fsIsolationScope</code> 与 <code>nsFactory</code></td><td>无条件</td></tr>
+              <tr><td><code>:2440-2441</code></td><td><code>WorkspaceIndex.open(...)</code>——<strong>只有 remote 模式才建</strong></td><td><code>remoteFilesystemSpec != null</code></td></tr>
+              <tr><td><code>:2442-2444</code></td><td><code>resolveFilesystem</code> 得到主 filesystem</td><td>无条件</td></tr>
+              <tr><td><code>:2450-2481</code></td><td>沙箱分支：替换 filesystem、装 <code>SandboxLifecycleMiddleware</code></td><td>沙箱 spec</td></tr>
+              <tr><td><code>:2482-2483</code></td><td>非沙箱但有路由 → 包一层 <code>CompositeFilesystem</code></td><td><code>filesystemRoute(...)</code></td></tr>
+              <tr><td><code>:2485-2487</code></td><td><code>new WorkspaceManager(...)</code> + <code>validate()</code></td><td>无条件</td></tr>
+              <tr><td><code>:2492-2502</code></td><td><code>workspaceFactoryFn</code>（<code>BakedContextFilesystem</code>）</td><td>无条件</td></tr>
+              <tr><td><code>:2527-2538</code></td><td><strong><code>WorkspaceContextMiddleware</code></strong></td><td><code>!disableWorkspaceContext</code></td></tr>
+              <tr><td><code>:2540-2541</code></td><td><strong><code>AtPathExpansionMiddleware</code></strong></td><td><code>!disableAtPathExpansion</code></td></tr>
+              <tr><td><code>:2694-2713</code></td><td><code>pathNormalizer</code> 三分支（本地 overlay 必须排第一，注释写明理由）</td><td>无条件</td></tr>
+              <tr><td><code>:2714-2724</code></td><td>注册 <code>FilesystemTool</code> / <code>ArtifactDeliveryTool</code> / <code>ShellExecuteTool</code></td><td>见上一节条件</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>pathNormalizer</code> 那三分支的注释值得抄进笔记：本地 overlay 的
+          <code>ShellAwareOverlay</code> 也 <code>instanceof AbstractSandboxFilesystem</code>，如果把沙箱分支放前面，宿主绝对路径会被当成
+          <code>/workspace</code> 前缀处理<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2697">HarnessAgent.java:2697</span>。
+          这是典型的「顺序即语义」。
+        </p>
+
+        <h2 id="doc-gap">官方说了什么 vs 源码实际是什么</h2>
+        <p>这一章核对出五处偏差。都不是「文档全错」，而是「文档滞后或过度简化」，按它们写代码会踩：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>主题</th><th>filesystem.md 的说法</th><th>2.0.4 源码事实</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Docker spec 的 isolationScope</td>
+                <td>默认值写 <code>SESSION</code><span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:137">filesystem.md:137</span></td>
+                <td>字段是 <code>null</code>，由 <code>build()</code> 统一落 <code>USER</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2415">HarnessAgent.java:2415</span></td>
+              </tr>
+              <tr>
+                <td>Docker 的 image</td>
+                <td>标成「必填」<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:136">:136</span></td>
+                <td><code>DockerSandboxClientOptions</code> 有默认值 <code>ubuntu:22.04</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClientOptions.java:36">DockerSandboxClientOptions.java:36</span></td>
+              </tr>
+              <tr>
+                <td>模式 1 的路由表</td>
+                <td>列了 8 条，没有 <code>plans/</code><span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:62">:62</span></td>
+                <td>源码有 <code>plans/</code> 这一条<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/RemoteFilesystemSpec.java:268">RemoteFilesystemSpec.java:268</span></td>
+              </tr>
+              <tr>
+                <td><code>read</code> 的 limit</td>
+                <td>未提</td>
+                <td>接口 javadoc 说默认 2000<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/AbstractFilesystem.java:61">:61</span>，但 <code>FilesystemTool</code> 传 0 = 全部行</td>
+              </tr>
+              <tr>
+                <td>本地 AgentStateStore 的校验强度</td>
+                <td>workspace.md 把两种模式一起说成会报错</td>
+                <td>remote 抛异常<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431">:2431</span>，sandbox 只 <code>log.warn</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2459">:2459</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 id="unwired">未接线</h3>
+        <div class="pitfall">
+          <div class="pf-h"><code>useLegacyXmlWorkspaceContext(...)</code>：设了没人读</div>
+          <dl>
+            <dt>现状</dt>
+            <dd>
+              字段默认 <code>false</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1241">HarnessAgent.java:1241</span>，setter
+              在 <code>:2028</code>，<code>HarnessAgentBuilderSupport</code> 会把它捕获并转发给子 agent 的 builder<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgentBuilderSupport.java:378"
+                >HarnessAgentBuilderSupport.java:378</span
+              >。
+            </dd>
+            <dt>问题</dt>
+            <dd>
+              <code>build()</code> 里从没读它，<code>WorkspaceContextMiddleware</code> 也没有 XML 分支——全仓库除「定义 + setter + 转发」外零消费点。
+            </dd>
+            <dt>结论</dt>
+            <dd>
+              别指望它能切回旧的 XML 上下文格式。要控制注入内容，用
+              <code>additionalContextFile(...)</code> 和 <code>maxContextTokens(...)</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2014"
+                >HarnessAgent.java:2014</span
+              >。
+            </dd>
+          </dl>
+        </div>
+
+        <h2 id="cheatsheet">速查</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想干什么</th><th>怎么写</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>默认本机 + shell，但限定能碰的目录</td><td><code>.filesystem(new LocalFilesystemSpec().project(p).addRoot(cfg).mode(LocalFsMode.ROOTED))</code></td></tr>
+              <tr><td>让代码文件写进项目而不是 workspace</td><td><code>.filesystem(new LocalFilesystemSpec().projectWritable(true))</code></td></tr>
+              <tr><td>宿主应用自己写的文件要让 agent 读到</td><td><code>.filesystem(new LocalFilesystemSpec().sharedLocalWorkspace(true))</code>（单租户才可用）</td></tr>
+              <tr><td>多副本共享记忆、不要 shell</td><td><code>.distributedStore(store).filesystem(new RemoteFilesystemSpec())</code> + 必须配分布式 stateStore</td></tr>
+              <tr><td>额外把工作区某目录也路由进 KV</td><td><code>new RemoteFilesystemSpec(store).addSharedPrefix("prompts/")</code></td></tr>
+              <tr><td>给某个前缀挂一个自带实现的后端</td><td><code>.filesystemRoute("cache/", myFs)</code>（非沙箱模式包成 Composite<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2482">HarnessAgent.java:2482</span>）</td></tr>
+              <tr><td>完全自管文件系统</td><td><code>.abstractFilesystem(myFs)</code>，与任何 spec 互斥</td></tr>
+              <tr><td>不要工作区上下文进提示词</td><td><code>.disableWorkspaceContext()</code></td></tr>
+              <tr><td>不要 @path 展开</td><td><code>.disableAtPathExpansion()</code></td></tr>
+              <tr><td>宿主侧拿 agent 视角的文件系统</td><td><code>agent.workspaceFor("alice", "alice-s1")</code></td></tr>
+              <tr><td>查一个默认值到底在哪</td><td>先找 spec 字段，再找 <code>build()</code> 里的覆盖点，两处都要记行号</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. workspace 目录不存在，程序照常启动</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>日志里两行 warn：<code>Workspace directory does not exist ... Please create it and add AGENTS.md.</code>，然后 agent 表现得像没读过你的人格文件。</dd>
+            <dt>因为</dt>
+            <dd><code>validate()</code> 全程只 <code>log.warn</code>，既不建目录也不抛异常<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:202">WorkspaceManager.java:202</span>。</dd>
+            <dt>改成</dt>
+            <dd>把 workspace 目录的准备当成部署步骤（CI 里 <code>Files.createDirectories</code> + 校验 AGENTS.md 存在），或者在 <code>build()</code> 之后自己判一次 <code>wsManager</code> 的 warn 是否出现。别指望框架替你 scaffold。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 模型写 <code>/etc/hosts</code> 没报错，文件却在 workspace 里</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>write_file</code> 返回成功，宿主 <code>/etc/hosts</code> 一点没变，<code>&lt;workspace&gt;/etc/hosts</code> 冒出来了。</dd>
+            <dt>因为</dt>
+            <dd><code>ROOTED</code> 对「以 <code>/</code> 开头但磁盘上不存在」的路径会剥掉前导斜杠当相对路径处理<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:649">LocalFilesystem.java:649</span>。只有真实存在的越界绝对路径才抛 <code>SecurityException</code>。</dd>
+            <dt>改成</dt>
+            <dd>需要碰宿主目录就显式 <code>addRoot(...)</code>；需要「只能写 workspace」就 <code>.mode(LocalFsMode.SANDBOXED)</code>，那条分支对任何越界一律拒绝<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:609">:609</span>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. 项目里的文件删不掉（overlay 的 <code>delete</code> 永远失败）</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>AbstractFilesystem.delete(rc, path)</code> 返回 <code>Cannot delete shared file: ...</code>，但同一个文件的 <code>edit_file</code> 却成功了。注意内置根本没有 <code>delete_file</code> 这个工具，能被踩到的是宿主代码、技能脚本与其它 harness 工具直接调的 <code>delete</code>。</dd>
+            <dt>因为</dt>
+            <dd>overlay 的下层（<code>project</code>）是只读的：edit 走 copy-on-write 会在上层建副本再改<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:175">OverlayFilesystem.java:175</span>，而 delete 遇到「只有下层有」直接失败<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/OverlayFilesystem.java:263">:263</span>。</dd>
+            <dt>改成</dt>
+            <dd>想让 agent 真删项目文件：开 <code>projectWritable(true)</code>（换成 <code>ProjectAwareOverlay</code>），或者在 shell 里删。默认语义是「项目文件可以被继承和改写，不能被删除」。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 模式 1 起来发现没有 <code>execute</code> 工具</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>模型说「我没有执行命令的能力」；或者你 <code>disableShellTool()</code> 都没调，工具列表里就是少一个。</dd>
+            <dt>因为</dt>
+            <dd><code>CompositeFilesystem</code> 不实现 <code>AbstractSandboxFilesystem</code>，注册条件是 <code>instanceof</code> 检查<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2722">HarnessAgent.java:2722</span>，而它是<strong>故意</strong>不做 shell 的<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/CompositeFilesystem.java:46">CompositeFilesystem.java:46</span>。</dd>
+            <dt>改成</dt>
+            <dd>三条路：换沙箱模式（第 13 章）；用 <code>abstractFilesystem(...)</code> 自己拼一个带 shell 的组合；或接受「共享存储不跑命令」这个设计。不要在模式 1 里到处找开关——没有这个开关。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. 加了 <code>sharedLocalWorkspace(true)</code>，多用户互相覆盖</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>alice 写的 <code>report.md</code> 立刻被 bob 的 <code>report.md</code> 盖掉。</dd>
+            <dt>因为</dt>
+            <dd>这个开关在 <code>toFilesystem</code> 里直接把 <code>namespaceFactory</code> 置 null<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:323">LocalFilesystemSpec.java:323</span>，字段 javadoc 明写「Not safe for multi-tenant workspaces」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:105">:105</span>。</dd>
+            <dt>改成</dt>
+            <dd>它只用于「宿主应用与 agent 需要对同一个物理路径达成一致」的单进程单租户集成。多租户请保持默认，靠 <code>workspaceFor(uid, sid)</code> 从宿主侧读。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">6. <code>@path</code> 和 workspace 上下文突然失效</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>同一段提示词在本机模式能带上附件，切到共享存储就没了；或者 MEMORY.md 越写越长，最后被截成半句。</dd>
+            <dt>因为</dt>
+            <dd>前者是 <code>CompositeFilesystem</code> 分支直接关掉展开<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/AtPathExpansionMiddleware.java:128">AtPathExpansionMiddleware.java:128</span>；后者是预算只截 MEMORY.md 这一份文件<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:233">WorkspaceContextMiddleware.java:233</span>，AGENTS.md 与 knowledge 是<strong>不截的</strong>，它们把额度吃光后 MEMORY.md 就只能截。</dd>
+            <dt>改成</dt>
+            <dd>分布式模式下想让模型看文件内容，就用 <code>read_file</code> 而不是 <code>@path</code>；上下文超限就调 <code>maxContextTokens(...)</code> 或把知识挪进 <code>knowledge/</code> 让 agent 自己去查。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>不写 <code>.filesystem(...)</code> 时，<code>project</code> 默认是什么？这会带来什么风险？</summary>
+          <p>
+            <code>${user.dir}</code>，即进程工作目录<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/LocalFilesystemSpec.java:75">LocalFilesystemSpec.java:75</span>。
+            风险有两层：一是 overlay 下层把整个当前目录变成只读可见（<code>read_file</code> 能读到你的源码、配置），
+            二是 shell 的 <code>pwd</code> 也是它，所以 <code>execute("ls")</code> 看到的是项目而不是 workspace。生产部署里
+            <code>user.dir</code> 往往是 jar 所在目录，这通常不是你想暴露的东西——显式 <code>.project(...)</code> 收窄。
+          </p>
+        </details>
+        <details>
+          <summary><code>readAgentsMd(rc)</code> 读到的内容来自 workspace 还是 project？</summary>
+          <p>
+            先 filesystem 后本地：两层读里 filesystem 优先<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:818">WorkspaceManager.java:818</span>。
+            默认模式的 filesystem 是 overlay，上层是 workspace、下层是 project，所以 workspace 里有 AGENTS.md 就用它，没有才退到
+            project。真正易错的是那个判据：它用的是「返回的字符串为空」而不是「读失败」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/workspace/WorkspaceManager.java:820">:820</span>，
+            三档真实行为各不相同：文件不存在 → <code>read</code> 失败 → 内容空串 → 回落本地盘；文件存在但为空或全空白 →
+            <code>LocalFilesystem</code> 把内容换成一句 <code>System reminder: File exists but has empty contents</code>（非空！）<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:291"
+              >LocalFilesystem.java:291</span
+            >，于是模型收到的“人格”就是这句话；KV 后端存了一个真正的空值 → 回落去读本地模板，静默换了来源。
+          </p>
+        </details>
+        <details>
+          <summary>我想让 agent 只能读写 <code>workspace</code>，任何宿主绝对路径都不行，最少要设什么？</summary>
+          <p>
+            <code>.filesystem(new LocalFilesystemSpec().mode(LocalFsMode.SANDBOXED))</code>，并把 shell 一起关掉
+            <code>.disableShellTool()</code>——只关文件工具不够，因为 <code>execute</code> 是宿主 <code>sh -c</code>，一条
+            <code>cat /etc/passwd</code> 就绕过了路径策略。注意 <code>SANDBOXED</code> 里绝对路径不是被拒绝而是被
+            <strong>重新锚定</strong>到 root<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:616">LocalFilesystem.java:616</span>，
+            真要隔离命令执行，正解是第 13 章的沙箱模式。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">把 namespace 的真相打印出来</span>
+            <div>
+              照本章「最小可跑」建 agent，让 alice 和 bob 各写一个同名 <code>note.txt</code>。然后用宿主侧视角对比两棵树：
+              <code>Files.walk(workspace)</code> 打印真实磁盘路径，再用
+              <code>agent.workspaceFor("alice", "alice-s1").getFilesystem().ls(RuntimeContext.empty(), "/")</code>
+              打印模型看到的路径树——前者有 <code>alice/</code>、<code>bob/</code> 两层，后者只有各自的
+              <code>note.txt</code>。注意第二个调用里传的是 <code>RuntimeContext.empty()</code> 却依然拿到了 alice 的桶：
+              <code>BakedContextFilesystem</code> 每次委托都把烤进去的身份盖回去，忽略调用方传的上下文<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/BakedContextFilesystem.java:51"
+                >BakedContextFilesystem.java:51</span
+              >；<code>workspaceFor</code> 的返回类型就是 <code>WorkspaceManager</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:256"
+                >HarnessAgent.java:256</span
+              >。
+            </div>
+          </li>
+          <li>
+            <span class="sh">验证 overlay 的四条不对称</span>
+            <div>
+              在 <code>project</code>（临时目录，随便写几个文件）里放 <code>data.txt</code>，workspace 里不放。然后依次做四件事并观察磁盘：
+              ① 让模型 <code>read_file("data.txt")</code>；② 让模型 <code>edit_file</code> 改一个字；③ 用
+              <code>agent.workspaceFor(uid, sid).getFilesystem().delete(rc, "data.txt")</code> 直删；④ 再来一次 ②。
+              你应该看到：读成功、delete 失败、<code>&lt;workspace&gt;/data.txt</code> 在第一次 edit 后凭空出现、第二次
+              edit 走上层副本——对应 <code>OverlayFilesystem</code> 的 <a href="#layering">那张表</a>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">把注入预算调小，看它截谁</span>
+            <div>
+              先让 <code>AGENTS.md</code> 成为一个<strong>空文件</strong>（<code>Files.writeString(path,"")</code>），跟 agent 说一句
+              “把你看到的人格原文读给我”，你会拿到 <code>System reminder: File exists but has empty contents</code>——这证明「空文件」在两层读里
+              <strong>不算不存在</strong>，回落只发生在“读出空串”那一支<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/local/LocalFilesystem.java:291">LocalFilesystem.java:291</span>；
+              然后写 5000 字的 <code>MEMORY.md</code>，把 <code>maxContextTokens</code> 调到 500，观察<strong>只有 MEMORY.md 那一段</strong>被截
+              <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:233">WorkspaceContextMiddleware.java:233</span>，
+              AGENTS.md 与 knowledge 一字不截。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">完成这一章之后</h2>
+        <p>
+          现在你知道「路径字符串 → 磁盘位置」中间隔着几层，也知道了三种模式各自的能力上限。这三种模式里最特殊的是沙箱：它把
+          <code>AbstractFilesystem</code> 的实现在容器里，还把 shell 一起搬了进去，于是多出一整套生命周期问题——租约、隔离键、快照、挂载声明。
+          下一章专门讲它。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="13-sandbox.html">13 沙箱与受控执行</a></td><td>本章反复提到的 <code>AbstractSandboxFilesystem</code> 一族，以及 lease / isolation key / 快照</td></tr>
+              <tr><td><a href="15-compaction-memory.html">15 上下文压缩与记忆</a></td><td>本章的 <code>maxContextTokens</code> 只是工作区预算，压缩是另一回事</td></tr>
+              <tr><td><a href="16-skill.html">16 技能</a></td><td><code>skills/</code> 目录为什么不带 namespace 前缀，答案在技能装配里</td></tr>
+              <tr><td><a href="../appendix/api-cheatsheet.html#h-fs">附录 C：Harness ②文件系统与沙箱</a></td><td>builder 方法按能力分组的完整清单</td></tr>
+              <tr><td><a href="../appendix/source-map.html#harness">附录 D：harness 子包</a></td><td><code>workspace</code> / <code>filesystem</code> 两个包的文件级地图</td></tr>
+              <tr><td>官方 <code>docs/v2/zh/docs/harness/filesystem.md</code></td><td>本章的「文档 vs 源码」差异表以它为对照</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">一句话记住这一章</span>
+          <p>
+            路径是字符串、身份在 <code>RuntimeContext</code> 里、读是并集、写只有一层——把这四句对上
+            <code>resolveFilesystem</code>、<code>OverlayFilesystem</code>、<code>applyNamespacePrefix</code>
+            三个位置，本章的图就不用背了。
+          </p>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

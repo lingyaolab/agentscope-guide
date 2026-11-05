@@ -1,0 +1,837 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="上一章我们知道了「流里流着东西」，这一章拆开看流里到底是什么。框架把「一句话」和「正在说这句话的过程」拆成了两套类型：Msg 体系负责结果（会进历史、会落盘、会喂给下一个模型），AgentEvent 体系负责过程（只在传输途中有意义）。搞混这两者，是做流式界面时最常见的返工原因。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="04 消息与事件：Msg、ContentBlock 与 31 个事件 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="上一章我们知道了「流里流着东西」，这一章拆开看流里到底是什么。框架把「一句话」和「正在说这句话的过程」拆成了两套类型：Msg 体系负责结果（会进历史、会落盘、会喂给下一个模型），AgentEvent 体系负责过程（只在传输途中有意义）。搞混这两者，是做流式界面时最常见的返工原因。" />
+    <title>04 消息与事件：Msg、ContentBlock 与 31 个事件 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="04-message-and-event" data-root="..">
+    <main>
+      <article class="article">
+        <h1>04 · 消息与事件</h1>
+        <p class="lede">
+          上一章我们知道了「流里流着东西」，这一章拆开看流里到底是什么。框架把「一句话」和「正在说这句话的过程」拆成了两套类型：<code>Msg</code>
+          体系负责<strong>结果</strong>（会进历史、会落盘、会喂给下一个模型），<code>AgentEvent</code>
+          体系负责<strong>过程</strong>（只在传输途中有意义）。搞混这两者，是做流式界面时最常见的返工原因。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 <code>Msg</code> 的 7 个字段各管什么，以及 9 种 <code>ContentBlock</code> 分别该塞给谁</li>
+          <li>看到 <code>replyId</code> / <code>blockId</code> / <code>toolCallId</code> 时，能判断这三个 id 各自把什么关在一起</li>
+          <li>用 <code>streamEvents()</code> 自己拼出完整回答，并知道为什么「不该这么做」</li>
+        </ul>
+
+        <h2 id="why">先说为什么：消息是包裹，事件是物流轨迹</h2>
+        <p>
+          把 <code>Msg</code> 想成<strong>已经签收的包裹</strong>：里面有东西（内容块）、有寄件人（<code>name</code>）、有面单号（<code>id</code>）、有签收时间（<code>timestamp</code>）。包裹可以堆在仓库里，下次还能拿出来看——这就是「对话历史」。
+        </p>
+        <p>
+          而 <code>AgentEvent</code> 是<strong>物流轨迹</strong>：「已揽收」→「运输中」→「派送中」→「已签收」。轨迹只在运输期间不断产生，你不会把轨迹存进仓库当包裹用，但你可以<strong>盯着轨迹做实时播报</strong>（这正是流式界面干的事）。
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h4><code>Msg</code>：结果</h4>
+            <ul>
+              <li>一次性拿到，可序列化、可落盘、可回放</li>
+              <li>是模型的输入（历史就是 <code>List&lt;Msg&gt;</code>）</li>
+              <li>内部是 <code>List&lt;ContentBlock&gt;</code>，一条消息可以同时有文字和图片</li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4><code>AgentEvent</code>：过程</h4>
+            <ul>
+              <li>几十上百条，只在该次调用期间存在</li>
+              <li>是界面的输入（打字机、工具进度条、思考折叠块）</li>
+              <li>靠 <code>replyId</code> 归到同一条消息，靠 <code>blockId</code> 归到同一个块</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          两者是同一件事的两个视角，所以框架内部只有一套执行路径：<code>call()</code> 也是跑同一条事件流，只是它把
+          <code>AgentResultEvent</code> 里的最终 <code>Msg</code> 挑出来返回<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1012"
+            >ReActAgent.java:1012</span
+          >。这一点在 05 章不重复，但你要记住：<strong>流式不是另一种调用方式，阻塞式只是流式的一个消费者</strong>。
+        </p>
+
+        <h2 id="minimal">最小可跑：造一条消息 + 数一遍事件</h2>
+        <h3 id="step-build-msg">第 1 步：造一条同时含文字和图片的消息</h3>
+        <pre data-lang="java" data-file="InspectMessage.java">import io.agentscope.core.message.ImageBlock;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.URLSource;
+import io.agentscope.core.message.UserMessage;
+import java.util.List;
+
+public class InspectMessage {
+    public static void main(String[] args) {
+        Msg msg = new UserMessage(List.of(
+                TextBlock.builder().text("这张图里有几只猫？").build(),
+                ImageBlock.builder()
+                        .source(URLSource.builder()
+                                .url("https://example.com/cats.png")
+                                .mimeType("image/png")
+                                .build())
+                        .build()));
+
+        System.out.println("role   = " + msg.getRole());      // USER
+        System.out.println("blocks = " + msg.getContent().size());  // 2
+        System.out.println("text   = " + msg.getTextContent());     // 只有文字那半句
+        System.out.println("image  = " + msg.hasContentBlocks(ImageBlock.class)); // true
+
+        ImageBlock img = msg.getFirstContentBlock(ImageBlock.class);
+        System.out.println("url    = " + ((URLSource) img.getSource()).getUrl());
+    }
+}</pre>
+        <p class="src-line">
+          <code>UserMessage(List&lt;ContentBlock&gt;)</code> 构造：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/message/UserMessage.java:69"
+            >UserMessage.java:69</span
+          >；<code>getTextContent()</code>：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:544"
+            >Msg.java:544</span
+          >；三个按类型取块的方法：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:346"
+            >Msg.java:346</span
+          >、<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:359"
+            >:359</span
+          >、<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:386"
+            >:386</span
+          >
+        </p>
+        <div class="callout warn">
+          <span class="ct"><code>getTextContent()</code> 不是「消息转字符串」</span>
+          <p>
+            它的实现是「筛出所有 <code>TextBlock</code>，把 <code>getText()</code> 用换行拼起来」<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:545"
+              >Msg.java:545</span
+            >。所以一条纯图片消息调用它会得到<strong>空字符串</strong>，而一条「文字 + 图片」消息只能拿到文字那半句。想拿全部内容必须遍历
+            <code>getContent()</code>。
+          </p>
+        </div>
+
+        <h3 id="step-count-events">第 2 步：数一遍一次回答产生多少事件</h3>
+        <pre data-lang="java" data-file="CountEvents.java">import io.agentscope.core.event.AgentEvent;
+import io.agentscope.core.message.UserMessage;
+import java.util.Map;
+import java.util.TreeMap;
+
+Map&lt;String, Integer&gt; counter = new TreeMap&lt;&gt;();
+
+agent.streamEvents(new UserMessage("用一句话介绍你自己"))
+        .doOnNext((AgentEvent e) -&gt; counter.merge(e.getType().name(), 1, Integer::sum))
+        .blockLast();
+
+counter.forEach((type, n) -&gt; System.out.printf("%-28s %d%n", type, n));</pre>
+        <p>
+          跑完你会看到类似这样的输出（具体条数取决于模型与是否用到工具）：
+        </p>
+        <pre data-lang="text" data-file="典型输出">AGENT_END                    1
+AGENT_RESULT                 1
+AGENT_START                  1
+MODEL_CALL_END               1
+MODEL_CALL_START             1
+TEXT_BLOCK_DELTA             137
+TEXT_BLOCK_END               1
+TEXT_BLOCK_START             1</pre>
+        <p>
+          请注意这里有一行<strong>官方文档里没写</strong>的 <code>AGENT_RESULT</code>：它携带最终 <code>Msg</code>，是
+          <code>call()</code> 能返回值的真正原因<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentEventType.java:45"
+            >AgentEventType.java:45</span
+          >。这类「文档没写、但代码里确实有」的差异，在下面的速查表里一并标出。
+        </p>
+
+        <h2 id="line-by-line">逐行解读：Msg 的字段与 9 种内容块</h2>
+        <h3 id="msg-fields">Msg 的 7 个字段</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>字段</th>
+                <th>取法</th>
+                <th>它解决什么问题</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>id</code></td>
+                <td><code>getId()</code></td>
+                <td>消息的唯一标识。构造时不给就随机生成 UUID；事件里的 <code>replyId</code> 最终指的就是它。</td>
+              </tr>
+              <tr>
+                <td><code>name</code></td>
+                <td><code>getName()</code></td>
+                <td>「谁说的」。单 agent 时可空；多 agent 场景（辩论、主管-工人）靠它区分发言人，formatter 会把它写进请求载荷。</td>
+              </tr>
+              <tr>
+                <td><code>role</code></td>
+                <td><code>getRole()</code></td>
+                <td>只有 4 个值：<code>USER</code> / <code>ASSISTANT</code> / <code>SYSTEM</code> / <code>TOOL</code>。</td>
+              </tr>
+              <tr>
+                <td><code>content</code></td>
+                <td><code>getContent()</code></td>
+                <td><code>List&lt;ContentBlock&gt;</code>，一条消息可以混合多种块。返回的是不可变列表。</td>
+              </tr>
+              <tr>
+                <td><code>metadata</code></td>
+                <td><code>getMetadata()</code></td>
+                <td>框架偷偷塞东西的地方：生成原因、token 用量、结构化输出都在这。</td>
+              </tr>
+              <tr>
+                <td><code>timestamp</code></td>
+                <td><code>getTimestamp()</code></td>
+                <td>格式固定为 <code>yyyy-MM-dd HH:mm:ss.SSS</code> 的字符串，不是 <code>Instant</code>。</td>
+              </tr>
+              <tr>
+                <td><code>usage</code></td>
+                <td><code>getUsage()</code> / <code>getChatUsage()</code></td>
+                <td>
+                  这次生成消耗的 token 与耗时。注意两个取法：<code>getUsage()</code> 只看字段，<code>getChatUsage()</code>
+                  会回退到 metadata 里的 <code>_chat_usage</code> 并顺手反序列化<span
+                    class="src"
+                    data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:579"
+                    >Msg.java:579</span
+                  >。
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout danger">
+          <span class="ct">角色和内容块有白名单，塞错了直接抛异常</span>
+          <p>
+            <code>Msg</code> 构造时会跑一遍 <code>validateRoleContent</code><span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:181"
+              >Msg.java:181</span
+            >：<code>USER</code> 只能是 text / data / image / audio / video 五种；<code>SYSTEM</code> 只能是
+            text；<code>ASSISTANT</code> 与 <code>TOOL</code> 不限制。所以「往 <code>UserMessage</code> 里塞一个
+            <code>ToolUseBlock</code>」会在 <strong>构造那一刻</strong>抛
+            <code>IllegalArgumentException: USER message may only contain ...</code>，而不是等到调模型才报错。
+          </p>
+        </div>
+
+        <h3 id="content-blocks">9 种内容块</h3>
+        <p>
+          <code>ContentBlock</code> 是一个 <code>sealed</code> 类，<code>permits</code> 明确列出 9 个子类<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/message/ContentBlock.java:58"
+            >ContentBlock.java:58</span
+          >。sealed 带来的好处很实在：你在自己代码里 <code>switch</code> 它时，编译器能检查你有没有漏分支。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>块类型</th>
+                <th>JSON <code>type</code></th>
+                <th>承载什么</th>
+                <th>通常出现在</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>TextBlock</code></td>
+                <td><code>text</code></td>
+                <td>纯文本</td>
+                <td>所有角色</td>
+              </tr>
+              <tr>
+                <td><code>ThinkingBlock</code></td>
+                <td><code>thinking</code></td>
+                <td>模型的思维链（推理过程）</td>
+                <td>ASSISTANT（开了 thinking 的模型）</td>
+              </tr>
+              <tr>
+                <td><code>ToolUseBlock</code></td>
+                <td><code>tool_use</code></td>
+                <td>「我要调这个工具，参数是这些」</td>
+                <td>ASSISTANT</td>
+              </tr>
+              <tr>
+                <td><code>ToolResultBlock</code></td>
+                <td><code>tool_result</code></td>
+                <td>工具执行结果</td>
+                <td>TOOL</td>
+              </tr>
+              <tr>
+                <td><code>DataBlock</code></td>
+                <td><code>data</code></td>
+                <td>通用二进制（图片/音频/视频/文件都行）</td>
+                <td>USER / ASSISTANT</td>
+              </tr>
+              <tr>
+                <td><code>ImageBlock</code></td>
+                <td><code>image</code></td>
+                <td>图片（遗留类型，兼容保留）</td>
+                <td>USER</td>
+              </tr>
+              <tr>
+                <td><code>AudioBlock</code></td>
+                <td><code>audio</code></td>
+                <td>音频（遗留类型）</td>
+                <td>USER</td>
+              </tr>
+              <tr>
+                <td><code>VideoBlock</code></td>
+                <td><code>video</code></td>
+                <td>视频（遗留类型）</td>
+                <td>USER</td>
+              </tr>
+              <tr>
+                <td><code>HintBlock</code></td>
+                <td><code>hint</code></td>
+                <td>中间件 / 长期记忆 / RAG 注入的提示，<strong>不属于对话历史</strong></td>
+                <td>由中间件注入，模型可见但不落历史</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">新代码该用 <code>DataBlock</code> 还是 <code>ImageBlock</code>？</span>
+          <p>
+            源码注释写得很直接：<code>ImageBlock</code> / <code>AudioBlock</code> / <code>VideoBlock</code>
+            是为了向后兼容而保留的<strong>遗留类型</strong>，<code>DataBlock</code> 才是「面向未来」的统一容器，新代码应优先用它<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/message/DataBlock.java:24"
+              >DataBlock.java:24</span
+            >。两者都能放进 <code>USER</code> 消息（白名单里都放行了），所以升级不会破坏旧管道。
+          </p>
+        </div>
+        <p>
+          至于底层是「URL 引用」还是「base64 内联」，不写在块上，而是写在块里的 <code>Source</code> 上：<code>URLSource</code>
+          走链接（适合大文件、CDN），<code>Base64Source</code> 走内联（适合小图、离线）。<code>URLSource</code>
+          还支持一个 <code>mimeType</code> 提示，专门对付「没有扩展名的签名 URL」<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/message/URLSource.java:40"
+            >URLSource.java:40</span
+          >。
+        </p>
+
+        <h3 id="msg-metadata">metadata 里框架偷偷塞了什么</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>key</th>
+                <th>常量</th>
+                <th>内容</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>agentscope_generate_reason</code></td>
+                <td><code>Msg.METADATA_GENERATE_REASON</code></td>
+                <td>这条消息为什么结束，取值见 <code>GenerateReason</code>（12 个，见速查表）</td>
+              </tr>
+              <tr>
+                <td><code>_chat_usage</code></td>
+                <td><code>MessageMetadataKeys.CHAT_USAGE</code></td>
+                <td>token 与耗时；<code>getChatUsage()</code> 会读这里</td>
+              </tr>
+              <tr>
+                <td><code>_structured_output</code></td>
+                <td><code>MessageMetadataKeys.STRUCTURED_OUTPUT</code></td>
+                <td>结构化输出的结果，<code>getStructuredData(Class)</code> 读这里（05 章细讲）</td>
+              </tr>
+              <tr>
+                <td><code>_tool_return_direct</code></td>
+                <td><code>MessageMetadataKeys.TOOL_RETURN_DIRECT</code></td>
+                <td>标记「工具结果直接返回给调用方，不再进模型」</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          常量定义位置：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:70"
+            >Msg.java:70</span
+          >、<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/message/MessageMetadataKeys.java:120"
+            >MessageMetadataKeys.java:120</span
+          >
+        </p>
+
+        <h2 id="lifecycle">端到端：一次带工具的回答，事件是怎么排队的</h2>
+        <p>
+          事件的骨架永远是 <strong>start → delta(×N) → end</strong>。但一次回答里可能有多轮「推理→执行」，所以下面这个序列会循环出现：
+        </p>
+        <ul class="timeline">
+          <li>
+            <div class="who">开场</div>
+            <div class="what"><code>AgentStartEvent</code>：带 <code>replyId</code>、<code>sessionId</code>、agent 名称与角色。后面所有事件都归到这个 <code>replyId</code> 上</div>
+          </li>
+          <li>
+            <div class="who">第 1 轮推理</div>
+            <div class="what"><code>ModelCallStartEvent</code> → 文本块 / 思考块的生命周期 → <code>ModelCallEndEvent</code>（带 input/output token）</div>
+          </li>
+          <li>
+            <div class="who">模型要调工具</div>
+            <div class="what"><code>ToolCallStartEvent</code> → <code>ToolCallDeltaEvent</code>（JSON 参数一片片到达）→ <code>ToolCallEndEvent</code>，全程靠 <code>toolCallId</code> 关联</div>
+          </li>
+          <li>
+            <div class="who">框架执行工具</div>
+            <div class="what"><code>ToolResultStartEvent</code> → <code>ToolResultTextDeltaEvent</code> / <code>ToolResultDataDeltaEvent</code> → <code>ToolResultEndEvent</code>（带 <code>ToolResultState</code>）</div>
+          </li>
+          <li>
+            <div class="who">第 2 轮推理</div>
+            <div class="what">拿着工具结果再问一次模型，于是又一轮 <code>ModelCallStart</code> / <code>TextBlock*</code> / <code>ModelCallEnd</code>。这就是「ReAct 循环」在事件流里的样子</div>
+          </li>
+          <li>
+            <div class="who">收尾</div>
+            <div class="what"><code>AgentResultEvent</code>（携带最终 <code>Msg</code>）→ <code>AgentEndEvent</code></div>
+          </li>
+        </ul>
+        <div class="swim">
+          <div class="lane">
+            <div class="lh">三个关联 id 的分工</div>
+            <div class="lb">
+              <ul>
+                <li><code>replyId</code>：把「这一次回答」里的所有事件关在一起。一次 <code>call()</code> 一个 <code>replyId</code>。</li>
+                <li><code>blockId</code>：把「同一个内容块」的 start/delta/end 关在一起。文本块、思考块、数据块用它。</li>
+                <li><code>toolCallId</code>：把「同一次工具调用」的 call 与 result 关在一起。跨轮次配对也靠它。</li>
+              </ul>
+            </div>
+          </div>
+          <div class="lane">
+            <div class="lh">最容易踩的假设</div>
+            <div class="lb">
+              <ul>
+                <li><code>blockId</code> 只保证在<strong>一个 reply 内</strong>唯一，不是全局 UUID，别拿它当数据库主键。</li>
+                <li>一次 reply 里 <code>ModelCallStart</code> 可能出现<strong>多次</strong>，因为工具调用会带来第二轮推理。</li>
+                <li>不要假设「文本块只有一块」——模型可能先输出一段思考、再输出一段正文。</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+        <p class="src-line">
+          事件公共方法（<code>getId</code> / <code>getCreatedAt</code> / <code>getType</code> / <code>getSource</code> /
+          <code>getMetadata</code>）：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentEvent.java:115"
+            >AgentEvent.java:115</span
+          >；<code>AgentStartEvent</code> 的四个 getter：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentStartEvent.java:58"
+            >AgentStartEvent.java:58</span
+          >
+        </p>
+        <div class="callout">
+          <span class="ct"><code>getSource()</code> 是给「子 agent」用的</span>
+          <p>
+            顶层 agent 发出的事件 <code>getSource()</code> 为 <code>null</code>；子 agent 的事件会带斜杠路径（如
+            <code>"main/researcher"</code>）。你在做多 agent 的界面时，靠这个字段把不同 agent 的输出分栏显示——不需要自己维护映射表。
+          </p>
+        </div>
+
+        <h2 id="rebuild">从事件流重建消息：能做，但通常别做</h2>
+        <h3 id="text-delta">只想要纯文本：拼 delta</h3>
+        <pre data-lang="java" data-file="RebuildText.java">import io.agentscope.core.event.TextBlockDeltaEvent;
+import io.agentscope.core.message.UserMessage;
+
+StringBuilder text = new StringBuilder();
+
+agent.streamEvents(new UserMessage("用三句话解释什么是 ReAct"))
+        .filter(e -&gt; e instanceof TextBlockDeltaEvent)
+        .cast(TextBlockDeltaEvent.class)
+        .doOnNext(e -&gt; text.append(e.getDelta()))
+        .blockLast();
+
+System.out.println(text);</pre>
+        <p>
+          这就是所有「打字机效果」的全部原理：<strong>把 delta 一片片接到同一个 StringBuilder 上</strong>。没有魔法。
+        </p>
+
+        <h3 id="toolcall-pairing">想要完整的工具调用记录：自己配对 <code>toolCallId</code></h3>
+        <pre data-lang="java" data-file="RebuildToolCalls.java">import io.agentscope.core.event.ToolCallDeltaEvent;
+import io.agentscope.core.event.ToolCallStartEvent;
+import io.agentscope.core.event.ToolResultEndEvent;
+import io.agentscope.core.message.UserMessage;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+Map&lt;String, StringBuilder&gt; args = new LinkedHashMap&lt;&gt;();
+
+agent.streamEvents(new UserMessage("北京现在天气怎么样？"))
+        .doOnNext(e -&gt; {
+            if (e instanceof ToolCallStartEvent s) {
+                args.put(s.getToolCallId(), new StringBuilder());
+                System.out.println("开始调工具：" + s.getToolCallName());
+            } else if (e instanceof ToolCallDeltaEvent d) {
+                args.get(d.getToolCallId()).append(d.getDelta());
+            } else if (e instanceof ToolResultEndEvent r) {
+                System.out.println("工具结束 state=" + r.getState()
+                        + " args=" + args.get(r.getToolCallId()));
+            }
+        })
+        .blockLast();</pre>
+        <p class="src-line">
+          <code>ToolCallStartEvent.getToolCallId()</code>：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/event/ToolCallStartEvent.java:55"
+            >ToolCallStartEvent.java:55</span
+          >；<code>ToolCallDeltaEvent.getDelta()</code>：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/event/ToolCallDeltaEvent.java:71"
+            >ToolCallDeltaEvent.java:71</span
+          >；<code>ToolResultEndEvent.getState()</code>：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/event/ToolResultEndEvent.java:85"
+            >ToolResultEndEvent.java:85</span
+          >
+        </p>
+
+        <h3 id="msg-call">想要一条真正的 <code>Msg</code>：用 <code>call()</code></h3>
+        <p>
+          上面两个例子都是「重建」，而重建是有代价的：你要自己处理思考块、多轮工具、错误状态、token 统计。框架内部的
+          <code>call()</code> 之所以能返回一个完整 <code>Msg</code>，是因为它在同一条事件流上做了三件事——过滤出
+          <code>AgentResultEvent</code>、取出里面的 <code>getResult()</code>、取最后一个<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1014"
+            >ReActAgent.java:1014</span
+          >。
+        </p>
+        <pre data-lang="java" data-file="两条路选一条">// 要过程 → 订阅事件，自己做增量渲染
+agent.streamEvents(userMsg).doOnNext(...).blockLast();
+
+// 要结果 → 让框架把事件收成一个 Msg 再给你
+Msg reply = agent.call(List.of(userMsg), RuntimeContext.empty()).block();</pre>
+        <div class="callout tip">
+          <span class="ct">什么时候才真的需要自己重建？</span>
+          <p>
+            三种情况：① 你要把事件转发给浏览器做 SSE，前端自己拼；② 你要在 <strong>不结束调用</strong>
+            的前提下显示「到目前为止的内容」（比如超过 N 秒就先把已生成部分展示出来）；③ 你在做可视化调试器，要看到每个块的边界。除此之外，用
+            <code>call()</code> 更省事也更不容易错。
+          </p>
+        </div>
+
+        <h2 id="cheatsheet">API 速查</h2>
+        <h3 id="event-types">31 个事件类型（按用途分组）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>分组</th>
+                <th>枚举值</th>
+                <th>你通常怎么用</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>生命周期</td>
+                <td><code>AGENT_START</code>、<code>AGENT_END</code>、<code>AGENT_RESULT</code></td>
+                <td>建「这一次回答」的容器；<code>AGENT_RESULT</code> 里是最终 <code>Msg</code></td>
+              </tr>
+              <tr>
+                <td>模型调用</td>
+                <td><code>MODEL_CALL_START</code>、<code>MODEL_CALL_END</code></td>
+                <td>算单次调用耗时与 token；判断进入第几轮推理</td>
+              </tr>
+              <tr>
+                <td>文本</td>
+                <td><code>TEXT_BLOCK_START</code> / <code>DELTA</code> / <code>END</code></td>
+                <td>打字机效果（<code>DELTA</code> 拿增量）</td>
+              </tr>
+              <tr>
+                <td>思考</td>
+                <td><code>THINKING_BLOCK_START</code> / <code>DELTA</code> / <code>END</code></td>
+                <td>渲染可折叠的「思考中…」区域</td>
+              </tr>
+              <tr>
+                <td>二进制</td>
+                <td><code>DATA_BLOCK_START</code> / <code>DELTA</code> / <code>END</code></td>
+                <td>图片/音频/视频的流式生成（<code>DELTA</code> 是 base64 片段）</td>
+              </tr>
+              <tr>
+                <td>工具调用</td>
+                <td><code>TOOL_CALL_START</code> / <code>DELTA</code> / <code>END</code></td>
+                <td>展示「正在准备参数…」；<code>DELTA</code> 是 JSON 片段</td>
+              </tr>
+              <tr>
+                <td>工具结果</td>
+                <td><code>TOOL_RESULT_START</code> / <code>TEXT_DELTA</code> / <code>DATA_DELTA</code> / <code>END</code></td>
+                <td>工具执行进度条；<code>END</code> 才拿到 <code>ToolResultState</code></td>
+              </tr>
+              <tr>
+                <td>迭代控制</td>
+                <td><code>EXCEED_MAX_ITERS</code>、<code>REQUEST_STOP</code></td>
+                <td>提示「达到最大轮数」或「被中间件叫停」</td>
+              </tr>
+              <tr>
+                <td>人机交互</td>
+                <td><code>REQUIRE_USER_CONFIRM</code>、<code>REQUIRE_EXTERNAL_EXECUTION</code>、<code>USER_CONFIRM_RESULT</code>、<code>EXTERNAL_EXECUTION_RESULT</code>、<code>ALL_TOOLS_DENIED</code></td>
+                <td>弹出确认框、把外部系统的执行结果送回去（08 章）</td>
+              </tr>
+              <tr>
+                <td>多 agent / 其他</td>
+                <td><code>SUBAGENT_EXPOSED</code>、<code>HINT_BLOCK</code>、<code>CUSTOM</code></td>
+                <td>子 agent 入口渲染、提示注入、自定义事件</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          完整枚举：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentEventType.java:40"
+            >AgentEventType.java:40</span
+          >。文档没写但代码里有的两个：<code>AGENT_RESULT</code>（:45）、<code>HINT_BLOCK</code>（:88）
+        </p>
+
+        <h3 id="msg-methods">Msg 常用方法</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>我想…</th>
+                <th>用这个</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>拿全部内容</td>
+                <td><code>getContent()</code> → <code>List&lt;ContentBlock&gt;</code></td>
+              </tr>
+              <tr>
+                <td>拿纯文字</td>
+                <td><code>getTextContent()</code>（只拼 <code>TextBlock</code>）</td>
+              </tr>
+              <tr>
+                <td>拿某一类块</td>
+                <td><code>getContentBlocks(XxxBlock.class)</code></td>
+              </tr>
+              <tr>
+                <td>判断有没有某类块</td>
+                <td><code>hasContentBlocks(XxxBlock.class)</code></td>
+              </tr>
+              <tr>
+                <td>拿第一个块 / 第一个某类块</td>
+                <td><code>getFirstContentBlock()</code> / <code>getFirstContentBlock(X.class)</code></td>
+              </tr>
+              <tr>
+                <td>拿 token 统计</td>
+                <td><code>getChatUsage()</code></td>
+              </tr>
+              <tr>
+                <td>判断为什么结束</td>
+                <td><code>getGenerateReason()</code></td>
+              </tr>
+              <tr>
+                <td>改装一条消息（不修改原对象）</td>
+                <td><code>withContent(...)</code>、<code>withMetadata(...)</code>、<code>withGenerateReason(...)</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="generate-reason">12 个 <code>GenerateReason</code></h3>
+        <p>
+          <code>MODEL_STOP</code>（正常答完）、<code>TOOL_CALLS</code>（这轮是工具调用）、<code>STRUCTURED_OUTPUT</code>、<code>TOOL_SUSPENDED</code>（等外部执行）、<code>REASONING_STOP_REQUESTED</code>、<code>ACTING_STOP_REQUESTED</code>、<code>PERMISSION_ASKING</code>（等用户确认）、<code>MIDDLEWARE_STOP_REQUESTED</code>、<code>ALL_TOOLS_DENIED</code>、<code>INTERRUPTED</code>、<code>MAX_ITERATIONS</code>、<code>TOOL_RETURN_DIRECT</code>
+          <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/message/GenerateReason.java:39">GenerateReason.java:39</span>
+        </p>
+        <p>
+          实战里最有用的判断是：<strong>拿到回复先看 <code>getGenerateReason()</code></strong>。等于
+          <code>MAX_ITERATIONS</code> 说明该调大 <code>maxIters</code> 或简化任务；等于
+          <code>PERMISSION_ASKING</code> 说明流程卡在等人确认，不要当成「答完了」。
+        </p>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+
+        <div class="pitfall">
+          <div class="pf-h">1. 以为 <code>getTextContent()</code> 能拿到全部内容</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>用户发了一张图 + 一句话，你把消息转成字符串存库，结果图「消失」了；纯图片消息甚至存成空串。</dd>
+            <dt>因为</dt>
+            <dd>它只筛 <code>TextBlock</code> 并用换行拼接，非文本块一律忽略。</dd>
+            <dt>改成</dt>
+            <dd>要完整内容就遍历 <code>getContent()</code>，按块的运行时类型分支处理；只做日志摘要时才用 <code>getTextContent()</code>。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">2. 试图直接改 <code>getContent()</code> 返回的列表</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>UnsupportedOperationException</code>。</dd>
+            <dt>因为</dt>
+            <dd>
+              构造时用的是 <code>content.stream().filter(...).toList()</code>，得到的是不可变列表<span
+                class="src"
+                data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:151"
+                >Msg.java:151</span
+              >，而 getter 直接把它返回出去。
+            </dd>
+            <dt>改成</dt>
+            <dd>用 <code>msg.withContent(newList)</code> 造一条新消息；<code>Msg</code> 是不可变对象，所有「修改」都是返回副本。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">3. 把 <code>blockId</code> 当全局唯一 ID 存进数据库</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>不同会话、不同请求的记录互相覆盖；或者重启后对不上。</dd>
+            <dt>因为</dt>
+            <dd>
+              <code>blockId</code> 只承诺在<strong>一个 <code>replyId</code> 作用域内</strong>唯一，实现甚至可以用固定类型标识（比如文本块统一用一个常量）当
+              <code>blockId</code>。
+            </dd>
+            <dt>改成</dt>
+            <dd>落库主键用 <code>Msg.getId()</code>；需要关联块时用「<code>replyId</code> + <code>blockId</code>」组合。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">4. 假设一次回复只有一轮模型调用</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>界面上工具结果出来了，后面又冒出一段文字，但你的代码只处理第一条 <code>TEXT_BLOCK_START</code>，第二段丢了。</dd>
+            <dt>因为</dt>
+            <dd>模型调工具后会带着工具结果<strong>再次推理</strong>，所以 <code>MODEL_CALL_START</code> 与 <code>TEXT_BLOCK_START</code> 都可能出现多次。</dd>
+            <dt>改成</dt>
+            <dd>用 <code>blockId</code> 作 key 维护多个缓冲区，或者干脆每次 <code>TEXT_BLOCK_START</code> 都新开一个段落。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">5. 把事件流当历史存下来</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>会话恢复后模型「不记得」之前聊了什么，或者上下文里混进了重复内容。</dd>
+            <dt>因为</dt>
+            <dd>历史是 <code>List&lt;Msg&gt;</code>，不是事件集合。事件只是同一条消息的施工过程，存了也不能直接喂回模型。</dd>
+            <dt>改成</dt>
+            <dd>要持久化就存 <code>Msg</code>（框架的 <code>AgentStateStore</code> 就是这么做的，见 07 章）；要回放界面才存事件。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>一条纯图片消息调用 <code>getTextContent()</code> 返回什么？为什么？</summary>
+          <p>
+            返回空字符串。因为它的实现只保留 <code>TextBlock</code> 并拼接 <code>getText()</code><span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:545"
+              >Msg.java:545</span
+            >，图片块在 filter 阶段就被排除了。
+          </p>
+        </details>
+        <details>
+          <summary><code>replyId</code>、<code>blockId</code>、<code>toolCallId</code> 各自把什么关在一起？</summary>
+          <p>
+            <code>replyId</code> 关「一次回答的全部事件」；<code>blockId</code> 关「一个内容块的 start/delta/end」；<code>toolCallId</code>
+            关「一次工具调用的 call 与 result」。三者是包含关系：一个 reply 里有多个 block，一个 block 可能对应一个 tool call。
+          </p>
+        </details>
+        <details>
+          <summary>既然 <code>streamEvents()</code> 的信息更全，为什么还要用 <code>call()</code>？</summary>
+          <p>
+            因为 <code>call()</code> 在内部跑的是<strong>同一条流</strong>，只是帮你把 <code>AgentResultEvent</code> 里的
+            <code>Msg</code> 取出来<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1015"
+              >ReActAgent.java:1015</span
+            >。它省掉了你处理思考块、多轮工具、错误状态、token 统计的全部工作。只有需要「边生成边展示」时才值得自己消费事件。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">给事件做一次「类型普查」</span>
+            <div>
+              跑 <code>CountEvents</code>，然后把问题换成需要工具的（比如「现在几点？请用工具查」），再跑一次。对比两次的
+              <code>MODEL_CALL_START</code> 数量——你会亲眼看到「一轮变两轮」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">手搓打字机 + 首字延迟</span>
+            <div>
+              在 <code>doOnNext</code> 里记录第一次收到 <code>TextBlockDeltaEvent</code> 的时刻，和请求发起时刻相减，打印「首字延迟
+              xxx ms」。这个数字就是用户感知的「卡不卡」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">故意制造一个白名单错误</span>
+            <div>
+              试着 <code>new UserMessage(List.of(ToolUseBlock.builder().id("x").name("t").input(Map.of()).build()))</code>，把异常信息完整读一遍。以后再看到这条报错，你就不用猜了。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          到这里你已经能读懂流里的每一个字节了。下一章回到「谁在生产这些事件」——<a href="05-model.html">05 模型层</a>：字符串
+          <code>"dashscope:qwen-plus"</code> 怎么变成一个会吐事件的模型对象、失败怎么重试、怎么降级到备用模型。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>想确认的事</th>
+                <th>去哪看</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>官方对消息结构与访问 API 的说明</td>
+                <td><span class="src" data-src="docs/v2/zh/docs/building-blocks/message-and-event.md:26">message-and-event.md:26</span></td>
+              </tr>
+              <tr>
+                <td>官方事件类型分组表</td>
+                <td><span class="src" data-src="docs/v2/zh/docs/building-blocks/message-and-event.md:189">message-and-event.md:189</span></td>
+              </tr>
+              <tr>
+                <td>官方「从事件流重建消息」示例</td>
+                <td><span class="src" data-src="docs/v2/zh/docs/building-blocks/message-and-event.md:384">message-and-event.md:384</span></td>
+              </tr>
+              <tr>
+                <td>31 个枚举值原文</td>
+                <td>
+                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentEventType.java:40">AgentEventType.java:40</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

@@ -1,0 +1,901 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 08 章结尾留了一个「不会自动停」的 AllToolsDeniedEvent。这一章解决这类需求：不修改框架、也不塞进工具，却要在循环的特定位置插一手。2.0 的答案是 MiddlewareBase——5 个 hook，4 个洋葱 + 1 条管道。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="09 中间件与 Hook：在循环里插手 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 08 章结尾留了一个「不会自动停」的 AllToolsDeniedEvent。这一章解决这类需求：不修改框架、也不塞进工具，却要在循环的特定位置插一手。2.0 的答案是 MiddlewareBase——5 个 hook，4 个洋葱 + 1 条管道。" />
+    <title>09 中间件与 Hook：在循环里插手 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="09-middleware-hook" data-root="..">
+    <main>
+      <article class="article">
+        <h1>09 · 中间件与 Hook：在循环里插手</h1>
+        <p class="lede">
+          第 08 章结尾留了一个「不会自动停」的 <code>AllToolsDeniedEvent</code>。这一章就解决这类需求：<strong>不修改框架、
+          也不塞进工具</strong>，却要在循环的特定位置插一手。2.0 给出的答案是 <code>MiddlewareBase</code>——
+          5 个 hook，4 个洋葱 + 1 条管道。至于 1.x 的 <code>Hook</code> 体系，整包已经标了
+          <code>@Deprecated(forRemoval = true)</code>，但代码还在 fire，别慌也别新写。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 5 个 hook 谁包谁、各自的「一次」到底指什么，不再把 <code>onActing</code> 当成「每个工具一次」</li>
+          <li>用 <code>order()</code> 排出想要的嵌套顺序，并知道 <code>GracefulShutdownMiddleware</code> 为什么永远在最外层</li>
+          <li>在 <code>onReasoning</code> / <code>onActing</code> / <code>onModelCall</code> 里改输入、滤事件，用 <code>RequestStopEvent</code> 叫停</li>
+          <li>认出框架会自动挂的中间件，知道 <code>enableTaskList(true)</code> 悄悄加了什么</li>
+          <li>分清 <code>MiddlewareBase</code>（2.0，推荐）与 <code>io.agentscope.core.hook</code>（废弃但仍可用），不做无用迁移也不新写旧 API</li>
+        </ul>
+
+        <h2 id="why">先说为什么：横切的事，塞哪儿都别扭</h2>
+        <p>
+          有三类需求天生不属于「工具」也不属于「业务代码」：<strong>可观测</strong>（每轮花了多少 token、工具跑了多久）、
+          <strong>治理</strong>（超过预算就停、敏感操作先审计）、<strong>上下文加工</strong>（每轮补一条任务清单、只把最终答案推给前端）。
+          塞进工具里，工具看不到模型调用；塞进业务代码里，每次 <code>call</code> 前后都要抄一遍。中间件就是给这些事准备的接缝。
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h4>1.x 的 Hook（接 legacy 代码时会遇到）</h4>
+            <ul>
+              <li>一个 <code>onEvent(HookEvent)</code> 收所有事件，自己 <code>instanceof</code> 分流</li>
+              <li>只能<strong>改事件对象</strong>：Pre/PostReasoning、Pre/PostActing 等有 setter</li>
+              <li>换不了模型实例、改不了工具 schema、发不了「停」的信号</li>
+              <li>整包 <code>@Deprecated(forRemoval = true, since = "2.0.0")</code></li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4>2.0 的 Middleware（新代码写这个）</h4>
+            <ul>
+              <li>5 个方法各管一段，只重写你关心的，其余默认直通</li>
+              <li>拿到的 <code>input</code> 是 record，<strong>换一个新的就能改下游输入</strong></li>
+              <li>能换 <code>Model</code>、能发 <code>RequestStopEvent</code> 叫停整个循环</li>
+              <li><code>order()</code> 控制洋葱层次，可组合、可嵌套</li>
+            </ul>
+          </div>
+        </div>
+        <p class="src-line">
+          接口与 5 个 hook：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareBase.java:59">MiddlewareBase.java:59</span>；洋葱链的构建：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareChain.java:46">MiddlewareChain.java:46</span>；Hook 的废弃声明：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/hook/Hook.java:121">Hook.java:121</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">官方文档这两处，抄下来会踩坑</span>
+          <p>
+            第一，文档把 <code>onSystemPrompt</code> 画在 <code>onReasoning</code> 里面、说它「在每次组装 system prompt 时触发」。
+            实际是 <code>AgentBase.notifyPreCall()</code> 里调一次 <code>seedSystemMsg()</code><span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/agent/AgentBase.java:744"
+              >AgentBase.java:744</span
+            >，<strong>每次 <code>call</code> 只跑一次</strong>，不在每轮 reasoning 里。第二，文档的
+            <code>TimingMiddleware</code>、<code>DynamicContextMiddleware</code> 示例少了 <code>RuntimeContext ctx</code>
+            参数，签名和 2.0.4 对不上，直接编译不过。本章的代码都按源码签名写。
+          </p>
+        </div>
+
+        <h2 id="minimal">最小可跑：一个审计中间件，三处下手</h2>
+        <p>
+          这段是本章的主干：一个类同时重写 <code>onSystemPrompt</code>（改提示词）、<code>onReasoning</code>（记一轮的开始与耗时）、
+          <code>onActing</code>（记这一批工具和每个结果）。跑一次带工具的对话，控制台就能看到三处都在工作。
+        </p>
+        <pre data-lang="java" data-file="AuditDemo.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.agent.Agent;
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.event.AgentEvent;
+import io.agentscope.core.event.ToolResultEndEvent;
+import io.agentscope.core.middleware.ActingInput;
+import io.agentscope.core.middleware.MiddlewareBase;
+import io.agentscope.core.middleware.ReasoningInput;
+import io.agentscope.core.tool.Tool;
+import io.agentscope.core.tool.ToolParam;
+import io.agentscope.core.tool.Toolkit;
+
+import java.util.List;
+import java.util.function.Function;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+public class AuditDemo {
+
+    static class AuditMiddleware implements MiddlewareBase {
+
+        // 1) 管道：每次 call 组装 system prompt 时跑一次
+        @Override
+        public Mono&lt;String&gt; onSystemPrompt(
+                Agent agent, RuntimeContext ctx, String currentPrompt) {
+            return Mono.just(currentPrompt + "\n\n## 会话\n当前用户：" + ctx.getUserId());
+        }
+
+        // 2) 洋葱：每一轮推理前后
+        @Override
+        public Flux&lt;AgentEvent&gt; onReasoning(
+                Agent agent, RuntimeContext ctx, ReasoningInput input,
+                Function&lt;ReasoningInput, Flux&lt;AgentEvent&gt;&gt; next) {
+            System.out.printf("[reason] msgs=%d tools=%d%n",
+                    input.messages().size(), input.tools().size());
+            long start = System.nanoTime();
+            return next.apply(input)
+                    .doOnComplete(() -&gt; System.out.printf(
+                            "[reason] done in %d ms%n",
+                            (System.nanoTime() - start) / 1_000_000));
+        }
+
+        // 3) 洋葱：每一批工具调用前后（注意是「一批」）
+        @Override
+        public Flux&lt;AgentEvent&gt; onActing(
+                Agent agent, RuntimeContext ctx, ActingInput input,
+                Function&lt;ActingInput, Flux&lt;AgentEvent&gt;&gt; next) {
+            System.out.println("[act] batch = "
+                    + input.toolCalls().stream().map(t -&gt; t.getName()).toList());
+            return next.apply(input)
+                    .doOnNext(ev -&gt; {
+                        if (ev instanceof ToolResultEndEvent end) {
+                            System.out.println("[act] " + end.getToolCallName()
+                                    + " -&gt; " + end.getState());
+                        }
+                    });
+        }
+    }
+
+    static class FileTools {
+        @Tool(name = "read_file", description = "读一个文本文件")
+        public String read(@ToolParam(name = "path", description = "文件路径") String path) {
+            return "content of " + path;
+        }
+    }
+
+    public static void main(String[] args) {
+        Toolkit toolkit = new Toolkit();
+        toolkit.registerTool(new FileTools());
+
+        ReActAgent agent = ReActAgent.builder()
+                .name("Audited")
+                .sysPrompt("你是文件助手，按用户要求调用工具。")
+                .model("dashscope:qwen-plus")
+                .toolkit(toolkit)
+                .middleware(new AuditMiddleware())
+                .build();
+
+        RuntimeContext ctx = RuntimeContext.builder()
+                .userId("alice").sessionId("s-09").build();
+        System.out.println(agent.call("读一下 /tmp/notes.txt", ctx).block().getTextContent());
+    }
+}</pre>
+        <p class="src-line">
+          注册入口：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5006">ReActAgent.java:5006</span>；<code>order()</code> 的默认值与语义：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareBase.java:71">MiddlewareBase.java:71</span>
+        </p>
+        <div class="callout tip">
+          <span class="ct">一个实例，会被很多请求复用</span>
+          <p>
+            <code>AuditMiddleware</code> 里没有可变字段，所以安全。一旦你要「记第几次模型调用」「累计 token」这类
+            <strong>请求级</strong>状态，别放实例字段——放进 <code>RuntimeContext</code>（<code>ctx.put/get</code>）。
+            否则同一个 agent 上的两个会话会互相串数。
+          </p>
+        </div>
+
+        <h2 id="line-by-line">逐行解读：5 个 hook、3 种顺序</h2>
+
+        <h3 id="five-hooks">1. 五个 hook：谁包谁，各跑几次</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>hook</th><th>类型</th><th>「一次」指什么</th><th>input</th><th>典型用途</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>onAgent</code></td><td>洋葱</td><td>一次 <code>call</code>（<code>call</code> 与 <code>streamEvents</code> 共用，只跑一次）</td><td><code>AgentInput(msgs)</code></td><td>整次调用的计时、trace、入口鉴权</td></tr>
+              <tr><td><code>onReasoning</code></td><td>洋葱</td><td>每一轮推理</td><td><code>ReasoningInput(messages, tools, options)</code></td><td>补临时消息、滤中间轮文本、按轮限流</td></tr>
+              <tr><td><code>onModelCall</code></td><td>洋葱</td><td>每一次模型 API 调用</td><td><code>ModelCallInput(messages, tools, options, model)</code></td><td>换模型、改 delta 文本、统计 token</td></tr>
+              <tr><td><code>onActing</code></td><td>洋葱</td><td>每一<strong>批</strong>工具调用（一批可含多个）</td><td><code>ActingInput(toolCalls)</code></td><td>工具审计、全拒即停</td></tr>
+              <tr><td><code>onSystemPrompt</code></td><td>管道</td><td>每次 <code>call</code> 组装提示词时一次</td><td><code>String</code></td><td>注入时间、租户、任务说明</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="stack">
+          <div class="layer"><span class="lt">onAgent</span><span class="ld">整个 ReAct 循环，最外层；<code>call</code> 和 <code>streamEvents</code> 走同一条链，不会重复触发</span></div>
+          <div class="layer in2"><span class="lt">onReasoning</span><span class="ld">每一轮：组装输入 → <code>onModelCall</code> → 解析输出</span></div>
+          <div class="layer in3"><span class="lt">onModelCall</span><span class="ld">最贴近模型，能拿到 <code>Model</code> 实例和工具 schema</span></div>
+          <div class="layer in2"><span class="lt">onActing</span><span class="ld">每一批工具：内部还会过权限引擎，然后才真正执行</span></div>
+          <div class="layer"><span class="lt">onSystemPrompt</span><span class="ld">不在这棵树里：call 开始前单独跑一条串行管道</span></div>
+        </div>
+        <p class="src-line">
+          四处挂链的位置：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1096">ReActAgent.java:1096</span>（onAgent）、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2464">:2464</span>（onReasoning）、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2624">:2624</span>（onModelCall）、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2884">:2884</span>（onActing）
+        </p>
+
+        <h3 id="hook-order">2. order()：数字越大越靠外，但系统中间件插队</h3>
+        <p>
+          四个洋葱 hook 共用同一份中间件列表，顺序只由 <code>order()</code> 决定：数值越大越靠外；相同 <code>order</code>
+          保持注册顺序（<code>List.sort</code> 是稳定排序）。
+        </p>
+        <pre data-lang="java" data-file="OrderDemo.java">public class Outer implements MiddlewareBase {
+    @Override public int order() { return 10; }   // 比默认 1 大 → 更外层
+}
+
+public class Inner implements MiddlewareBase {
+    // 不重写 order() → 1
+}
+
+ReActAgent agent = ReActAgent.builder()
+        .name("Ordered")
+        .model("dashscope:qwen-plus")
+        .middleware(new Inner())    // 先注册
+        .middleware(new Outer())    // 后注册
+        .build();
+// 实际链条：onAgent/onReasoning/... 都是
+//   Outer 前 → Inner 前 → 核心 → Inner 后 → Outer 后</pre>
+        <p class="src-line">
+          排序发生在 <code>build()</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5621">ReActAgent.java:5621</span>；链按「后往前」构建、index 0 最外层：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareChain.java:56">MiddlewareChain.java:56</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct"><code>GracefulShutdownMiddleware</code> 永远在最外层</span>
+          <p>
+            它不参与排序：<code>build()</code> 排完序后，构造函数又把 <code>new GracefulShutdownMiddleware(...)</code>
+            <strong>插到列表第 0 位</strong><span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:341"
+              >ReActAgent.java:341</span
+            >。所以你把 <code>order()</code> 写成 100，也只能在「用户中间件」里最靠外，仍然在它里面。它的作用是让
+            reasoning / acting 各自跑完再检查停机，属于框架自己的生命周期，不该被业务包住。
+          </p>
+        </div>
+
+        <h3 id="event-direction">3. 事件方向：外层的「前」先跑，内层的「看到」先跑</h3>
+        <p>
+          洋葱的「前逻辑」从外往里，事件流却从里往外冒泡。所以同一个事件，内层中间件<strong>先</strong>看到；这也解释了为什么
+          <code>doOnNext</code> 里的日志顺序，和 <code>next.apply</code> 之前的日志顺序是相反的。
+        </p>
+        <div class="timeline">
+          <li>
+            <span class="who">Outer.pre</span>
+            <div class="what">最先执行，此时内层还没开始</div>
+          </li>
+          <li>
+            <span class="who">Inner.pre</span>
+            <div class="what">随后执行，再往下就是核心逻辑</div>
+          </li>
+          <li>
+            <span class="who">事件冒泡</span>
+            <div class="what">核心产生 <code>TextBlockDeltaEvent</code> → Inner 的 <code>doOnNext</code> 先看到 → 才轮到 Outer</div>
+          </li>
+          <li>
+            <span class="who">Inner.post / Outer.post</span>
+            <div class="what"><code>doOnComplete</code> 从里往外依次触发</div>
+          </li>
+        </div>
+        <pre data-lang="java" data-file="CountDeltas.java">@Override
+public Flux&lt;AgentEvent&gt; onReasoning(
+        Agent agent, RuntimeContext ctx, ReasoningInput input,
+        Function&lt;ReasoningInput, Flux&lt;AgentEvent&gt;&gt; next) {
+    int[] deltas = {0};                       // 只在本轮订阅内计数
+    return next.apply(input)
+            .doOnNext(ev -&gt; {
+                if (ev instanceof TextBlockDeltaEvent) {
+                    deltas[0]++;
+                }
+            })
+            .doOnComplete(() -&gt; System.out.println("本轮文本片段数：" + deltas[0]));
+}</pre>
+        <p class="src-line">
+          事件类型清单（31 个）：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentEvent.java:36">AgentEvent.java:36</span>
+        </p>
+
+        <h3 id="on-system-prompt">4. onSystemPrompt 是管道：按注册顺序接力，order() 管不着</h3>
+        <p>
+          它不是洋葱，没有 <code>next</code>。框架把上一个中间件的输出喂给下一个，按<strong>注册顺序</strong>串行执行。
+          <code>order()</code> 对这条管道无效——排序只作用于那四个洋葱 hook。
+        </p>
+        <pre data-lang="java" data-file="applySystemPromptMiddlewares.java">Mono&lt;String&gt; result = Mono.just(prompt);
+for (MiddlewareBase mw : middlewares) {          // 列表顺序，不是 order 顺序
+    result = result.flatMap(p -&gt; mw.onSystemPrompt(this, ctx, p));
+}
+return result;</pre>
+        <p class="src-line">
+          源码就在这十几行：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:789">ReActAgent.java:789</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">返回 <code>Mono.empty()</code> 会截断整条管道</span>
+          <p>
+            <code>flatMap</code> 遇到空序列就结束，后面的中间件<strong>全都不会跑</strong>，最终连 system message 都不会有
+            （<code>seedSystemMsg</code> 后面还有一层 <code>filter(prompt -&gt; !prompt.isEmpty())</code>）。
+            想「不改」就原样返回 <code>Mono.just(currentPrompt)</code>，别返回空。
+          </p>
+        </div>
+
+        <h3 id="on-model-call">5. onModelCall：最贴近模型，能换模型也能改文本</h3>
+        <p>
+          这个 hook 拿到的是原始调用参数和一个 <code>Model</code> 实例。想换模型，构造一个新的
+          <code>ModelCallInput</code> 再调 <code>next</code> 即可：
+        </p>
+        <pre data-lang="java" data-file="SwapModel.java">@Override
+public Flux&lt;AgentEvent&gt; onModelCall(
+        Agent agent, RuntimeContext ctx, ModelCallInput input,
+        Function&lt;ModelCallInput, Flux&lt;AgentEvent&gt;&gt; next) {
+    Model backup = /* 另一个 Model 实例 */;
+    return next.apply(new ModelCallInput(
+            input.messages(), input.tools(), input.options(), backup));
+}</pre>
+        <p>
+          改文本要稍微绕一下：<code>TextBlockDeltaEvent</code> <strong>没有 <code>withDelta</code></strong>，只能 new 一个
+          同 <code>replyId</code> / <code>blockId</code> 的新事件。好消息是 <code>reasoningStream</code> 会把你流出的 delta
+          重新拼成最终文本<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2631">ReActAgent.java:2631</span>，
+          所以改了事件就等于改了答案：
+        </p>
+        <pre data-lang="java" data-file="StripFence.java">@Override
+public Flux&lt;AgentEvent&gt; onModelCall(
+        Agent agent, RuntimeContext ctx, ModelCallInput input,
+        Function&lt;ModelCallInput, Flux&lt;AgentEvent&gt;&gt; next) {
+    return next.apply(input).map(ev -&gt; {
+        if (ev instanceof TextBlockDeltaEvent d &amp;&amp; d.getDelta() != null) {
+            String cleaned = d.getDelta().replace("```json", "").replace("```", "");
+            return new TextBlockDeltaEvent(d.getReplyId(), d.getBlockId(), cleaned);
+        }
+        return ev;
+    });
+}</pre>
+        <p class="src-line">
+          三参构造器（不传 id/createdAt，自动生成）：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/TextBlockDeltaEvent.java:40">TextBlockDeltaEvent.java:40</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">别在这里用「调两次 <code>next</code>」做重试</span>
+          <p>
+            <code>next.apply(input)</code> 就是一次真实的模型调用。在 <code>onErrorResume</code> 里再调一次，等于失败一次、
+            计费两次，还会绕过框架的退避与超时。重试交给 <code>modelExecutionConfig(...)</code> 或模型的
+            <code>maxRetries</code>（第 05 章），这里只做「换目标」。
+          </p>
+        </div>
+
+        <h3 id="on-reasoning-acting">6. onReasoning 与 onActing：一个包「一轮思考」，一个包「一批动作」</h3>
+        <p>
+          <code>onReasoning</code> 能改的是「这一轮发给模型的消息、工具、参数」——补一条临时消息最方便，因为
+          <code>ReasoningInput</code> 的 <code>messages</code> 就在手里。注意 record 不可变，要构造新对象：
+        </p>
+        <pre data-lang="java" data-file="InjectHint.java">@Override
+public Flux&lt;AgentEvent&gt; onReasoning(
+        Agent agent, RuntimeContext ctx, ReasoningInput input,
+        Function&lt;ReasoningInput, Flux&lt;AgentEvent&gt;&gt; next) {
+    List&lt;Msg&gt; messages = new ArrayList&lt;&gt;(input.messages());
+    messages.add(new UserMessage("system",
+            "&lt;system-reminder&gt;别忘了先读 README&lt;/system-reminder&gt;"));
+    return next.apply(new ReasoningInput(messages, input.tools(), input.options()));
+}</pre>
+        <p>
+          <code>onActing</code> 的 <code>input.toolCalls()</code> 是<strong>整批</strong>工具调用。想知道单个工具的结果，
+          不要去数调用次数，订阅 <code>ToolResultEndEvent</code>：它带 <code>toolCallName</code> 与
+          <code>state</code>（success / error / denied / interrupted）。
+        </p>
+        <div class="callout tip">
+          <span class="ct">临时消息别写进 <code>AgentState</code></span>
+          <p>
+            上面这条 <code>UserMessage</code> 只存在于本次 <code>next</code> 的输入里，不会落库、不会被压缩、也不会出现在下一轮。
+            想「每轮都提醒」，就每轮在这里补（内置的 <code>TaskReminderMiddleware</code> 正是这么干的）；想「永久记住」，
+            应该写进 <code>AgentState</code> 或长期存储，而不是靠中间件。
+          </p>
+        </div>
+
+        <h2 id="stop">叫停：<code>RequestStopEvent</code> 的三个消费点</h2>
+        <p>
+          中间件不能靠 <code>throw</code> 来停（那会变成一次错误），也不能直接 <code>return</code> 一个 <code>Msg</code>——它返回的是事件流。
+          2.0 的约定是：<strong>往流里发一个 <code>RequestStopEvent</code></strong>，框架把当前阶段跑完再收尾。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>你从哪发</th><th>谁接住</th><th>收尾动作</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>onReasoning</code>（含更深层的 <code>onModelCall</code>）</td>
+                <td>reasoning 链外层的 <code>doOnNext</code></td>
+                <td>等这次模型调用跑完；<code>buildFinalMessage()</code> 非空才写入上下文并打上 <code>generateReason</code>，随后<strong>跳过 postReasoning</strong></td>
+              </tr>
+              <tr>
+                <td><code>onActing</code></td>
+                <td>acting 链外层的 <code>doOnNext</code></td>
+                <td>等这一批工具都执行完；<code>PERMISSION_ASKING</code> 特判返回上一条 assistant，否则用 <code>buildStopMsg(results, reason)</code> 带着已产出的工具结果返回</td>
+              </tr>
+              <tr>
+                <td><code>onActing</code>（全拒专用链）</td>
+                <td><code>emitAllToolsDeniedThroughMiddleware</code></td>
+                <td>发了 stop → 最后一条 assistant 打上 reason（缺省 <code>ALL_TOOLS_DENIED</code>）；没发 → 继续下一轮</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          reasoning 的捕获与收尾：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2476">ReActAgent.java:2476</span>；acting 的：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2891">:2891</span>；全拒专用链：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4150">:4150</span>；<code>buildStopMsg</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:3484">:3484</span>
+        </p>
+        <p>
+          最常用的是「预算守卫」：允许到第 N 次模型调用为止，第 N 次正常返回，然后在流尾追加一次停止请求。
+        </p>
+        <pre data-lang="java" data-file="BudgetGuardMiddleware.java">import io.agentscope.core.agent.Agent;
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.event.AgentEvent;
+import io.agentscope.core.event.RequestStopEvent;
+import io.agentscope.core.middleware.MiddlewareBase;
+import io.agentscope.core.middleware.ModelCallInput;
+
+import java.util.function.Function;
+import reactor.core.publisher.Flux;
+
+public class BudgetGuardMiddleware implements MiddlewareBase {
+
+    private static final String KEY = "model_calls";
+    private final int maxCalls;
+
+    public BudgetGuardMiddleware(int maxCalls) {
+        this.maxCalls = maxCalls;
+    }
+
+    @Override
+    public Flux&lt;AgentEvent&gt; onModelCall(
+            Agent agent, RuntimeContext ctx, ModelCallInput input,
+            Function&lt;ModelCallInput, Flux&lt;AgentEvent&gt;&gt; next) {
+        Integer prev = ctx.get(KEY);
+        int n = (prev == null ? 0 : prev) + 1;
+        ctx.put(KEY, n);                       // 请求级状态放 ctx，不放实例字段
+
+        Flux&lt;AgentEvent&gt; call = next.apply(input);
+        if (n &lt; maxCalls) {
+            return call;
+        }
+        // 第 maxCalls 次照常完成，然后在流尾追加停止请求
+        return call.concatWith(Flux.just(
+                new RequestStopEvent("模型调用达到上限 " + maxCalls)));
+    }
+}</pre>
+        <p class="src-line">
+          两个公开构造器：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/RequestStopEvent.java:64">RequestStopEvent.java:64</span>；默认 reason 就是 <code>MIDDLEWARE_STOP_REQUESTED</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/message/GenerateReason.java:70">GenerateReason.java:70</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">只发 stop、不调 <code>next</code>，等于白停</span>
+          <p>
+            reasoning 路径上，框架要先 <code>context.buildFinalMessage()</code> 拿到这一轮的最终消息，才会把
+            <code>generateReason</code> 打上去（源码里的条件是 <code>rs != null &amp;&amp; finalMsg != null</code>）。你没调
+            <code>next</code> 就没有模型调用、也就没有 finalMsg，这次 stop 会被直接丢掉，<code>call()</code> 返回
+            <code>null</code>——不报错、不停止，最难查。<strong>正确写法永远是 <code>next.apply(input).concatWith(...)</code></strong>。
+          </p>
+        </div>
+        <p>
+          第二个高频场景就是 08 章留下的尾巴：全拒之后要不要停。默认不停（向后兼容），想停就观察
+          <code>AllToolsDeniedEvent</code> 并追加停止：
+        </p>
+        <pre data-lang="java" data-file="StopOnAllDeniedMiddleware.java">import io.agentscope.core.event.AllToolsDeniedEvent;
+import io.agentscope.core.event.RequestStopEvent;
+import io.agentscope.core.message.GenerateReason;
+
+public class StopOnAllDeniedMiddleware implements MiddlewareBase {
+
+    @Override
+    public Flux&lt;AgentEvent&gt; onActing(
+            Agent agent, RuntimeContext ctx, ActingInput input,
+            Function&lt;ActingInput, Flux&lt;AgentEvent&gt;&gt; next) {
+        return next.apply(input).concatMap(ev -&gt;
+                ev instanceof AllToolsDeniedEvent
+                        ? Flux.just(ev, new RequestStopEvent(
+                                "本轮工具全部被拒绝", GenerateReason.ALL_TOOLS_DENIED))
+                        : Flux.just(ev));
+    }
+}</pre>
+        <div class="callout tip">
+          <span class="ct">用 <code>concatMap</code>，别用 <code>flatMap</code></span>
+          <p>
+            这里要先保留原事件、再追加 stop，顺序有意义。<code>flatMap</code> 会把两个事件重新交错，<code>concatMap</code>
+            保证 <code>AllToolsDeniedEvent</code> 先被下游看到，再看到停止请求。官方文档的示例用的是 <code>flatMap</code>，
+            能跑，但顺序不保证。
+          </p>
+        </div>
+        <p>
+          停下来之后，返回的 <code>Msg</code> 会带着对应的 <code>GenerateReason</code>。照例按它分流：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>GenerateReason</th><th>谁打的</th><th>你该做什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>MIDDLEWARE_STOP_REQUESTED</code></td><td><code>RequestStopEvent</code> 的默认值</td><td>展示「已暂停」，需要时再 <code>call</code> 续跑</td></tr>
+              <tr><td><code>ALL_TOOLS_DENIED</code></td><td><strong>必须显式传入</strong>：<code>RequestStopEvent</code> 的构造器会把 null 兜成 <code>MIDDLEWARE_STOP_REQUESTED</code></td><td>告诉用户「都拒了」，别再自动重试</td></tr>
+              <tr><td><code>PERMISSION_ASKING</code></td><td>框架内部（HITL 暂停）</td><td><strong>别自己发</strong>，走 08 章的 <code>ConfirmResult</code></td></tr>
+              <tr><td><code>REASONING_STOP_REQUESTED</code> / <code>ACTING_STOP_REQUESTED</code></td><td>旧 Hook 的 <code>stopAgent()</code></td><td>维护老代码时才会见到</td></tr>
+              <tr><td><code>INTERRUPTED</code> / <code>MAX_ITERATIONS</code></td><td>中断 / 触顶</td><td>与中间件无关，但会从同一个出口返回</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          续跑很轻：挂起状态已经持久化在 <code>AgentState</code> 里，用同一个 <code>RuntimeContext</code> 再 call 一次即可——
+          <code>agent.call(List.of(), ctx)</code>；只有一个默认会话时，<code>agent.call()</code> 也行。注意摘要阶段也走
+          <code>onModelCall</code>，但那条路径不捕获 <code>RequestStopEvent</code>，别指望在摘要里把 agent 叫停。
+        </p>
+
+        <h2 id="builtin">内置中间件：只有两个在 middleware 包里，其余在别的包</h2>
+        <p>
+          搜 <code>implements MiddlewareBase</code> 会得到 5 个实现：2 个在 <code>middleware</code> 包（可直接用），
+          3 个在别处（其中 2 个由框架自动挂）。先认清谁是谁，再决定要不要自己写。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>类</th><th>重写了什么</th><th>谁挂上去</th><th>干什么 / 代价</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>TaskReminderMiddleware</code></td>
+                <td><code>onSystemPrompt</code> + <code>onReasoning</code></td>
+                <td><code>enableTaskList(true)</code> 自动</td>
+                <td>system prompt 里加一段 <code>todo_write</code> 用法；每轮把任务清单渲染成 <code>&lt;system-reminder&gt;</code> 临时注入，带 <code>METADATA_SYNTHETIC</code>，不落库、不被压缩</td>
+              </tr>
+              <tr>
+                <td><code>FinalAnswerFilterMiddleware</code></td>
+                <td><code>onReasoning</code></td>
+                <td>手动 <code>middleware(...)</code></td>
+                <td>缓冲文本事件；一旦本轮出现 <code>ToolCallStartEvent</code> 就整轮丢弃，只放行最后一轮。代价：首字要等到本轮模型调用结束才出现</td>
+              </tr>
+              <tr>
+                <td><code>OtelTracingMiddleware</code></td>
+                <td><code>onAgent</code> / <code>onModelCall</code> / <code>onActing</code></td>
+                <td>手动</td>
+                <td><code>invoke_agent</code> / <code>chat</code> / <code>execute_tool</code> 三层 span；没配 OTel SDK 时近零开销</td>
+              </tr>
+              <tr>
+                <td><code>GracefulShutdownMiddleware</code></td>
+                <td><code>onReasoning</code> / <code>onActing</code></td>
+                <td><strong>自动</strong>，插在列表第 0 位</td>
+                <td>每个阶段跑完检查是否在停机；在安全点打 checkpoint，不浪费已生成的 token</td>
+              </tr>
+              <tr>
+                <td><code>DynamicSkillMiddleware</code></td>
+                <td><code>onSystemPrompt</code></td>
+                <td>配了 <code>skillRepositories</code> 且开启动态技能时自动加</td>
+                <td>每次 call 重新解析技能仓库，把可用技能清单拼进 system prompt</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          两个可直接用的：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/TaskReminderMiddleware.java:54">TaskReminderMiddleware.java:54</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/FinalAnswerFilterMiddleware.java:44">FinalAnswerFilterMiddleware.java:44</span>；追踪：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tracing/OtelTracingMiddleware.java:77">OtelTracingMiddleware.java:77</span>；停机：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/shutdown/GracefulShutdownMiddleware.java:53">GracefulShutdownMiddleware.java:53</span>
+        </p>
+        <h3 id="task-list">任务清单：<code>enableTaskList(true)</code> 到底做了什么</h3>
+        <p>
+          它做两件事：往 toolkit 里注册内置的 <code>TodoTools</code>（提供 <code>todo_write</code>），并往中间件列表里加一个
+          <code>TaskReminderMiddleware</code>。清单存在 <code>AgentState.tasksContext</code> 里，所以对话被压缩后清单还在。
+        </p>
+        <pre data-lang="java" data-file="Planner.java">ReActAgent agent = ReActAgent.builder()
+        .name("Planner")
+        .sysPrompt("你是任务规划助手。")
+        .model("dashscope:qwen-plus")
+        .enableTaskList(true)          // 够用了：TodoTools + TaskReminderMiddleware 都会自动加
+        .build();</pre>
+        <p class="src-line">
+          开关与说明：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5059">ReActAgent.java:5059</span>；注册动作：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5560">:5560</span>；<code>build()</code> 里的触发：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5606">:5606</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">官方示例重复注册了 <code>TodoTools</code></span>
+          <p>
+            文档里既 <code>toolkit.registerTool(new TodoTools())</code> 又 <code>enableTaskList(true)</code>，等于把同一套能力申请两遍。
+            同名工具会被后来的覆盖，不报错但没必要——只留 <code>enableTaskList(true)</code> 就行。
+          </p>
+        </div>
+
+        <h2 id="hook">Hook：整包废弃，但代码还在 fire</h2>
+        <p>
+          <code>io.agentscope.core.hook</code> 下 19 个类全部标了
+          <code>@Deprecated(forRemoval = true, since = "2.0.0")</code>，javadoc 的原话是 middleware
+          「replaces this entire hook system」。但它<strong>没有被拆掉</strong>：<code>AgentBase</code> 仍然在 PreCall / PostCall
+          阶段 fire，<code>ReActAgent</code> 仍然通过 <code>LegacyHookDispatcher</code> fire 推理、行动、摘要的各阶段事件，
+          <code>builder.hooks(...)</code> 也还在。技能功能内部自己也在用 <code>SkillHook</code>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Hook 事件</th><th>对应的 middleware 位置</th><th>差别</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>PreCallEvent</code> / <code>PostCallEvent</code></td><td><code>onAgent</code>（改提示词用 <code>onSystemPrompt</code>）</td><td>Hook 能改最终返回的 <code>Msg</code>，middleware 的 <code>onAgent</code> 只能看事件流</td></tr>
+              <tr><td><code>PreReasoningEvent</code> / <code>PostReasoningEvent</code></td><td><code>onReasoning</code></td><td>Hook 改事件对象，middleware 换 <code>ReasoningInput</code></td></tr>
+              <tr><td><code>ReasoningChunkEvent</code></td><td><code>onModelCall</code> 的事件流</td><td>一个按 chunk 回调，一个是流</td></tr>
+              <tr><td><code>PreActingEvent</code> / <code>PostActingEvent</code></td><td><code>onActing</code></td><td>Hook 的 PostActing 是<strong>单个</strong>工具一次；middleware 的 <code>onActing</code> 是<strong>整批</strong>一次</td></tr>
+              <tr><td><code>PreSummaryEvent</code> / <code>PostSummaryEvent</code></td><td>无对应</td><td>摘要阶段只经过 <code>onModelCall</code>，没有 <code>onReasoning</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          废弃声明：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/hook/Hook.java:121">Hook.java:121</span>；仍在 fire 的 Pre/PostCall：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/AgentBase.java:726">AgentBase.java:726</span>；摘要走 <code>onModelCall</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:3965">ReActAgent.java:3965</span>
+        </p>
+        <div class="callout tip">
+          <span class="ct">三条实用结论</span>
+          <p>
+            一，<strong>新代码不要再写 Hook</strong>，用 middleware；二，<strong>老代码能跑就先别动</strong>，forRemoval 指的是
+            「下个小版本可能删」，不是「今天就坏」；三，两者可以共存，但同一件事别写两遍——双重日志事小，双重改写输入事大。
+          </p>
+        </div>
+
+        <h2 id="recipes">四个配方，拿走就用</h2>
+
+        <h3 id="recipe-dynamic-prompt">配方 1：按请求动态改提示词</h3>
+        <pre data-lang="java" data-file="TenantPromptMiddleware.java">public class TenantPromptMiddleware implements MiddlewareBase {
+
+    @Override
+    public Mono&lt;String&gt; onSystemPrompt(
+            Agent agent, RuntimeContext ctx, String currentPrompt) {
+        String tenant = ctx.get("tenant");        // 调用方放进 RuntimeContext 的属性
+        if (tenant == null) {
+            return Mono.just(currentPrompt);      // 没有就原样返回，别返回 empty
+        }
+        return Mono.just(currentPrompt
+                + "\n\n## 租户规则\n当前租户：" + tenant
+                + "\n只能访问该租户自己的数据。");
+    }
+}</pre>
+
+        <h3 id="recipe-metering">配方 2：整次调用记账（token / 模型调用次数）</h3>
+        <pre data-lang="java" data-file="UsageMiddleware.java">public class UsageMiddleware implements MiddlewareBase {
+
+    @Override
+    public Flux&lt;AgentEvent&gt; onAgent(
+            Agent agent, RuntimeContext ctx, AgentInput input,
+            Function&lt;AgentInput, Flux&lt;AgentEvent&gt;&gt; next) {
+        int[] calls = {0};
+        int[] in = {0};
+        int[] out = {0};
+        return next.apply(input)
+                .doOnNext(ev -&gt; {
+                    if (ev instanceof ModelCallEndEvent end &amp;&amp; end.getUsage() != null) {
+                        calls[0]++;
+                        in[0] += end.getUsage().getInputTokens();
+                        out[0] += end.getUsage().getOutputTokens();
+                    }
+                })
+                .doFinally(sig -&gt; System.out.printf(
+                        "[usage] calls=%d in=%d out=%d%n", calls[0], in[0], out[0]));
+    }
+}</pre>
+        <p>
+          用 <code>doFinally</code> 而不是 <code>doOnComplete</code>：取消和报错也要把数字打出来。这里数到的是<strong>整次 call</strong>
+          的模型调用，包含触顶后的摘要那次；只想数推理轮次，就把同样的代码挪到 <code>onReasoning</code>。
+        </p>
+
+        <h3 id="recipe-final-only">配方 3：只把最终答案推给前端</h3>
+        <p>
+          模型在中间轮常会自言自语（「我先看看文件」）。不想让 UI 看到，就挂内置的：
+        </p>
+        <pre data-lang="java" data-file="FinalOnly.java">ReActAgent agent = ReActAgent.builder()
+        .name("FinalOnly")
+        .model("dashscope:qwen-plus")
+        .toolkit(toolkit)
+        .middleware(new FinalAnswerFilterMiddleware())
+        .build();</pre>
+        <p>
+          它的判定方式是「本轮有没有出现 <code>ToolCallStartEvent</code>」：出现过就整轮文本丢弃，没出现过就在
+          <code>ModelCallEndEvent</code> 之前把缓冲的文本一口气放出来。所以<strong>流式的手感会变</strong>——首字延迟到本轮结束。
+          能用，但别默认开。
+        </p>
+
+        <h3 id="recipe-builtin">配方 4：别自己写，框架已经有</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想做的事</th><th>别写中间件，用这个</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>主模型失败切备用</td><td><code>builder.fallbackModel(...)</code> + <code>maxRetries(...)</code>（第 05 章）</td></tr>
+              <tr><td>超时与退避</td><td><code>modelExecutionConfig(...)</code> / <code>toolExecutionConfig(...)</code></td></tr>
+              <tr><td>任务清单</td><td><code>enableTaskList(true)</code></td></tr>
+              <tr><td>OpenTelemetry 追踪</td><td><code>OtelTracingMiddleware</code></td></tr>
+              <tr><td>限制总轮数</td><td><code>builder.maxIters(n)</code>（触顶会给 <code>MAX_ITERATIONS</code>）</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cheatsheet">速查</h2>
+        <h3 id="api-quick">1. API 速查</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>类 / 方法</th><th>干什么</th><th>关键点</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>MiddlewareBase</code></td><td>5 个 hook 的接口</td><td>全部有默认实现，只重写你要的</td></tr>
+              <tr><td><code>order()</code></td><td>洋葱层次</td><td>默认 1，越大越外层；相同保持注册顺序</td></tr>
+              <tr><td><code>onAgent / onReasoning / onActing / onModelCall</code></td><td>四个洋葱 hook</td><td>必须调 <code>next.apply(input)</code>，可在前后夹逻辑</td></tr>
+              <tr><td><code>onSystemPrompt</code></td><td>一条串行管道</td><td>返回 <code>Mono&lt;String&gt;</code>；每次 call 只跑一次；返回 empty 会截断</td></tr>
+              <tr><td><code>AgentInput / ReasoningInput / ActingInput / ModelCallInput</code></td><td>四个 record 输入</td><td>不可变，改字段就 new 一个</td></tr>
+              <tr><td><code>RequestStopEvent(reason)</code></td><td>请求停下</td><td>放在流尾；默认 <code>MIDDLEWARE_STOP_REQUESTED</code></td></tr>
+              <tr><td><code>builder.middleware(...)</code> / <code>middlewares(List)</code></td><td>注册</td><td><code>build()</code> 时统一按 <code>order()</code> 排序</td></tr>
+              <tr><td><code>enableTaskList(true)</code></td><td>任务清单</td><td>自动加 <code>TodoTools</code> + <code>TaskReminderMiddleware</code></td></tr>
+              <tr><td><code>FinalAnswerFilterMiddleware</code></td><td>只输出最终轮文本</td><td>首字延迟到本轮模型调用结束</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="want-table">2. 「我想…」对照表</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>写在哪</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>整次调用的耗时 / 总 token</td><td><code>onAgent</code>，数 <code>ModelCallEndEvent</code> 的 <code>getUsage()</code></td></tr>
+              <tr><td>每轮补一条临时消息</td><td><code>onReasoning</code>，new 一个带新 <code>messages</code> 的 <code>ReasoningInput</code></td></tr>
+              <tr><td>按请求改提示词</td><td><code>onSystemPrompt</code>，从 <code>ctx</code> 读租户 / 时间</td></tr>
+              <tr><td>超预算就停</td><td><code>onModelCall</code> + <code>next.apply(input).concatWith(stop)</code></td></tr>
+              <tr><td>全拒就停</td><td><code>onActing</code> + <code>AllToolsDeniedEvent</code> + <code>concatMap</code></td></tr>
+              <tr><td>换模型</td><td><code>onModelCall</code> 换 <code>ModelCallInput.model</code>；能用 <code>fallbackModel(...)</code> 就别写</td></tr>
+              <tr><td>只把最终答案推给 UI</td><td><code>new FinalAnswerFilterMiddleware()</code></td></tr>
+              <tr><td>任务清单一直摆在模型面前</td><td><code>enableTaskList(true)</code></td></tr>
+              <tr><td>接入 OpenTelemetry</td><td><code>new OtelTracingMiddleware()</code></td></tr>
+              <tr><td>限制总轮数</td><td><code>maxIters(n)</code>，不要自己数 <code>onReasoning</code> 次数</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="source-locations">3. 源码位置</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想确认的事</th><th>去哪看</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>5 个 hook 的签名与默认实现</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareBase.java:59">MiddlewareBase.java:59</span></td></tr>
+              <tr><td>洋葱链为什么 index 0 最外层</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareChain.java:46">MiddlewareChain.java:46</span></td></tr>
+              <tr><td><code>order()</code> 排序与稳定排序</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5621">ReActAgent.java:5621</span></td></tr>
+              <tr><td>停机中间件为何总在最外层</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:341">ReActAgent.java:341</span></td></tr>
+              <tr><td><code>onSystemPrompt</code> 的串行管道</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:789">ReActAgent.java:789</span></td></tr>
+              <tr><td>reasoning 里怎么接住 stop</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2476">ReActAgent.java:2476</span></td></tr>
+              <tr><td>acting 里怎么收尾</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2904">ReActAgent.java:2904</span></td></tr>
+              <tr><td>全拒事件怎么过中间件链</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4150">ReActAgent.java:4150</span></td></tr>
+              <tr><td>HITL 的暂停信号从哪发</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:3066">ReActAgent.java:3066</span></td></tr>
+              <tr><td>Hook 的废弃声明</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/hook/Hook.java:121">Hook.java:121</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. 发了 <code>RequestStopEvent</code>，<code>call()</code> 却返回 <code>null</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>中间件里明确发了停止，程序不报错，但返回的 <code>Msg</code> 是 <code>null</code>，后续按钮全部 NPE。</dd>
+            <dt>因为</dt>
+            <dd>你直接 <code>return Flux.just(new RequestStopEvent(...))</code>，没调 <code>next</code>。没有模型调用 → <code>buildFinalMessage()</code> 为 <code>null</code> → 源码里的 <code>rs != null &amp;&amp; finalMsg != null</code> 不成立，stop 被丢弃。</dd>
+            <dt>改成</dt>
+            <dd>永远 <code>next.apply(input).concatWith(Flux.just(stop))</code>；要「不调模型就拒绝」，别用 stop，直接在业务层拦住这次 <code>call</code>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 把请求状态放在中间件实例字段里</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>并发跑两个会话，A 的 token 计数跑到 B 头上；或者「只提醒一次」变成了全局只提醒一次。</dd>
+            <dt>因为</dt>
+            <dd>一个中间件实例会被同一个 agent 上的所有 <code>(userId, sessionId)</code> 共用，实例字段就是全局变量。</dd>
+            <dt>改成</dt>
+            <dd>请求级状态放 <code>RuntimeContext</code>：<code>ctx.put("k", v)</code> / <code>ctx.get("k")</code>；它在一次 call 内是线程安全的，也随 ctx 天然隔离。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. 以为 <code>onSystemPrompt</code> 每轮都跑</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>把「当前时间」「本轮任务」写进 <code>onSystemPrompt</code>，结果整轮对话里时间一直不变；或者调了 <code>order(10)</code> 想让它最后执行，没反应。</dd>
+            <dt>因为</dt>
+            <dd>它在 <code>PreCall</code> 阶段由 <code>seedSystemMsg()</code> 调一次，<strong>每次 call 只跑一次</strong>；管道按注册顺序执行，<code>order()</code> 不参与。</dd>
+            <dt>改成</dt>
+            <dd>要「每轮变」的内容放 <code>onReasoning</code>，往 messages 里补一条临时消息；<code>onSystemPrompt</code> 只放整次 call 不变的东西。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 把 <code>onActing</code> 当成「每个工具一次」</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>一轮里模型调了 3 个工具，你的日志只打了一行；或者想给每个工具单独计时，发现拿不到。</dd>
+            <dt>因为</dt>
+            <dd><code>onActing</code> 包的是<strong>一整批</strong>，<code>ActingInput.toolCalls()</code> 是列表。单个工具的粒度在事件流里。</dd>
+            <dt>改成</dt>
+            <dd>用 <code>next.apply(input)</code> 的流，按 <code>ToolResultEndEvent.getToolCallName()</code> 拆；要改参数则在工具内部或权限层做。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. 在 <code>onActing</code> 里吞掉了 <code>RequestStopEvent</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>配上自己的 <code>onActing</code> 过滤器后，08 章的权限确认不再暂停了：本来该出 <code>PERMISSION_ASKING</code>，现在直接跑下去。</dd>
+            <dt>因为</dt>
+            <dd>HITL 的暂停信号也是以 <code>RequestStopEvent("permission asking", PERMISSION_ASKING)</code> 的形式从 acting 流里发出的。你过滤事件时把它一起丢了。</dd>
+            <dt>改成</dt>
+            <dd>过滤只针对你要处理的类型；遇到 <code>RequestStopEvent</code>、<code>RequireUserConfirmEvent</code>、<code>AllToolsDeniedEvent</code> 一律原样放行。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">6. 在 <code>onModelCall</code> 里调两次 <code>next</code> 做重试</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>账单翻倍；日志里一次失败后紧跟两次成功；超时时间也不对。</dd>
+            <dt>因为</dt>
+            <dd><code>next.apply(input)</code> 就是一次真实模型调用，你在 <code>onErrorResume</code> 里再调一次就是两次请求，而且绕过了框架的退避与超时配置。</dd>
+            <dt>改成</dt>
+            <dd>重试交给 <code>modelExecutionConfig(...)</code> / <code>maxRetries(...)</code>；中间件只负责换模型或改输入。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>A 的 <code>order()</code> 是 2、B 是 1，A 先注册。谁先看到 <code>TextBlockDeltaEvent</code>？</summary>
+          <p>
+            B 先看到。A 更靠外，所以 A 的「前逻辑」先执行、B 的后逻辑先执行；但事件是从内层往外冒的，B 比 A 先拿到每个事件。<code>order</code> 只决定嵌套层次，不决定事件到达顺序。
+          </p>
+        </details>
+        <details>
+          <summary>一个 <code>onSystemPrompt</code> 返回了 <code>Mono.empty()</code>，会发生什么？</summary>
+          <p>
+            整条管道断掉：<code>applySystemPromptMiddlewares</code> 用 <code>flatMap</code> 串联，遇到空序列就结束，后面的中间件全不执行；最终 <code>seedSystemMsg</code> 拿到空字符串，再被 <code>filter(prompt -&gt; !prompt.isEmpty())</code> 滤掉，于是这次 call <strong>没有 system message</strong>。想不改就返回 <code>Mono.just(currentPrompt)</code>。
+          </p>
+        </details>
+        <details>
+          <summary>在 <code>onActing</code> 里发了 stop，这一批剩下的工具还会执行吗？</summary>
+          <p>
+            会——只要你的中间件把 <code>next</code> 的流接上。框架是「把当前阶段跑完再停」：它继续消费完整的 acting 流，所以这批工具都会执行（或走完权限判定），然后才把 <code>RequestStopEvent</code> 收尾成 <code>buildStopMsg(results, reason)</code>，已产出的结果都会保留。想让某个工具根本不跑，得在权限引擎或工具入口拦。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">给审计中间件加一层「总账」</span>
+            <div>
+              在 <code>AuditDemo</code> 上再加一个 <code>order() = 10</code> 的中间件，只重写 <code>onAgent</code>：用 <code>doFinally</code> 打印整次 call 的毫秒数，并数出 <code>ModelCallEndEvent</code> 的个数。把 <code>maxIters</code> 调成 1，让它触顶并走摘要，观察模型调用次数是不是比你预期的多一次。
+            </div>
+          </li>
+          <li>
+            <span class="sh">跑一次预算守卫，再跑一次续跑</span>
+            <div>
+              用 <code>BudgetGuardMiddleware(2)</code> 问一个需要多轮工具的问题，确认返回的 <code>getGenerateReason()</code> 是 <code>MIDDLEWARE_STOP_REQUESTED</code>；再用<strong>同一个</strong> <code>RuntimeContext</code> 调 <code>agent.call(List.of(), ctx)</code>，观察请求一开始就又停了——因为计数还在 ctx 里。想重置就 <code>ctx.put("model_calls", null)</code>（传 null 会删 key）或换一个 ctx。
+            </div>
+          </li>
+          <li>
+            <span class="sh">把 08 章的「全拒」变成「一拒就停」</span>
+            <div>
+              挂上 <code>StopOnAllDeniedMiddleware</code>，重跑 08 章的全拒场景：返回的 <code>Msg</code> 应该带 <code>ALL_TOOLS_DENIED</code>，而不是继续下一轮。然后再试「只拒一部分」：<code>AllToolsDeniedEvent</code> 不会触发，agent 会继续。这个对比能让你记住事件名里的 <strong>All</strong> 不是形容词。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          到这里，你已经能在 ReAct 循环的每个接缝上下手了：改输入、滤事件、叫停、记账。但还有一个问题没回答：
+          <strong>这个循环本身长什么样</strong>？<code>maxIters</code> 触顶后为什么要多调一次模型做摘要？中断和优雅停机有什么区别？
+          下一章 <a href="10-react-vs-harness.html">10 ReActAgent 还是 HarnessAgent：主循环拆开看</a>。顺带一提：
+          <code>HarnessAgent</code> 内部就是一个 <code>ReActAgent</code>（字段名就叫 <code>delegate</code>），它的 builder 也提供
+          <code>middleware(...)</code>，只是自己又塞了十几个（压缩、沙箱、子 agent、计划模式……），到时候你会看到本章的排序规则为什么重要。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想确认的事</th><th>去哪看</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方中间件章节（本章主要对照对象）</td><td><span class="src" data-src="docs/v2/zh/docs/building-blocks/middleware.md:7">middleware.md:7</span></td></tr>
+              <tr><td>自定义中间件示例</td><td><span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/middleware/CustomizedMiddlewareExample.java:1">CustomizedMiddlewareExample.java</span></td></tr>
+              <tr><td>模型调用中间件示例</td><td><span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/middleware/ModelCallMiddlewareExample.java:1">ModelCallMiddlewareExample.java</span></td></tr>
+              <tr><td>系统提示词中间件示例</td><td><span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/middleware/SystemPromptMiddlewareExample.java:1">SystemPromptMiddlewareExample.java</span></td></tr>
+              <tr><td>Harness 自己用了哪些中间件</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2518">HarnessAgent.java:2518</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

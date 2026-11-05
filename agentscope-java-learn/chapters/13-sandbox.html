@@ -1,0 +1,943 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 12 章那句「换部署模式只改一行 filesystem(...)」里，沙箱是成本最高的一个选项：它把 AbstractFilesystem 的十一个方法全部翻译成 shell 命令，在容器里执行。文件没变，却多出一整套生命周期问题：容器归谁、跨 call 怎么复用、容器丢了怎么恢复。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="13 沙箱与受控执行：把文件与命令关进容器 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 12 章那句「换部署模式只改一行 filesystem(...)」里，沙箱是成本最高的一个选项：它把 AbstractFilesystem 的十一个方法全部翻译成 shell 命令，在容器里执行。文件没变，却多出一整套生命周期问题：容器归谁、跨 call 怎么复用、容器丢了怎么恢复。" />
+    <title>13 沙箱与受控执行：把文件与命令关进容器 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="13-sandbox" data-root="..">
+    <main>
+      <article class="article">
+        <h1>13 · 沙箱与受控执行：把文件与命令关进容器</h1>
+        <p class="lede">
+          第 12 章那句「换部署模式只改一行 <code>filesystem(...)</code>」里，沙箱是成本最高的一个选项：它把
+          <code>AbstractFilesystem</code> 的十一个方法全部翻译成 shell 命令，在容器里跑<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:38"
+            >BaseSandboxFilesystem.java:38</span
+          >。文件没变，命令却需要一个真实的执行环境——于是多出一整套生命周期问题：容器归谁、跨 call
+          怎么复用、容器丢了怎么恢复、多个副本抢同一个用户怎么办。这一章按 <code>acquire → start → exec →
+          release</code> 的顺序把它拆开，每个默认值都对到 2.0.4 的行号上。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说出 <code>SandboxManager.acquire</code> 的四条优先级，以及哪两条<strong>不会</strong>过并发闸门</li>
+          <li>给定 <code>(isolationScope, userId, sessionId, agentId)</code>，推出容器复用的粒度，并知道 <code>USER</code> 缺 <code>userId</code> 时会降级成什么</li>
+          <li>解释 <code>AbstractBaseSandbox.start()</code> 的四分支：什么条件只补 ephemeral 条目、什么条件从快照恢复、快照不可用时怎么降级</li>
+          <li>判断「容器被删掉之后工作区还在不在」——默认答案是不在，因为 <code>DockerFilesystemSpec</code> 挂的是 <code>NoopSnapshotSpec</code></li>
+          <li>排查「沙箱起不来」「execute 一直 30 秒超时」「<code>edit_file</code> 在容器里失败」三类问题的定位顺序</li>
+        </ul>
+
+        <h2 id="why">先说为什么：一个容器要管三件事</h2>
+        <p>
+          官方给沙箱的理由是三条：宿主不被污染、能跑任意命令、能力可以横向复制<span
+            class="src"
+            data-src="docs/v2/zh/docs/harness/sandbox.md:11"
+            >sandbox.md:11</span
+          >。但代码里为了这三条写出来的东西分属三个互不相干的关注点，混看就会晕：
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">能力层：一个后端能不能跑</span>
+            <div class="ld">
+              <code>Sandbox</code> 接口只有 9 个方法（start / stop / shutdown / close / isRunning / getState /
+              exec / persistWorkspace / hydrateWorkspace）<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/Sandbox.java:42"
+                >Sandbox.java:42</span
+              >，<code>AbstractBaseSandbox</code> 负责「怎么把容器拉起来并把工作区摆好」，具体后端只填 5 个
+              <code>do*</code> 抽象方法。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">归属层：这次调用该用哪个容器</span>
+            <div class="ld">
+              <code>SandboxIsolationKey</code> 把 scope + 上下文折成一个键<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxIsolationKey.java:67">SandboxIsolationKey.java:67</span>，
+              <code>SessionSandboxStateStore</code> 用这个键在<strong>你配的状态后端</strong>里存一份
+              <code>SandboxState</code> JSON，<code>SandboxExecutionGuard</code> 负责同一个键不许两个人同时进。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">内容层：容器里那堆文件从哪来</span>
+            <div class="ld">
+              <code>WorkspaceSpec</code> + <code>layout</code> 的七种条目是声明式的「开局文件树」，宿主工作区的
+              <code>AGENTS.md</code> / <code>skills/</code> 靠一条投影条目按内容哈希增量同步进去。
+            </div>
+          </div>
+        </div>
+        <div class="callout">
+          <span class="ct">最容易搞混的一对：stop 与 shutdown</span>
+          <p>
+            <code>stop()</code> 只把工作区打包进快照、不销毁资源；<code>shutdown()</code> 才销毁后端资源（容器、临时目录），而且
+            <strong>只对 self-managed 的沙箱调用</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/Sandbox.java:35">Sandbox.java:35</span>。
+            框架侧的收口在 <code>SandboxManager.release(...)</code>：一旦这次是「你自己传进来的沙箱」（Priority 1）就直接
+            return，两个都不调<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:197">SandboxManager.java:197</span>；
+            自管的才依次 <code>stop()</code> → <code>shutdown()</code>，各自 try/catch 只
+            <code>log.warn</code>，互不阻塞<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:201-211">:201-211</span>。
+          </p>
+        </div>
+
+        <h2 id="minimal">最小可跑：一个镜像 + 一个 scope</h2>
+        <p>
+          下面这段是官方示例 <code>WorkspaceSandboxExample</code> 的装配部分，去掉了打印<span
+            class="src"
+            data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/harness/workspace/WorkspaceSandboxExample.java:80"
+            >WorkspaceSandboxExample.java:80</span
+          >。它是「模式 2：沙箱」的标准写法：
+        </p>
+        <pre data-lang="java" data-file="WorkspaceSandboxExample（节选）">Path workspace = Files.createTempDirectory("agentscope-sandbox-example");
+
+Files.writeString(
+        workspace.resolve("AGENTS.md"),
+        """
+        # Sandbox Agent
+
+        You are a coding assistant running inside a Docker sandbox.
+        All file operations and shell commands execute inside the container.
+        The host is untouched.
+        Keep answers concise (under two sentences).
+        """);
+
+HarnessAgent agent =
+        HarnessAgent.builder()
+                .name("sandbox-agent")
+                .sysPrompt("You are a coding assistant in a Docker sandbox.")
+                .model("dashscope:qwen-plus")
+                .workspace(workspace)
+                .filesystem(
+                        new DockerFilesystemSpec()
+                                .image("ubuntu:24.04")
+                                .isolationScope(IsolationScope.USER))
+                .build();
+
+RuntimeContext aliceCtx = RuntimeContext.builder().userId("alice").sessionId("alice-s1").build();
+agent.streamEvents(
+        new UserMessage(
+                "Create a file /workspace/hello.txt containing 'Hello from sandbox'"
+                        + " and then cat it to verify."),
+        aliceCtx)
+        .blockLast();</pre>
+        <p>跑之前注意 javadoc 里写明的三条前置：<code>docker info</code> 能通、镜像本地有或拉得动、模型 key 已设<span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/harness/workspace/WorkspaceSandboxExample.java:46">:46</span>。跑起来之后有三件事值得停下来确认：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">模型看到的工具一个都没变</span>
+            <div>
+              还是第 12 章那六个文件工具，外加一个 <code>execute</code>。沙箱模式对模型的唯一可见差异是<strong>路径空间换成了容器内的
+              <code>/workspace</code></strong>，提示词里的工作区说明也会换成沙箱那一版文案。
+            </div>
+          </li>
+          <li>
+            <span class="sh">alice 的第二次 call 还在同一个容器里</span>
+            <div>
+              示例紧接着问「<code>/workspace/hello.txt</code> 还在吗」，期望答 yes<span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/harness/workspace/WorkspaceSandboxExample.java:130">:130</span>。
+              靠的不是快照，而是 <code>USER</code> 键 <code>alice</code> 在状态后端里查到了上一次的
+              <code>SandboxState</code>（里面记着 containerId），于是走 Priority 3 的
+              <code>resume</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:102-120">SandboxManager.java:102-120</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">bob 是新容器，看不到 alice 的文件</span>
+            <div>
+              <code>USER</code> scope 把 userId 折进隔离键<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxIsolationKey.java:79-81">SandboxIsolationKey.java:79-81</span>，
+              bob 查不到状态 → Priority 4 新建，容器名是 <code>agentscope-sandbox-&lt;随机 uuid&gt;</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:520"
+                >DockerSandbox.java:520</span
+              >。示例里期望 bob 回答 no<span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/harness/workspace/WorkspaceSandboxExample.java:160">:160</span>。
+            </div>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <span class="ct">image 其实不是必填</span>
+          <p>
+            把 <code>.image("ubuntu:24.04")</code> 整段删掉也能跑：字段默认就是
+            <code>ubuntu:22.04</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClientOptions.java:36">DockerSandboxClientOptions.java:36</span>，
+            <code>create()</code> 里还有一层兜底<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClient.java:68-69">DockerSandboxClient.java:68-69</span>。
+            官方 filesystem.md 把它标成「必填」<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:136">filesystem.md:136</span>，是文档滞后。
+            容器内的工作区根同理默认 <code>/workspace</code>，而且这个默认写在了两处：spec 侧<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxClientOptions.java:61-63">SandboxClientOptions.java:61-63</span>
+            和 Docker options 字段<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClientOptions.java:39">DockerSandboxClientOptions.java:39</span>。
+          </p>
+        </div>
+
+        <h2 id="acquire">归属：四级优先级与一个并发闸门</h2>
+        <p>
+          每次 call 一开始，<code>SandboxManager.acquire(...)</code> 都要决定「这次用哪个容器」。四条分支从上往下短路<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:69"
+            >SandboxManager.java:69</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>优先级</th><th>触发条件</th><th>做过期闸门吗</th><th>归属</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1</td>
+                <td><code>SandboxContext.externalSandbox != null</code></td>
+                <td>不过<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:40-41">:40-41</span></td>
+                <td><code>userManaged</code>：release 不动它</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:71-77">:71-77</span></td>
+              </tr>
+              <tr>
+                <td>2</td>
+                <td><code>externalSandboxState != null</code></td>
+                <td>不过</td>
+                <td><code>selfManaged</code>：生命周期仍归框架</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:80-87">:80-87</span></td>
+              </tr>
+              <tr>
+                <td>3</td>
+                <td>隔离键能算出来，且状态后端里存过 <code>_sandbox_state</code></td>
+                <td>过</td>
+                <td><code>selfManaged</code> + <code>resume(state)</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:102-120">:102-120</span></td>
+              </tr>
+              <tr>
+                <td>4</td>
+                <td>以上都不成立</td>
+                <td>过</td>
+                <td><code>selfManaged</code> + <code>create(...)</code>，返回的是 pre-start 状态<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxClient.java:30">SandboxClient.java:30</span></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:132-148">:132-148</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Priority 3 里藏了一行容易被忽略的覆盖：反序列化出来的 <code>SandboxState</code> 带着<strong>上次部署时的</strong>
+          <code>WorkspaceSpec</code>，框架会用当前应用的 spec 把它换掉<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:113-115">:113-115</span>——所以「改了
+          <code>workspaceSpec(...)</code> 但恢复后没生效」这类疑问，方向应该是查快照里的旧文件，不是查 spec。整段
+          resume 包在 try 里，失败只 <code>log.warn</code> 然后穿透到 Priority 4 新建<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:122-129">:122-129</span>。
+        </p>
+        <h3 id="isolation-key">隔离键怎么算</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>scope</th><th>键值</th><th>缺字段时</th><th>状态槽位（userId 恒为 <code>null</code>）</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>SESSION</code></td>
+                <td><code>sessionId</code></td>
+                <td>没有 sid → <code>Optional.empty()</code>，跳过状态查询<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxIsolationKey.java:71-74">:71-74</span></td>
+                <td><code>sandbox/session/&lt;sid&gt;</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SessionSandboxStateStore.java:87">SessionSandboxStateStore.java:87</span></td>
+              </tr>
+              <tr>
+                <td><code>USER</code>（默认）</td>
+                <td><code>userId</code></td>
+                <td>缺 uid 但有 sid → <strong>降级 SESSION</strong> 并 debug<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxIsolationKey.java:84-90">:84-90</span>；两个都缺 → warn + empty，「每次都是新沙箱」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxIsolationKey.java:91-95">:91-95</span></td>
+                <td><code>sandbox/user/&lt;agentId&gt;/&lt;uid&gt;</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SessionSandboxStateStore.java:88">:88</span></td>
+              </tr>
+              <tr>
+                <td><code>AGENT</code></td>
+                <td><code>agentId</code>，恒有值</td>
+                <td>—</td>
+                <td><code>sandbox/agent/&lt;agentId&gt;</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SessionSandboxStateStore.java:89">:89</span></td>
+              </tr>
+              <tr>
+                <td><code>GLOBAL</code></td>
+                <td>常量 <code>__global__</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxIsolationKey.java:37">:37</span></td>
+                <td>—</td>
+                <td><code>sandbox/global</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SessionSandboxStateStore.java:90">:90</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>scope</code> 传 <code>null</code> 等价于 <code>USER</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxIsolationKey.java:69">:69</span>。而「不写
+          <code>isolationScope(...)</code>」时字段就是 null<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:44">SandboxFilesystemSpec.java:44</span>，
+          <code>build()</code> 里统一落 <code>USER</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2415">HarnessAgent.java:2415</span>。注意这个键<strong>同时</strong>喂给两处：文件系统层的
+          namespace 前缀和沙箱层的容器复用键，所以「bob 的文件在 <code>bob/</code> 下」和「bob 有自己的容器」是同一个决定的两个结果。
+        </p>
+        <h3 id="guard-lease">闸门与租约</h3>
+        <p>
+          <code>SandboxExecutionGuard</code> 是一个函数式接口，只有一个方法 <code>tryEnter(key)</code>，返回一个
+          <code>SandboxLease</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxExecutionGuard.java:58-72">SandboxExecutionGuard.java:58-72</span>。默认实现是
+          <code>noop()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxExecutionGuard.java:78-80">:78-80</span>，即<strong>什么都不锁</strong>。租约覆盖了整个 call
+          窗口：acquire 之前拿<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:94-98">SandboxManager.java:94-98</span>，acquire
+          中途抛异常就地还<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:150-153">:150-153</span>，call
+          结束时在 <code>releaseForCall</code> 的最后一步还<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SandboxLifecycleMiddleware.java:178">SandboxLifecycleMiddleware.java:178</span>。后端随便选：Redis
+          <code>SET NX PX</code>、ZooKeeper、数据库 advisory lock 都行<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxExecutionGuard.java:33-34">:33-34</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">javadoc 与代码在这里不一致</span>
+          <p>
+            <code>SandboxFilesystemSpec.executionGuard(...)</code> 的注释说这个只在 <code>AGENT</code> /
+            <code>GLOBAL</code> scope 下才有意义<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:80-83">SandboxFilesystemSpec.java:80-83</span>；
+            但 <code>acquire()</code> 的实际条件只有一个：<strong>只要隔离键算得出来就 <code>tryEnter</code></strong>，
+            <code>SESSION</code> 和 <code>USER</code> 一样进<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:95-97">:95-97</span>。
+            实际影响是：一旦你配了 guard，同一 userId 的两个并发请求会被串行化，而不只是 AGENT/GLOBAL 那种「一个持久槽位」的场景。
+          </p>
+        </div>
+
+        <h2 id="start">start()：四条分支决定「工作区是不是上次那个」</h2>
+        <p>
+          <code>AbstractBaseSandbox.start()</code> 是整套恢复语义的核心，判据只有两个：<code>state.isWorkspaceRootReady()</code>（上一次 stop
+          时工作区是否就绪）和 <code>snapshot.isRestorable()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:70-115">AbstractBaseSandbox.java:70-115</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>分支</th><th>条件</th><th>做什么</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>A</td>
+                <td>上次就绪，且 <code>test -d /workspace</code> 探到还在</td>
+                <td><strong>只补 ephemeral 条目</strong>，不重建、不恢复</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:77-82">:77-82</span></td>
+              </tr>
+              <tr>
+                <td>B</td>
+                <td>上次就绪，但目录没了；快照可恢复</td>
+                <td>建目录 → 解快照 → 只补 ephemeral</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:85-91">:85-91</span></td>
+              </tr>
+              <tr>
+                <td>B′</td>
+                <td>同上，但快照不可用</td>
+                <td>降级到 D，并 <code>log.warn("Branch B degraded to D: snapshot not restorable")</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:92-97">:92-97</span></td>
+              </tr>
+              <tr>
+                <td>C</td>
+                <td>上次没就绪；快照可恢复</td>
+                <td>建目录 → 解快照 → <strong>应用全量条目</strong></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:101-108">:101-108</span></td>
+              </tr>
+              <tr>
+                <td>D</td>
+                <td>上次没就绪；没有可用快照</td>
+                <td>建目录 → 按全量 spec 从零初始化</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:110-113">:110-113</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          四条分支最后都会再走一次投影（下一节），然后把 <code>workspaceRootReady</code> 置真<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:116-118">:116-118</span>；任何一步失败则置假并抛
+          <code>SandboxException.WorkspaceStartException</code>，消息是 <code>"Failed to start workspace at: " + root</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:119-122">:119-122</span
+          ><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxException.java:159">SandboxException.java:159</span>。
+          探测用的是 <code>test -d &lt;root&gt;</code>、10 秒超时，失败当作「已丢失」并 warn<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:197-207">:197-207</span>。
+        </p>
+        <p>
+          反向的 <code>stop()</code> 只有一行判断：快照 <code>isPersistenceEnabled()</code> 为假就整段跳过打包<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:133-138">:133-138</span>。<code>NoopSandboxSnapshot</code>
+          正是返回 false<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/NoopSandboxSnapshot.java:44-46">NoopSandboxSnapshot.java:44-46</span>——默认配置下，
+          <code>docker exec tar</code> 这一步根本不会发生，省掉的是每次 call 结束时打包整个工作区的开销。
+        </p>
+        <div class="callout tip">
+          <span class="ct">Docker 的 start 多做一步，而且失败信息不一样</span>
+          <p>
+            <code>DockerSandbox.start()</code> = 先 <code>doEnsureContainerRunning()</code> 再 <code>super.start()</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:96-100"
+              >DockerSandbox.java:96-100</span
+            >。容器保活靠一条 <code>sh -c "trap 'exit 0' TERM; while :; do sleep 3600 &amp; wait $!; done"</code>，注释解释了为什么不用
+            <code>sleep infinity</code>（BusyBox/Alpine 不支持）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:652-659">:652-659</span>。
+            三条状态迁移：RUNNING 复用、STOPPED 走 <code>docker start</code>、<strong>查不到就 warn + 把
+            <code>workspaceRootReady</code> 置回 false 再新建</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:497-517">:497-517</span>——正因为置回了
+            false，容器丢了这次会走 C 或 D 而不是 A，这是「容器被运维清掉之后还能自愈」的机制。
+          </p>
+        </div>
+
+        <h2 id="persistence">快照：默认不存，存了才有跨 JVM 的第二次</h2>
+        <p>三个实现，序列化名写死在接口上<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/SandboxSnapshot.java:31-36">SandboxSnapshot.java:31-36</span>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>类型</th><th>Spec</th><th>落在哪</th><th><code>isRestorable()</code></th><th>什么时候用</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>noop</code></td>
+                <td><code>NoopSnapshotSpec</code>（<code>DockerFilesystemSpec</code> 的字段默认<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerFilesystemSpec.java:35">DockerFilesystemSpec.java:35</span>）</td>
+                <td>哪儿都不落：persist 把流丢进 <code>nullOutputStream</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/NoopSandboxSnapshot.java:53-59">NoopSandboxSnapshot.java:53-59</span></td>
+                <td>恒 false<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/NoopSandboxSnapshot.java:77-80">:77-80</span></td>
+                <td>单副本、容器不会被删；或工作区本来就靠投影重建</td>
+              </tr>
+              <tr>
+                <td><code>local</code></td>
+                <td><code>LocalSnapshotSpec(basePath)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/LocalSnapshotSpec.java:53">LocalSnapshotSpec.java:53</span></td>
+                <td>宿主 <code>{basePath}/{id}.tar</code>，先写 <code>.{id}.{uuid}.tmp</code> 再 <code>ATOMIC_MOVE</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/LocalSandboxSnapshot.java:70-86">LocalSandboxSnapshot.java:70-86</span></td>
+                <td><code>Files.exists</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/LocalSandboxSnapshot.java:121-123">:121-123</span></td>
+                <td>单机重启后还要拿回工作区。多副本不行：文件在别的 pod 上</td>
+              </tr>
+              <tr>
+                <td><code>remote</code></td>
+                <td><code>RemoteSnapshotSpec(client)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/RemoteSnapshotSpec.java:49-51">RemoteSnapshotSpec.java:49-51</span></td>
+                <td>对象存储 / KV，由你传的 client 决定</td>
+                <td>取决于后端</td>
+                <td>多副本。配 <code>distributedStore(...)</code> 时会被自动注入</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          快照 id 有校验：空串抛 <code>IllegalArgumentException("Snapshot id must not be null or blank")</code>，含
+          <code>/</code>、<code>\</code>、<code>..</code>、<code>\0</code> 抛 <code>INVALID_MANIFEST_PATH</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/LocalSandboxSnapshot.java:144-153"
+            >LocalSandboxSnapshot.java:144-153</span
+          >。Docker 创建时直接用 <code>UUID.randomUUID()</code> 当 sessionId 并据此 build 快照<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClient.java:66">DockerSandboxClient.java:66</span><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClient.java:91-93">:91-93</span>，所以自制的短 id（比如 <code>user/alice</code>）会被这道校验拦住。
+        </p>
+        <h3 id="two-fallbacks">两个兜底</h3>
+        <ul>
+          <li>
+            <strong>resume 失败仍想保住连续性</strong>：<code>carryOverPersistedSnapshotId(...)</code> 会把新沙箱的快照指向<strong>旧的那个
+            id</strong>，日志 <code>"Resume fell back to fresh create; carrying over snapshot id"</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:157-182"
+              >SandboxManager.java:157-182</span
+            >。效果是下一次 <code>start()</code> 从上一份归档恢复，而不是静默重置，且 <code>stop()</code>
+            覆写同一个 id、不留孤儿归档。
+          </li>
+          <li>
+            <strong>反序列化把 remote client 重新绑上</strong>：带 spec 的 <code>deserializeState</code> 重载默认实现是「忽略
+            spec」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxClient.java:45-47">SandboxClient.java:45-47</span>，Docker
+            客户端把它改了：仅当当前 spec 与已有快照都是 remote 时，用新 client 重建快照对象<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClient.java:149-159">DockerSandboxClient.java:149-159</span>。
+            这一步不做，跨 JVM 恢复出来的快照里就攥着一个已经关掉的 OSS/Redis client。
+          </li>
+        </ul>
+        <p>
+          状态本身存在<strong>你为 agent 配的那个 <code>AgentStateStore</code></strong> 里，key 固定
+          <code>_sandbox_state</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SessionSandboxStateStore.java:34">SessionSandboxStateStore.java:34</span>，于是「配了 Redis
+          状态存储 = 沙箱恢复也分布式」是白送的<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SessionSandboxStateStore.java:28-30">:28-30</span>。删除没有用 delete，而是写一条
+          tombstone 记录，因为不是所有 store 都支持按 key 删<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SessionSandboxStateStore.java:67-76">:67-76</span>。任何底层异常都被包成
+          <code>IOException("Failed to load|save|delete sandbox state for " + key)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SessionSandboxStateStore.java:94-96">:94-96</span>。
+        </p>
+
+        <h2 id="layout">内容：WorkspaceSpec 的七种条目与一条投影</h2>
+        <p>
+          <code>WorkspaceSpec</code> 三块内容：root（默认 <code>/workspace</code>）、有序条目表、环境变量表<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpec.java:43-49"
+            >WorkspaceSpec.java:43-49</span
+          >；<code>copy()</code> 对条目值是浅拷贝，注释写明「沙箱启动后条目按不可变对待」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpec.java:75-85">:75-85</span>。七种条目由 Jackson 的
+          <code>type</code> 区分<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/layout/WorkspaceEntry.java:32-41">WorkspaceEntry.java:32-41</span>：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>type</th><th>类</th><th>谁应用它</th><th>要点</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>file</code></td><td><code>FileEntry</code></td><td><code>WorkspaceSpecApplier</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpecApplier.java:94-103">WorkspaceSpecApplier.java:94-103</span></td><td>content 默认空串、encoding 默认 UTF-8；写盘是 <code>CREATE + TRUNCATE_EXISTING</code></td></tr>
+              <tr><td><code>dir</code></td><td><code>DirEntry</code></td><td>同上 <code>:105-109</code></td><td>children 递归；ephemeral 模式下会递归进子表<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpecApplier.java:87-89">:87-89</span></td></tr>
+              <tr><td><code>local_file</code></td><td><code>LocalFileEntry</code></td><td>同上 <code>:111-118</code></td><td><code>sourcePath</code> 为空只 warn 跳过<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpecApplier.java:112-115">:112-115</span>；<code>REPLACE_EXISTING</code> 复制</td></tr>
+              <tr><td><code>local_dir</code></td><td><code>LocalDirEntry</code></td><td>同上 <code>:120-126</code></td><td><code>Files.walk</code> 整树复制；源不是目录直接抛 <code>IOException</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpecApplier.java:141-144">:141-144</span></td></tr>
+              <tr><td><code>git_repo</code></td><td><code>GitRepoEntry</code></td><td><strong>没人</strong></td><td>只留一行 <code>log.warn("GitRepoEntry is not yet implemented")</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpecApplier.java:128-129">:128-129</span></td></tr>
+              <tr><td><code>workspace_projection</code></td><td><code>WorkspaceProjectionEntry</code></td><td><code>Sandbox#start()</code> 的归档注入</td><td>applier 里显式 debug 跳过<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpecApplier.java:130-132">:130-132</span>，见下</td></tr>
+              <tr><td><code>bind_mount</code></td><td><code>BindMountEntry</code></td><td>后端的容器启动参数</td><td>javadoc 写明：Docker 走 <code>-v host:container</code>、Kubernetes 走 HostPath volume、<strong>Daytona/E2B 运行时忽略</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/layout/BindMountEntry.java:27-30">BindMountEntry.java:27-30</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          所有条目都有 <code>ephemeral</code> 开关，默认 false<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/layout/WorkspaceEntry.java:44">WorkspaceEntry.java:44</span>。它正好对上上一节的分支语义：容器还在（A）或从快照恢复（B、C）时只重放
+          ephemeral，全量重放只发生在 D<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpecApplier.java:64-70">WorkspaceSpecApplier.java:64-70</span>。想把某个
+          <code>FileEntry</code> 变成「每次 call 都覆写一次」的启动脚本，就把它标 ephemeral。
+        </p>
+        <div class="callout">
+          <span class="ct">applier 写的是宿主的文件系统</span>
+          <p>
+            <code>WorkspaceSpecApplier</code> 全程用 <code>java.nio.file.Files</code>，构造时拿的是
+            <code>spec.getRoot()</code> 这个<strong>字符串</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:59-62">AbstractBaseSandbox.java:59-62</span>。Docker
+            的根默认是容器内的 <code>/workspace</code>，所以 <code>file</code> / <code>local_file</code>
+            这类条目会落到<strong>宿主的 <code>/workspace</code></strong>（Windows 上是当前盘的
+            <code>\workspace</code>），而不是容器里——只有 <code>workspace_projection</code>（tar
+            管道）和 <code>bind_mount</code>（<code>docker run -v</code>）真能进容器。默认配置下条目表里只有那一条投影，因此这个错位不会显形<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:137-139"
+              >SandboxFilesystemSpec.java:137-139</span
+            >；一旦你手工 <code>workspaceSpec(...)</code> 塞了 <code>FileEntry</code>，就要么改成投影、要么把这个 root
+            同时挂成 bind mount。
+          </p>
+        </div>
+        <h3 id="projection">投影：宿主 → 沙箱，单向，按内容哈希增量</h3>
+        <p>
+          装配在 spec 层完成：只要没关投影且拿得到宿主工作区根，就往条目表里插一个固定 key
+          <code>__workspace_projection__</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:127-141">SandboxFilesystemSpec.java:127-141</span>，默认收录五个根：<code>AGENTS.md</code>、<code>skills</code>、<code>subagents</code>、<code>knowledge</code>、<code>.skills-cache</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:41-42"
+            >:41-42</span
+          >（传 <code>null</code> 会回到这五份，不是清空<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:102-108">:102-108</span>）。执行在
+          <code>start()</code> 的最后一步<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:267-287">AbstractBaseSandbox.java:267-287</span>：
+        </p>
+        <ul class="timeline">
+          <li><span class="who">收集</span><div class="what">按 key 排序遍历，只收 <code>sourceRoot</code> 之下且真实存在的常规文件，目录走 <code>Files.walk</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceProjectionApplier.java:101-134">WorkspaceProjectionApplier.java:101-134</span></div></li>
+          <li><span class="who">算哈希</span><div class="what">SHA-256 over「相对路径 + 0x00 + 字节」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceProjectionApplier.java:50-88">:50-88</span>，路径也进摘要，所以改名会让内容哈希变化</div></li>
+          <li><span class="who">比上次</span><div class="what">与 <code>state.getWorkspaceProjectionHash()</code> 相同就整段跳过<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:273-276">AbstractBaseSandbox.java:273-276</span>——这就是「改一个 skills 文件要重启才生效」的反面：不需要重启，但需要哈希变</div></li>
+          <li><span class="who">注水</span><div class="what"><code>fileCount &gt; 0</code> 才把 tar 灌进容器（走 <code>doHydrateWorkspace</code>）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:277-281">:277-281</span></div></li>
+          <li><span class="who">记账</span><div class="what">写回新的哈希<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:282">:282</span>。注意哈希存在 <code>SandboxState</code> 里<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxState.java:43">SandboxState.java:43</span>，状态没持久化 = 每次 call 都重灌</div></li>
+        </ul>
+        <p>
+          方向是<strong>单向</strong>的：宿主改了会同步进容器，容器里 agent 写的文件不会回流宿主<span class="src" data-src="docs/v2/zh/docs/harness/sandbox.md:284">sandbox.md:284</span>。想让产物回到宿主，走快照（第 12 章的
+          <code>deliver_artifact</code> 是另一条路）。
+        </p>
+
+        <h2 id="filesystem">文件系统侧：十一个方法怎么变成 shell</h2>
+        <p>
+          沙箱族在接口上只多两个方法：<code>id()</code> 和 <code>execute(rc, command, timeoutSeconds)</code>，后者的
+          <code>timeoutSeconds</code> 传 null 时用 filesystem 自己的默认<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/AbstractSandboxFilesystem.java:27-48">AbstractSandboxFilesystem.java:27-48</span>。<code>BaseSandboxFilesystem</code>
+          把其余九个方法全翻译成 shell——这是「镜像契约」的真正来源：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>容器里实际跑</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>ls</code></td><td>一段 POSIX shell：<code>stat -c '%Y' / '%s'</code>，用 <code>__NOT_EXISTS__</code> / <code>__NOT_A_DIR__</code> / <code>DIR:</code> / <code>FILE:</code> 四种前缀回传协议</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:73-130">BaseSandboxFilesystem.java:73-130</span></td></tr>
+              <tr><td><code>read</code></td><td>文本走 <code>sed -n 'start,end p'</code>（<code>startLine = offset + 1</code>），非文本走 <code>base64</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:132-192">:132-192</span></td></tr>
+              <tr><td><code>write</code></td><td>先 <code>if [ -e ] … exit 1</code> + <code>mkdir -p $(dirname)</code>，再走 <code>uploadFiles</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:194-232">:194-232</span></td></tr>
+              <tr><td><code>edit</code></td><td><strong>base64 载荷 + heredoc 调 <code>python3 -c</code></strong>，错误映射 <code>file_not_found</code> / <code>string_not_found</code> / <code>multiple_occurrences</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:234-319">:234-319</span></td></tr>
+              <tr><td><code>grep</code></td><td><code>grep -rHnF [--include=…] -e pattern path 2&gt;/dev/null || true</code>，按 <code>:</code> 切三段</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:321-367">:321-367</span></td></tr>
+              <tr><td><code>glob</code></td><td><code>find path -type f -name pattern | sort</code> + GNU <code>stat</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:369-413">:369-413</span></td></tr>
+              <tr><td><code>delete</code></td><td><code>rm -rf</code>（先过 <code>validatePath</code>）</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:415-425">:415-425</span></td></tr>
+              <tr><td><code>move</code> / <code>exists</code></td><td><code>mkdir -p $(dirname to) &amp;&amp; mv</code> / <code>test -e … &amp;&amp; echo yes || echo no</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:427-451">:427-451</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          两处文案与第 12 章的本地实现对得死死的：空文件读出来是一句非空的 <code>System reminder: File exists but has
+          empty contents</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:183-186">:183-186</span>；<code>write</code>
+          撞已存在文件时回「先读再改，或者写新路径」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:206-215">:206-215</span>。这不是巧合：工具层语义要在三种模式之间保持一致，模型才不用重学。
+        </p>
+        <h3 id="sandbox-fs-proxy">SandboxBackedFilesystem：一个不带容器的代理</h3>
+        <p>
+          这个对象在 <code>build()</code> 里 <code>new</code> 出来时就固定了，但它<strong>不持有容器</strong>。真正的沙箱是每次 call
+          由中间件绑到这次的 <code>RuntimeContext</code> 上的<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SandboxLifecycleMiddleware.java:114-121">SandboxLifecycleMiddleware.java:114-121</span>；那个
+          <code>volatile</code> 字段只是给不穿上下文的调用方（比如 <code>WorkspaceMessageBus</code>）的兜底，注释直言并发下它是
+          last-writer-wins、<strong>不许拿来做隔离</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/SandboxBackedFilesystem.java:56-58">SandboxBackedFilesystem.java:56-58</span>。这不是洁癖，是 issue
+          #2490：同一 agent 上并发的两个不同会话曾经会互相踩掉绑定。解析顺序因此是「先读本 call 上下文里的
+          <code>SandboxAcquireResult</code>，再退到字段，两个都没有就抛 <code>SandboxConfigurationException("No active sandbox — sandbox
+          filesystem used outside of a call context")</code>」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/SandboxBackedFilesystem.java:239-255">:239-255</span>。
+        </p>
+        <p>
+          <code>execute(...)</code> 的异常处理值得单独记：超时转成 <code>ExecuteResponse(msg, 124, false)</code>、非零退出转成「stdout + stderr
+          + 原退出码」、其它异常转成 <code>"Internal sandbox error: …"</code> 与 <code>-1</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/SandboxBackedFilesystem.java:99-120"
+            >:99-120</span
+          >。也就是说<strong>模型永远拿到一个可读的响应而不是一个异常</strong>，而 124 正是 <code>timeout(1)</code> 的约定码，<code>read</code>
+          里判断「命令到底跑没跑」用的就是它<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:141-151">BaseSandboxFilesystem.java:141-151</span>。
+        </p>
+        <p>
+          上传下载各有两条路：后端实现 <code>SandboxFileTransfer</code>（Docker 用宿主临时文件 +
+          <code>docker cp</code>）时优先走原生通道<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/SandboxBackedFilesystem.java:136-160">:136-160</span><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:374-414">DockerSandbox.java:374-414</span>；否则退回「单文件 tar
+          + <code>hydrateWorkspace</code>」和「<code>base64 path</code>」。这个可选能力接口的 javadoc 给了动机：Linux
+          单个命令行参数约 128 KiB 上限，大文件走 base64-over-exec 会撞墙<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxFileTransfer.java:26-27">SandboxFileTransfer.java:26-27</span>。退避规则也是分开的：路径「不被支持」才回退，原生传输<strong>失败</strong>不回退<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxFileTransfer.java:50-51"
+            >:50-51</span
+          >；下载侧被截断则直接失败并回 <code>"File download output was truncated by the sandbox"</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/SandboxBackedFilesystem.java:203-207">SandboxBackedFilesystem.java:203-207</span>，解码用 <code>Base64.getMimeDecoder()</code> 以容忍 GNU base64 的换行<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/SandboxBackedFilesystem.java:209-212">:209-212</span>。
+        </p>
+        <p>
+          最后一层是路由：<code>filesystemRoute("memories/", …)</code> 和沙箱同时出现时会包一个
+          <code>RoutedSandboxFilesystem</code>，它内部挂一个 <code>CompositeFilesystem</code>，但
+          <code>execute</code> 与 <code>id</code> <strong>恒定走 primary 沙箱</strong>，免得挂个 KV 路由就把
+          <code>execute</code> 弄没了<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/RoutedSandboxFilesystem.java:33-74">RoutedSandboxFilesystem.java:33-74</span>。
+        </p>
+
+        <h2 id="tools">工具层：execute 与它的一圈条件</h2>
+        <p>
+          工具名就叫 <code>execute</code>（<code>NAME</code> 常量<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:32">ShellExecuteTool.java:32</span>），注册条件只有一个实例检查<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2722-2724">HarnessAgent.java:2722-2724</span>：
+          <code>!disableShellTool &amp;&amp; filesystem instanceof AbstractSandboxFilesystem</code>。注意第 12 章里
+          <code>LocalFilesystemWithShell</code> 也满足这个条件，所以「有没有 execute」跟「是不是沙箱」并不是同一件事。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>参数 / 行为</th><th>事实</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>描述</td><td>「如果有专门工具（read_file 等），你必须用工具而不是 shell 命令」</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:44-49">:44-49</span></td></tr>
+              <tr><td><code>timeout</code></td><td>没传或 ≤0 时代码写死 <strong>30 秒</strong>，参数描述也写 <code>default: 30</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:78">:78</span><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:59-63">:59-63</span></td></tr>
+              <tr><td>沙箱自己的默认</td><td><code>AbstractBaseSandbox.getDefaultExecTimeoutSeconds()</code> = <strong>120 秒</strong>，但只有传 null 才用得上</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:173-177">AbstractBaseSandbox.java:173-177</span><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:214-216">:214-216</span></td></tr>
+              <tr><td><code>working_directory</code></td><td>以 <code>/</code>、<code>~</code> 开头或含 <code>..</code> 直接返回一句错误文本，不抛异常；Windows 拼 <code>cd /d "…" &amp;&amp;</code>，其他 <code>cd '…' &amp;&amp;</code>（单引号转义）</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:64-76">:64-76</span><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:92-98">:92-98</span></td></tr>
+              <tr><td>回给模型的样子</td><td><code>Exit code: N</code> + 空行 + 输出，截断时追加 <code>(output was truncated)</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:81-89">:81-89</span></td></tr>
+              <tr><td>输出上限</td><td>Docker 侧 stdout / stderr <strong>各</strong> 512 KiB，任一到达即标 truncated</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:78">DockerSandbox.java:78</span><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:192-195">:192-195</span></td></tr>
+              <tr><td>计划模式</td><td>只有开了 <code>allowShellInPlanMode</code> 才把 <code>execute</code> 放进白名单，否则计划模式下命令一律被拦</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2743-2746">:2743-2746</span></td></tr>
+              <tr><td>技能里的脚本路径</td><td>沙箱前缀取 <code>clientOptions.getWorkspaceRoot()</code>，拿不到才回 <code>/workspace</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2883-2894">:2883-2894</span></td></tr>
+              <tr><td>工具里的路径归一</td><td>沙箱分支用 <code>ShellPathPolicy.SANDBOX_WORKSPACE_PREFIX</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2707-2709">:2707-2709</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="end-to-end">端到端：一次 <code>execute("pytest -q")</code> 走了哪些门</h2>
+        <ul class="timeline">
+          <li><span class="who">入口</span><div class="what"><code>streamEvents</code> 被包成 <code>Flux.using</code>：资源获取阶段调 <code>acquireForCall(effective)</code>，收尾阶段调 <code>releaseForCall(eff)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:991-1006">HarnessAgent.java:991-1006</span></div></li>
+          <li><span class="who">补默认</span><div class="what"><code>ensureSessionDefaults</code> 把 <code>defaultSandboxContext</code> 塞进这次调用的上下文；上下文里已自带 <code>SandboxContext</code> 时<strong>以调用方为准</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1021-1024">:1021-1024</span><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1033">:1033</span></div></li>
+          <li><span class="who">前置回调</span><div class="what"><code>beforeStartCallback</code>（如果注册了）先跑，用来让宿主物化 <code>.skills-cache/</code> 之类，好让这次 start 的投影带上它；回调失败只 warn<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SandboxLifecycleMiddleware.java:98-109">SandboxLifecycleMiddleware.java:98-109</span></div></li>
+          <li><span class="who">acquire</span><div class="what">四级优先级 + 闸门租约，见上文<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:69-155">SandboxManager.java:69-155</span></div></li>
+          <li><span class="who">start</span><div class="what"><code>doEnsureContainerRunning()</code> → 四分支工作区 → 投影；成功后把结果绑进上下文、把容器交给文件系统代理<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SandboxLifecycleMiddleware.java:110-124">:110-124</span></div></li>
+          <li><span class="who">模型调工具</span><div class="what"><code>ShellExecuteTool.execute(rc, "pytest -q", null, null)</code> → 超时补 30 → <code>sandbox.execute(...)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:78-79">ShellExecuteTool.java:78-79</span></div></li>
+          <li><span class="who">解析沙箱</span><div class="what"><code>requireSandbox(runtimeContext)</code> 先读本 call 的绑定<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/SandboxBackedFilesystem.java:239-255">SandboxBackedFilesystem.java:239-255</span></div></li>
+          <li><span class="who">真跑</span><div class="what"><code>docker exec -w /workspace &lt;id&gt; sh -c "pytest -q"</code>，两个 daemon 线程排空 stdout/stderr；超时 <code>destroyForcibly</code> 并抛 <code>ExecTimeoutException</code>，非零抛 <code>ExecException</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:144-200">DockerSandbox.java:144-200</span></div></li>
+          <li><span class="who">回话</span><div class="what">异常被转成 <code>ExecuteResponse</code>，再被工具转成 <code>Exit code: 1 …</code> 文本<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/SandboxBackedFilesystem.java:107-119">:107-119</span></div></li>
+          <li><span class="who">release</span><div class="what">先 <code>release</code>（stop 打包 → shutdown 删容器）再 <code>persistState</code>，注释说明这个顺序是为了让 stop 期间的状态改动被记进持久化<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SandboxLifecycleMiddleware.java:166-177">:166-177</span>；最后 <code>lease.close()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SandboxLifecycleMiddleware.java:178">:178</span></div></li>
+        </ul>
+        <p>
+          post-call 的两个失败都只 <code>log.warn</code>、不回传给调用方<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SandboxLifecycleMiddleware.java:48-49">SandboxLifecycleMiddleware.java:48-49</span>，所以「回复正常但下一 call 工作区不对」的问题，第一现场永远是日志里的
+          <code>[sandbox-mw]</code> / <code>[sandbox]</code> 前缀。
+        </p>
+
+        <h2 id="backends">后端：Docker 之外只有四个</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>后端</th><th>模块</th><th>Spec / Jackson 注册</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Docker</td><td>harness 内置<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerFilesystemSpec.java:31">DockerFilesystemSpec.java:31</span></td><td><code>docker</code> 是唯一写死在 <code>SandboxClientOptions</code> 上的子类型<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxClientOptions.java:30-33">SandboxClientOptions.java:30-33</span>，state 子类型由 <code>HarnessSandboxJacksonModule</code> 注册<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/json/HarnessSandboxJacksonModule.java:30-33">HarnessSandboxJacksonModule.java:30-33</span></td></tr>
+              <tr><td>Kubernetes</td><td><code>agentscope-extensions-sandbox-kubernetes</code></td><td><code>KubernetesFilesystemSpec</code> + 自己那份 module<span class="src" data-src="agentscope-extensions/agentscope-extensions-sandbox/agentscope-extensions-sandbox-kubernetes/src/main/java/io/agentscope/extensions/sandbox/kubernetes/KubernetesSandboxClient.java:79-80">KubernetesSandboxClient.java:79-80</span></td></tr>
+              <tr><td>E2B / Daytona / AgentRun</td><td><code>agentscope-extensions-sandbox-{e2b,daytona,agentrun}</code></td><td>同构：各一个 <code>*FilesystemSpec</code>、各注册一个 state 子类型名<span class="src" data-src="agentscope-extensions/agentscope-extensions-sandbox/agentscope-extensions-sandbox-e2b/src/main/java/io/agentscope/extensions/sandbox/e2b/E2bSandboxClient.java:50-51">E2bSandboxClient.java:50-51</span></td></tr>
+              <tr><td>自研</td><td>—</td><td>照 <code>SandboxFilesystemSpec</code> 的四个 abstract 实现即可；官方指路测试里的 <code>InMemorySandbox</code><span class="src" data-src="docs/v2/zh/docs/harness/sandbox.md:292">sandbox.md:292</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>SandboxState</code> 上有 <code>@JsonTypeInfo</code> 但<strong>没有</strong>
+          <code>@JsonSubTypes</code>，注释解释subtype 交给 module 注册，这样新增后端不用改这个类<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxState.java:29-34">SandboxState.java:29-34</span>。每个官方扩展因此都注册两个 module<span class="src" data-src="agentscope-extensions/agentscope-extensions-sandbox/agentscope-extensions-sandbox-daytona/src/main/java/io/agentscope/extensions/sandbox/daytona/DaytonaSandboxClient.java:51-52">DaytonaSandboxClient.java:51-52</span>——自定义后端时，忘注册的后果是 <code>deserializeState</code> 抛 <code>SandboxConfigurationException("Failed to deserialize … sandbox state")</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClient.java:127-135">DockerSandboxClient.java:127-135</span>。
+        </p>
+        <div class="callout">
+          <span class="ct">镜像契约：alpine 和 distroless 不合格</span>
+          <p>
+            因为上一节那些 shell 翻译，镜像里必须有：<code>sh</code>、<code>mkdir/rm/mv/test/sed -n</code>、
+            <code>grep -rHnF --include</code>、<code>find</code>、<strong>GNU</strong>
+            <code>stat -c</code>、<code>tar</code>、<code>base64</code>、<strong>python3</strong>，且工作区可写<span
+              class="src"
+              data-src="docs/v2/zh/docs/harness/sandbox.md:191-209"
+              >sandbox.md:191-209</span
+            >。BusyBox 的 <code>stat</code> 不认 <code>-c '%Y'</code>，所以 <code>ls</code>/<code>glob</code>
+            会给出 size/mtime 全 0 的条目——代码里到处是 <code>2&gt;/dev/null || echo 0</code> 的兜底<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:86-91"
+              >BaseSandboxFilesystem.java:86-91</span
+            >，它不会报错，只会静默给你错数据。至于 python3：只有 <code>edit_file</code> 用它，缺了它的表现是「其它工具都正常、改文件永远失败」。
+          </p>
+        </div>
+        <p>
+          还有一条默认值容易忽略：<code>--network</code> 没设时强制 <code>none</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:623-624">DockerSandbox.java:623-624</span>，
+          即沙箱默认<strong>没有网络</strong>，<code>pip install</code> 之类的命令会直接失败。内存、CPU、端口都是可选参数<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:605-621"
+            >:605-621</span
+          >，不传就是不限。
+        </p>
+
+        <h2 id="assemble">这块什么时候装上</h2>
+        <p>全部以 <code>HarnessAgent.build()</code> 为准，沙箱那一支集中在 2450-2481：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>行号</th><th>发生什么</th><th>条件</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>:2362-2370</code></td><td>sandbox / remote / local 三个 spec 至多配一个，多配抛 <code>IllegalStateException</code></td><td>无条件</td></tr>
+              <tr><td><code>:2384-2407</code></td><td><code>distributedStore</code> 补 <code>snapshotSpec</code> 与 <code>executionGuard</code>——<strong>只在对应字段是 null 时才补</strong>，显式设置优先</td><td>配了 store 且有沙箱 spec<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2392-2400">:2392-2400</span></td></tr>
+              <tr><td><code>:2415-2425</code></td><td>算 <code>fsIsolationScope</code>（默认 USER）并生成 namespace 工厂</td><td>无条件</td></tr>
+              <tr><td><code>:2442-2444</code></td><td><code>resolveFilesystem</code> 先算出一个 filesystem</td><td>无条件</td></tr>
+              <tr><td><code>:2450-2455</code></td><td><code>new SandboxBackedFilesystem()</code> 顶掉上一步结果；有路由则再包 <code>RoutedSandboxFilesystem</code></td><td>沙箱 spec<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2451-2455">:2451-2455</span></td></tr>
+              <tr><td><code>:2457</code></td><td><code>toSandboxContext(resolvedWorkspace)</code>：client 为 null 直接 <code>NullPointerException("sandbox client is required")</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:110-121">SandboxFilesystemSpec.java:110-121</span></td></tr>
+              <tr><td><code>:2459-2466</code></td><td>状态后端是本地实现时<strong>只 <code>log.warn</code></strong>，不抛</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2459-2466">:2459-2466</span></td></tr>
+              <tr><td><code>:2468-2479</code></td><td><code>SessionSandboxStateStore</code> → 取 guard（没配则 noop）→ <code>SandboxManager</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2468-2479">:2468-2479</span></td></tr>
+              <tr><td><code>:2480-2481</code></td><td><code>new SandboxLifecycleMiddleware(manager, proxy)</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2480-2481">:2480-2481</span></td></tr>
+              <tr><td><code>:2519-2521</code></td><td><strong>它是第一个装上的中间件</strong>，排在 <code>AgentTraceMiddleware</code> 之前</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2519-2523">:2519-2523</span></td></tr>
+              <tr><td><code>:2707-2709</code></td><td><code>pathNormalizer</code> 走沙箱前缀分支</td><td>沙箱<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2697-2699">:2697-2699</span></td></tr>
+              <tr><td><code>:2722-2724</code></td><td>注册 <code>execute</code></td><td><code>instanceof AbstractSandboxFilesystem</code></td></tr>
+              <tr><td><code>:2883-2894</code></td><td><code>ShellPathPolicy.sandbox(wsPrefix)</code>，含 routed 的 primary 判断</td><td>技能可用时</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「沙箱中间件第一个装」这件事有实际后果：任何想读工作区文件的中间件（工作区上下文、转写、压缩）都在容器已经起来之后才跑，所以它们能直接用
+          <code>read_file</code> 背后那套抽象；反过来，你在更前面插自己的中间件是插不进去的——<code>build()</code> 里没有比它更早的安装点。
+        </p>
+
+        <h2 id="doc-gap">官方说了什么 vs 源码实际是什么</h2>
+        <p>sandbox.md 整体是这一组文档里最贴代码的一篇，但四处偏差会直接影响写代码：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>主题</th><th>官方说法</th><th>2.0.4 源码事实</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Docker 的 <code>image</code></td>
+                <td>标「必填」<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:136">filesystem.md:136</span></td>
+                <td>默认 <code>ubuntu:22.04</code>，<code>create()</code> 里还有兜底<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandboxClientOptions.java:36">DockerSandboxClientOptions.java:36</span></td>
+              </tr>
+              <tr>
+                <td>沙箱的 isolationScope 默认</td>
+                <td>两处写「后端默认 SESSION」<span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:137">filesystem.md:137</span><span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:237">:237</span></td>
+                <td>spec 字段是 null<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:44">SandboxFilesystemSpec.java:44</span>，由 <code>build()</code> 落 <code>USER</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2415">HarnessAgent.java:2415</span>；sandbox.md 自己的表也写 USER 是默认<span class="src" data-src="docs/v2/zh/docs/harness/sandbox.md:44">sandbox.md:44</span>——两篇文档互相矛盾</td>
+              </tr>
+              <tr>
+                <td>快照 Spec 清单</td>
+                <td>把 <code>OssSnapshotSpec</code> / <code>RedisSnapshotSpec</code> / <code>JdbcSnapshotSpec</code> 列成 harness 的东西<span class="src" data-src="docs/v2/zh/docs/harness/sandbox.md:74-76">sandbox.md:74-76</span></td>
+                <td>harness 只有 <code>Noop</code> / <code>Local</code> / <code>Remote</code> 三种<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/SandboxSnapshot.java:32-36">SandboxSnapshot.java:32-36</span>；那三个在 oss / redis / mysql / jdbc 等扩展模块里，且都 <code>extends RemoteSnapshotSpec</code></td>
+              </tr>
+              <tr>
+                <td><code>execute</code> 的默认超时</td>
+                <td>未提</td>
+                <td>工具层写死 30 秒<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:78">ShellExecuteTool.java:78</span>，沙箱层 120 秒只在传 null 时生效<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:214-216">AbstractBaseSandbox.java:214-216</span></td>
+              </tr>
+              <tr>
+                <td>本地状态存储的强度</td>
+                <td>「多副本部署必须配分布式 store」<span class="src" data-src="docs/v2/zh/docs/harness/sandbox.md:111">sandbox.md:111</span></td>
+                <td>确实只是 <code>log.warn</code>，与 remote 模式的硬抛异常不同<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431-2439">HarnessAgent.java:2431-2439</span><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2459">:2459</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 id="unwired">未接线</h3>
+        <div class="pitfall">
+          <div class="pf-h"><code>GitRepoEntry</code>：类型能序列化，落盘时被丢弃</div>
+          <dl>
+            <dt>现状</dt>
+            <dd>
+              它 <strong>是</strong>七种布局条目之一，Jackson 认得<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/layout/WorkspaceEntry.java:32-41">WorkspaceEntry.java:32-41</span>，也写进了 sandbox.md 的挂载叙述里。
+            </dd>
+            <dt>问题</dt>
+            <dd>
+              <code>WorkspaceSpecApplier</code> 对它的唯一处理是一行 <code>log.warn("GitRepoEntry is not yet
+              implemented, skipping entry at: …")</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpecApplier.java:128-129">:128-129</span>；仓库里没有任何 git clone 调用点。
+            </dd>
+            <dt>结论</dt>
+            <dd>要往沙箱里放代码，先用 <code>local_dir</code> 从宿主拷，或者 <code>bind_mount</code>，或者干脆把仓库打进自定义镜像。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h"><code>WorkspaceArchiveExtractor</code>：生产路径没人调</div>
+          <dl>
+            <dt>现状</dt>
+            <dd>一个防 Zip Slip 的 tar 解包工具：拒绝对路径、拒绝 <code>..</code> 段、拒绝 NUL 字节，最后再校验目标在根内<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceArchiveExtractor.java:54-113">WorkspaceArchiveExtractor.java:54-113</span>。</dd>
+            <dt>问题</dt>
+            <dd>
+              全仓库检索，除了定义本身只有一个测试类调它<span class="src" data-src="agentscope-harness/src/test/java/io/agentscope/harness/agent/sandbox/WorkspaceProjectionApplierTest.java:65">WorkspaceProjectionApplierTest.java:65</span>。Docker 侧解包用的是容器里的 <code>tar -xf - -C &lt;root&gt;</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:269-280">DockerSandbox.java:269-280</span>。
+            </dd>
+            <dt>结论</dt>
+            <dd>它是一道<strong>库层面</strong>的防护，供自研后端复用；写自定义沙箱时请调它，别自己 <code>Files.copy</code> 解 tar。</dd>
+          </dl>
+        </div>
+
+        <h2 id="cheatsheet">速查</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想干什么</th><th>怎么写</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>最省事的沙箱</td><td><code>.filesystem(new DockerFilesystemSpec())</code>（image 有默认，容器内根 <code>/workspace</code>）</td></tr>
+              <tr><td>给容器限额、开网</td><td><code>.memorySizeBytes(512L * 1024 * 1024).cpuCount(2L).network("bridge")</code>；不写 network 就是 <code>none</code></td></tr>
+              <tr><td>重启后还要保住 agent 装的东西</td><td><code>.snapshotSpec(new LocalSnapshotSpec(dir))</code>（单机）或 <code>distributedStore(...)</code>（多副本）</td></tr>
+              <tr><td>整个 agent 共用一个容器</td><td><code>.isolationScope(IsolationScope.AGENT)</code>，并且<strong>配 guard</strong>，否则并发互踩</td></tr>
+              <tr><td>同 scope 串行化</td><td><code>.executionGuard(RedisSandboxExecutionGuard.…)</code> 或交给 <code>distributedStore</code> 自动注入</td></tr>
+              <tr><td>宿主目录直接挂进容器</td><td>在 <code>workspaceSpec</code> 里放 <code>BindMountEntry</code>（Docker <code>-v</code>、K8s HostPath、Daytona/E2B 无效）</td></tr>
+              <tr><td>少同步点 / 多同步点</td><td><code>.workspaceProjectionRoots(List.of("AGENTS.md"))</code>；传 <code>null</code> 会回到默认五份<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:102-108">SandboxFilesystemSpec.java:102-108</span></td></tr>
+              <tr><td>每次 call 覆写某个启动文件</td><td>把该条目 <code>ephemeral = true</code></td></tr>
+              <tr><td>框架之外自己管容器</td><td><code>SandboxContext.builder().externalSandbox(s)</code>（框架只 start，不 stop/shutdown）或 <code>.externalSandboxState(st)</code>（生命周期仍归框架）</td></tr>
+              <tr><td>宿主在 start 之前放文件</td><td><code>SandboxLifecycleMiddleware.setBeforeStartCallback(rc -&gt; …)</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SandboxLifecycleMiddleware.java:70-80">SandboxLifecycleMiddleware.java:70-80</span>，走 <code>agent</code> 内部装配时才拿得到</td></tr>
+              <tr><td>不要 execute</td><td><code>.disableShellTool()</code>——文件工具不受影响</td></tr>
+              <tr><td>自研后端</td><td>继承 <code>SandboxFilesystemSpec</code> 实现四个 abstract<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:50-56">:50-56</span>，继承 <code>AbstractBaseSandbox</code> 填五个 <code>do*</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:227-265">AbstractBaseSandbox.java:227-265</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. 默认没有快照，容器一没工作区全丢</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>上一 call <code>pip install</code>、<code>npm i</code> 装的东西，下一 call 全没了；日志里偶尔一句 <code>Branch B degraded to D: snapshot not restorable</code>。</dd>
+            <dt>因为</dt>
+            <dd><code>DockerFilesystemSpec</code> 字段默认就是 <code>NoopSnapshotSpec</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerFilesystemSpec.java:35">DockerFilesystemSpec.java:35</span>，<code>stop()</code> 于是连打包都不做<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:133-138">AbstractBaseSandbox.java:133-138</span>。投影只把宿主那五个根灌进来，容器里新装的包不在其中。</dd>
+            <dt>改成</dt>
+            <dd>单机用 <code>LocalSnapshotSpec</code>，多副本用 <code>distributedStore(...)</code>；或者把依赖打进自定义镜像，用 <code>image(...)</code> 指过去——后者比快照便宜得多。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 报 <code>Cannot run program "docker"</code>，而不是任何沙箱语义的异常</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>一个 <code>RuntimeException</code> 包着 <code>IOException: Cannot run program "docker"…</code>。</dd>
+            <dt>因为</dt>
+            <dd><code>DockerSandbox.start()</code> 第一步就 <code>doEnsureContainerRunning()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:96-100">DockerSandbox.java:96-100</span>，它在 <code>super.start()</code> <strong>之前</strong>，所以拿不到 <code>WorkspaceStartException</code> 的包装<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:119-122">AbstractBaseSandbox.java:119-122</span>；中间件在外层再包一次 <code>RuntimeException</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SandboxLifecycleMiddleware.java:139-142">SandboxLifecycleMiddleware.java:139-142</span>。</dd>
+            <dt>改成</dt>
+            <dd>先确认 CLI 在 <code>PATH</code> 且 daemon 可连（<code>SandboxClientOptions</code> 的注释就要求这一点<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxClientOptions.java:28-31">SandboxClientOptions.java:28-31</span>）。注意 <code>docker run</code> 失败是另一种形状：<code>SandboxRuntimeException(WORKSPACE_START_ERROR, "docker run failed (exit=N): …")</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:564-568">DockerSandbox.java:564-568</span>，60 秒没返回则是 <code>"docker run timed out for image: …"</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:551-558">:551-558</span>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. 想改命令超时，改了个改不动的地方</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>一个 40 秒的测试永远在 30 秒被杀，报 <code>Command timed out after 30s: …</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxException.java:283-285">SandboxException.java:283-285</span>。</dd>
+            <dt>因为</dt>
+            <dd>工具层在没有 <code>timeout</code> 参数时<strong>硬填 30</strong><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:78">ShellExecuteTool.java:78</span>，沙箱层的 120 秒默认永远收不到 null<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:173-177">AbstractBaseSandbox.java:173-177</span>。而模型看到参数描述写着 <code>default: 30</code>，于是它「不传」的行为是符合预期的。</dd>
+            <dt>改成</dt>
+            <dd>提示词里让模型显式传 <code>timeout</code>；或者用 <code>tools.json</code> 的工具过滤把 <code>execute</code> 收回去、自己注册一个默认超时更大的同类工具（第 17 章讲过滤）。<code>timeout=0</code> 或负数也会落回 30。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 没传 userId，「同一个用户的容器」变成「每个会话一个容器」</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>同一个用户开新会话就要重新装依赖；日志 debug 级有一句 <code>USER isolation scope requested but userId is absent — falling back to SESSION</code>。</dd>
+            <dt>因为</dt>
+            <dd><code>USER</code> 是默认 scope<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2415">HarnessAgent.java:2415</span>，而它缺 uid 时的行为是<strong>降级</strong>而不是报错<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxIsolationKey.java:83-90">SandboxIsolationKey.java:83-90</span>；uid 和 sid 都没有时干脆不算键，直接 Priority 4 新建<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxIsolationKey.java:91-95">:91-95</span>。</dd>
+            <dt>改成</dt>
+            <dd>每次调用都带 <code>RuntimeContext.builder().userId(...).sessionId(...)</code>。沙箱模式下 <code>userId</code> 不是可选装饰：它同时决定文件命名空间和容器归属（第 12 章的 namespace 前缀用的是同一个键）。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. <code>edit_file</code> 永远失败，其它工具正常</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>read_file</code>、<code>write_file</code>、<code>grep_files</code> 都好使，只有改字符串那一招报错。</dd>
+            <dt>因为</dt>
+            <dd><code>edit</code> 是九个翻译里唯一依赖 <code>python3</code> 的<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:258-281">BaseSandboxFilesystem.java:258-281</span>；<code>slim</code> 系镜像没带它。命令还用了 heredoc + <code>2&gt;&amp;1</code>，Python 缺失时输出的是 shell 级报错文本，不是 JSON 错误，于是落到 <code>"Error editing file …: unexpected server response"</code> 那一支<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/BaseSandboxFilesystem.java:314-318">:314-318</span>。</dd>
+            <dt>改成</dt>
+            <dd>换带 python3 的镜像，或按官方给的镜像契约自检<span class="src" data-src="docs/v2/zh/docs/harness/sandbox.md:214-215">sandbox.md:214-215</span>。这条契约的另一个坑是 GNU <code>stat</code>：BusyBox 下 <code>ls</code>/<code>glob</code> 的 size 与 mtime 会静默变成 0。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">6. <code>agent.call(msg)</code> 不带上下文，报 <code>No active sandbox</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>SandboxConfigurationException: No active sandbox — sandbox filesystem used outside of a call context</code>。</dd>
+            <dt>因为</dt>
+            <dd>沙箱是<strong>按 call 绑定</strong>的：绑在 <code>RuntimeContext</code> 里的 <code>SandboxAcquireResult</code> 上，字段只是兜底且并发不可信<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/sandbox/SandboxBackedFilesystem.java:234-255">SandboxBackedFilesystem.java:234-255</span>。中间件在 <code>SandboxContext</code> 缺失时直接 return<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/SandboxLifecycleMiddleware.java:93-96">SandboxLifecycleMiddleware.java:93-96</span>，于是容器压根没起。</dd>
+            <dt>改成</dt>
+            <dd>宿主侧想用文件系统，走 <code>agent.workspaceFor(uid, sid).getFilesystem()</code>（第 12 章的 <code>BakedContextFilesystem</code>），它会把身份烤进每次委托；不要在 call 之外裸拿共享的那个 filesystem 对象调方法。同理，<code>WorkspaceMessageBus</code> 这类不穿上下文的调用方只能吃到 volatile 兜底，并发场景请避开。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">7. 配了多副本、没配 guard，两个副本抢同一个用户</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>两个副本各自 <code>docker run</code> 出同名容器（<code>agentscope-sandbox-&lt;sid&gt;</code> 会撞），或者后起的 <code>shutdown()</code> 把前一个正在用的容器删了。</dd>
+            <dt>因为</dt>
+            <dd>guard 默认 <code>noop()</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:82">SandboxFilesystemSpec.java:82</span>，而 <code>build()</code> 在你没显式设置时会取 spec 上的、取不到还是 noop<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2470-2473">HarnessAgent.java:2470-2473</span>。</dd>
+            <dt>改成</dt>
+            <dd>上 <code>distributedStore(...)</code>，它会连 stateStore、snapshotSpec、executionGuard 一起注入，且<strong>优先级低于</strong>你显式写的那三个<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2381-2400">:2381-2400</span>；官方还内置了 Redis / JDBC 系 guard 可直接用。配了 guard 之后，同一隔离键的调用会排队，租约在 call 结束统一归还<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:94-98">SandboxManager.java:94-98</span>。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary><code>stop()</code> 和 <code>shutdown()</code> 谁负责写快照、谁负责删容器？框架什么时候两个都不调？</summary>
+          <p>
+            <code>stop()</code> 只写快照（且快照 <code>isPersistenceEnabled()</code> 为假时连打包都跳过），并把
+            <code>workspaceRootReady</code> 标真<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:131-141">AbstractBaseSandbox.java:131-141</span>；<code>shutdown()</code>
+            才 <code>docker stop --time=30</code> + <code>docker rm --force</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:107-142">DockerSandbox.java:107-142</span>。两个都不调的情况是 Priority 1：沙箱是你自己传进来的（<code>externalSandbox</code>），<code>release()</code>
+            一进来就 return<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:193-199">SandboxManager.java:193-199</span>；另外 <code>containerOwned</code> 为假时 <code>shutdown()</code> 内部也会跳过删除只打一条 debug<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:113-118">DockerSandbox.java:113-118</span>。
+          </p>
+        </details>
+        <details>
+          <summary>为什么容器被删掉之后，下一次 call 不会走 Branch A 把空目录当成「工作区还在」？</summary>
+          <p>
+            两道保险。第一道在 Docker 层：<code>doEnsureContainerRunning()</code> 发现容器查不到时，会<strong>把
+            <code>workspaceRootReady</code> 置回 false</strong> 再新建容器<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:511-516">DockerSandbox.java:511-516</span>，于是
+            <code>start()</code> 走进的是 C 或 D<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:99-114">AbstractBaseSandbox.java:99-114</span>。第二道是探测本身：万一状态说「就绪」但目录不在（例如容器复用、卷被清空），<code>test -d</code> 失败同样落入 B 支去恢复快照，探测异常则当作「已丢失」并 warn<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:197-207">:197-207</span>。默认 Noop 快照下，B 支会降级成 D：<strong>静默重建一个干净工作区</strong>，这正是「东西没了但没有任何异常」的成因。
+          </p>
+        </details>
+        <details>
+          <summary>沙箱模式下，宿主改了一个 <code>skills/foo/SKILL.md</code>，容器里多久能看到？</summary>
+          <p>
+            下一次 call 的 <code>start()</code> 末尾——前提是内容哈希变了。投影在四条分支之后无条件尝试一次<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:116">AbstractBaseSandbox.java:116</span>，哈希 = SHA-256 over「相对路径 + 0x00 + 字节」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceProjectionApplier.java:50-88">WorkspaceProjectionApplier.java:50-88</span>；相同就跳过，不同才 <code>tar</code> 灌进去并重写哈希<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/AbstractBaseSandbox.java:273-282">:273-282</span>。两个例外：投影被关掉、或该文件不在默认五个根（<code>AGENTS.md</code>、<code>skills</code>、<code>subagents</code>、<code>knowledge</code>、<code>.skills-cache</code>）里<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/SandboxFilesystemSpec.java:41-42">SandboxFilesystemSpec.java:41-42</span>。另外哈希记在 <code>SandboxState</code> 里<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxState.java:43">SandboxState.java:43</span>，状态没持久化时每次 call 都会重灌一遍——行为正确，只是白花时间。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">把「默认没有快照」这件事亲眼看到</span>
+            <div>
+              照本章「最小可跑」跑通 alice 的两个 call。第三次 call 前先手工执行 <code>docker rm -f</code> 干掉那个
+              <code>agentscope-sandbox-*</code> 容器，然后再问一次「<code>/workspace/hello.txt</code> 还在吗」。你会拿到
+              no，并且日志里出现 <code>Container … not found, creating a new one</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/impl/docker/DockerSandbox.java:512">DockerSandbox.java:512</span>。加上
+              <code>.snapshotSpec(new LocalSnapshotSpec(dir))</code> 重跑同样三步：这次容器重建后文件回来了，因为
+              <code>isRestorable()</code> 变成了 <code>Files.exists</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/LocalSandboxSnapshot.java:121-123">LocalSandboxSnapshot.java:121-123</span>。顺手确认一下目录里只会有一个
+              <code>&lt;uuid&gt;.tar</code>，中间产物是 <code>.&lt;id&gt;.&lt;uuid&gt;.tmp</code> 加一次原子改名<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/snapshot/LocalSandboxSnapshot.java:70-86">:70-86</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">亲眼看到隔离键决定容器数量</span>
+            <div>
+              把 scope 依次改成 <code>SESSION</code> / <code>USER</code> / <code>AGENT</code> /
+              <code>GLOBAL</code>，每次都让 alice（两个不同 sessionId）和 bob 各跑一轮，然后数一下
+              <code>docker ps --filter name=agentscope-sandbox --format '{{.Names}}'</code> 有几行：SESSION 是 3
+              个、USER 是 2 个、AGENT 与 GLOBAL 各 1 个。再去状态存储目录里看槽位名——默认是
+              <code>~/.agentscope/state/&lt;agentId&gt;/</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1134-1141">HarnessAgent.java:1134-1141</span>，文件里能搜到
+              <code>sandbox/user/…</code> 这种 sessionId 形状的槽位名<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SessionSandboxStateStore.java:84-92">SessionSandboxStateStore.java:84-92</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">验证「applier 写宿主、投影写容器」这条分界</span>
+            <div>
+              给 <code>DockerFilesystemSpec.workspaceSpec(spec)</code> 塞一个 <code>FileEntry</code>（内容随便），root
+              保持 <code>/workspace</code>。跑一次 call，然后分别看宿主 <code>/workspace</code>（Windows 上是
+              <code>D:\workspace</code>）和容器里 <code>docker exec &lt;id&gt; ls /workspace</code>：宿主那侧有、容器那侧没有，对应
+              <code>WorkspaceSpecApplier</code> 用的是 <code>java.nio.file.Files</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/WorkspaceSpecApplier.java:93-103">WorkspaceSpecApplier.java:93-103</span>；再把同一条内容改成 <code>workspace_projection</code> 能覆盖的路径（比如 <code>skills/x.md</code>）并让投影保持开着，容器里就有了。最后一件事：把 <code>timeout</code> 显式传成 <code>0</code>，确认它仍然在 30 秒被杀<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/ShellExecuteTool.java:78">ShellExecuteTool.java:78</span>。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">完成这一章之后</h2>
+        <p>
+          现在你知道沙箱模式的代价清单：一次按 call 的 acquire/release、一层 shell 翻译、一份可选快照、一条按内容哈希的单向投影。三件「必须配」的事——
+          <code>userId</code>、快照、并发闸门——也都各归各位。接下来两条线：一条往「谁来调这个 agent」走（子 agent 与团队，第 14
+          章），一条往「上下文太长怎么办」走（第 15 章）。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="14-subagent-team.html">14 子 Agent 与团队</a></td><td><code>subagents</code> 出现在投影默认里：子 agent 的声明文件怎么进容器</td></tr>
+              <tr><td><a href="16-skill.html">16 技能</a></td><td><code>skills/</code> 与 <code>.skills-cache/</code> 的投影、<code>beforeStartCallback</code> 的真实用途</td></tr>
+              <tr><td><a href="17-plan-mode-tools.html">17 计划模式与工具装配</a></td><td><code>allowShellInPlanMode</code> 与 <code>execute</code> 的白名单关系、工具过滤</td></tr>
+              <tr><td><a href="12-workspace-filesystem.html">12 工作区与文件系统</a></td><td>本章反复用到的 namespace 前缀、两种绝对路径写法与工具层语义</td></tr>
+              <tr><td><a href="../appendix/api-cheatsheet.html#h-fs">附录 C：Harness ②文件系统与沙箱</a></td><td><code>filesystem(...)</code> 一族 builder 方法的完整清单</td></tr>
+              <tr><td><a href="../appendix/source-map.html#harness">附录 D：harness 子包</a></td><td><code>sandbox</code> 包 22 个文件 + 三个子包的职责表</td></tr>
+              <tr><td>官方 <code>docs/v2/zh/docs/harness/sandbox.md</code></td><td>本章的「文档 vs 源码」差异表以它为对照</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">一句话记住这一章</span>
+          <p>
+            键决定用哪个容器、四分支决定工作区是不是上次的、投影只管宿主往里、快照默认是空的——把这四句对上
+            <code>SandboxIsolationKey.resolve</code>、<code>AbstractBaseSandbox.start</code>、
+            <code>WorkspaceProjectionApplier.build</code>、<code>DockerFilesystemSpec:35</code> 四个位置，本章的图就不用背了。
+          </p>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

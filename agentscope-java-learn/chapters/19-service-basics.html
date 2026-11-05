@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="前 18 章的 Agent 都跑在一个进程里，Service 把它变成可登录、可发布、可编排的平台。这一章从 docker compose 起站讲到第一个 Managed Agent 对话：五个组件各管什么、端口怎么映射、管理员怎么初始化、Local Environment 为什么默认关。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="19 Service 入门：五个组件、一条命令、一个能对话的云端 Agent · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="前 18 章的 Agent 都跑在一个进程里，Service 把它变成可登录、可发布、可编排的平台。这一章从 docker compose 起站讲到第一个 Managed Agent 对话：五个组件各管什么、端口怎么映射、管理员怎么初始化、Local Environment 为什么默认关。" />
+    <title>19 Service 入门：五个组件、一条命令、一个能对话的云端 Agent · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="19-service-basics" data-root="..">
+    <main>
+      <article class="article">
+        <h1>19 · Service 入门：五个组件、一条命令、一个能对话的云端 Agent</h1>
+        <p class="lede">
+          前 18 章的所有 Agent 都有一个共同点：<strong>跑在你自己的进程里</strong>。你 <code>new</code> 一个
+          <code>HarnessAgent</code>，状态写本地 JSON，谁能调用、调用完谁付钱、会话怎么隔离，全由宿主应用决定。
+          Service 换了一个问题：如果 Agent 不是「库」，而是「平台上的一项服务」，需要多出哪些东西？这一章不讲代码，先把这个平台的
+          <strong>五个组件、三种运行方式、一条起站路径</strong>拆开，然后真的起一个站、建一个能对话的 Agent。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>用一句话说清 Service 与 SDK 的分工：SDK 管「Agent 怎么想」，Service 管「Agent 被谁用、在哪跑、结果去哪」</li>
+          <li>画出 Gateway / Control / Dataplane / Scheduler / PostgreSQL 的调用关系，并说出哪个端口对外、哪个只在内网</li>
+          <li>用发布包里的 <code>init-env.sh</code> + <code>docker compose</code> 起一套本地站，健康检查通过并登录控制台</li>
+          <li>创建一个 <strong>Managed Agent</strong>，在 Chat 里完成两轮对话并确认历史在刷新后仍然存在</li>
+          <li>解释 <code>BUILDER_ALLOW_LOCAL_ENVIRONMENT</code> 为什么默认是 <code>false</code>，以及打开后工具到底在哪执行</li>
+        </ul>
+
+        <h2 id="why">先说为什么：一个库撑不起一个平台</h2>
+        <p>
+          官方对 Service 的定义很克制：面向 Agent 应用的<strong>运行、管理与编排平台</strong>，把单个 Agent 或多 Agent
+          协作发布成可调用、可追踪的服务<span class="src" data-src="docs/v2/zh/service/index.md:10">index.md:10</span>。
+          拆开看，它解决的是四个库解决不了的问题：
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">身份与权限：谁在用这个 Agent</span>
+            <div class="ld">
+              用户、Namespace、资源归属、私有工作可见性。SDK 只认 <code>RuntimeContext</code>，不负责登录，也不负责「这个用户能不能看那个 Session」。<span
+                class="src"
+                data-src="docs/v2/zh/service/access.md:20"
+                >access.md:20</span
+              >
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">会话与状态：对话活过这个进程</span>
+            <div class="ld">
+              第 07 章的状态存储是「一个 Session 一个槽位」，但槽位在哪个库、多副本怎么共享、会话删了怎么回收，是部署问题。
+              Service 把 Chat、Session、Run、Attempt 都变成平台对象<span
+                class="src"
+                data-src="docs/v2/zh/service/index.md:68-74"
+                >index.md:68-74</span
+              >。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">契约：怎么被别的系统调用</span>
+            <div class="ld">
+              Endpoint、API key、幂等键、SSE 事件流、状态查询。你自己写 Controller 也能做，但每个 Agent 都重写一遍就不叫平台了。<span
+                class="src"
+                data-src="docs/v2/zh/service/index.md:56-62"
+                >index.md:56-62</span
+              >
+            </div>
+          </div>
+          <div class="layer">
+            <span class="lt">编排与运维：多个 Agent 怎么协作、出事怎么办</span>
+            <div class="ld">
+              Team 动态委派、Workflow 固定流程、Issue 记录工作、Inbox 验收结果；再往后是备份、升级、排障。
+              这些在第 14 章是中间件，在平台上是产品功能。
+            </div>
+          </div>
+        </div>
+        <div class="callout tip">
+          <span class="ct">一句话分工</span>
+          <p>
+            SDK 负责<strong>一次推理循环怎么跑</strong>；Service 负责<strong>这次循环由谁发起、在哪台机器上跑、结果写给谁看</strong>。
+            所以 Service 没有重新实现 Agent，它把第 02–18 章的那个 <code>HarnessAgent</code> 当成执行单元来调度。
+          </p>
+        </div>
+
+        <h2 id="arch">五个组件：谁在什么时候被调用</h2>
+        <p>
+          本地安装启动的是一整套栈，不是单个 jar：Gateway、Control、Dataplane、Scheduler 和
+          PostgreSQL<span class="src" data-src="docs/v2/zh/service/quickstart.md:10">quickstart.md:10</span>。
+          先记住它们的职责，后面每个「为什么连不上」都能对号入座。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>组件</th><th>容器端口</th><th>管什么</th><th>关键事实</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Gateway</td>
+                <td>8080（宿主默认 18080）</td>
+                <td>唯一公开入口：控制台静态页、管理 API、会话事件、Endpoint 调用都从这里进</td>
+                <td>纯路径路由，<strong>没有数据库、没有自己的鉴权</strong>；JWT 与内部令牌由目标组件校验<span class="src" data-src="agentscope-service/service-gateway/src/main/java/io/agentscope/builder/GatewayApp.java:24-26">GatewayApp.java:24-26</span></td>
+              </tr>
+              <tr>
+                <td>Control</td>
+                <td>8081</td>
+                <td>Agent / Team / Workflow 目录、工作记录、发布、账号与 Namespace</td>
+                <td>Go 写的 <code>aistiod</code>，同时提供控制台 SPA；连 PostgreSQL 的 <code>cp</code> / <code>rt</code> schema<span class="src" data-src="agentscope-service/deploy/compose.yaml:57-76">compose.yaml:57-76</span></td>
+              </tr>
+              <tr>
+                <td>Dataplane</td>
+                <td>8082</td>
+                <td>Managed Agent 的模型循环、单轮会话执行、SSE 事件、worker HTTP API</td>
+                <td>会话 turn 的路由目标是它，不是 Control<span class="src" data-src="agentscope-service/service-gateway/src/main/resources/application.yml:37-54">application.yml:37-54</span></td>
+              </tr>
+              <tr>
+                <td>Scheduler</td>
+                <td>8083</td>
+                <td>调度与执行协调、外发消息、IM 渠道回调</td>
+                <td><code>/api/outbound/**</code> 与飞书/企微/GitHub/GitLab 回调都路由到这里<span class="src" data-src="agentscope-service/service-gateway/src/main/resources/application.yml:65-75">application.yml:65-75</span></td>
+              </tr>
+              <tr>
+                <td>PostgreSQL</td>
+                <td>5432</td>
+                <td>一套库、多套 schema：控制面产品库、运行状态库、Java 侧 <code>dp</code></td>
+                <td>官方没有为每个组件配独立数据库，恢复时要整体备份<span class="src" data-src="docs/v2/zh/service/configuration.md:18-20">configuration.md:18-20</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          对外只暴露 Gateway<span class="src" data-src="docs/v2/zh/service/quickstart.md:62">quickstart.md:62</span>。
+          容器编排里的端口映射是 <code>127.0.0.1:18080 → gateway:8080</code><span
+            class="src"
+            data-src="agentscope-service/deploy/compose.yaml:120"
+            >compose.yaml:120</span
+          >，所以「18080」是宿主端口，「8080」是容器内端口，两个数字都对，只是站在不同网络里。
+        </p>
+
+        <h3 id="modes">三种 Agent 运行方式：同一个目录，不同的执行者</h3>
+        <p>
+          Service 不要求所有 Agent 都用它托管。目录里可以同时存在三种运行方式，它们在控制台上看起来一样，区别是<strong>模型循环跑在哪</strong><span
+            class="src"
+            data-src="docs/v2/zh/service/index.md:32-48"
+            >index.md:32-48</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方式</th><th>你负责</th><th>Service 负责</th><th>适合</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Managed</strong></td>
+                <td>在控制台填职责、模型、知识与工具</td>
+                <td>启动 Agent、跑模型与工具循环、保存会话状态</td>
+                <td>零代码应用、想最快看到效果</td>
+              </tr>
+              <tr>
+                <td><strong>External</strong></td>
+                <td>用 AgentScope 写应用、部署进程、管依赖</td>
+                <td>登记身份、会话与能力，需要时派发任务</td>
+                <td>已有代码、要保留框架控制权</td>
+              </tr>
+              <tr>
+                <td><strong>Hosted</strong></td>
+                <td>在主机上安装并登录 Codex / Claude Code / Qoder 等 provider</td>
+                <td>把工作调度到这台主机，管理任务与交付</td>
+                <td>复用现成 Coding Agent 的执行能力</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          这一章只碰 Managed，因为它是唯一「装完站就能用」的路径；External 与 Hosted 留给后面的章节。
+        </p>
+
+        <h2 id="minimal">最小可跑：一条 compose 命令起整站</h2>
+        <p>
+          官方推荐的本地路径不是从源码构建，而是下载 Release 里的 compose 包<span
+            class="src"
+            data-src="docs/v2/zh/service/quickstart.md:16"
+            >quickstart.md:16</span
+          >。解压后目录里有一个 <code>init-env.sh</code> 和一份 <code>compose.yaml</code>；前者生成密钥，后者定义五个服务。
+        </p>
+        <pre data-lang="bash" data-file="service quickstart（节选）">tar -xzf agentscope-service-VERSION-compose.tar.gz
+cd agentscope-service
+./init-env.sh VERSION REGISTRY/NAMESPACE
+docker compose pull
+docker compose up -d --wait --wait-timeout 600</pre>
+        <p>
+          这五行里有两个容易忽略的细节。第一，<code>init-env.sh</code> 会先 <code>umask 077</code> 再写
+          <code>.env</code><span class="src" data-src="agentscope-service/deploy/init-env.sh:13">init-env.sh:13</span>，
+          所以文件权限是 600，里面是数据库密码、JWT 密钥、内部令牌、Vault 主密钥和初始管理员密码。第二，脚本发现
+          <code>.env</code> 已存在就<strong>直接退出</strong>，不覆盖、不重置密码、也不改版本<span
+            class="src"
+            data-src="agentscope-service/deploy/init-env.sh:4-6"
+            >init-env.sh:4-6</span
+          >——升级时想换版本，得自己改 <code>SERVICE_VERSION</code>。
+        </p>
+        <p>起完之后按顺序验三件事，不要只看容器是不是 <code>Up</code>：</p>
+        <pre data-lang="bash" data-file="service quickstart（节选）">docker compose ps
+curl -fsS http://localhost:18080/actuator/health
+# 浏览器打开 http://localhost:18080，用 admin 与 .env 里的 AISTIO_BOOTSTRAP_PASSWORD 登录</pre>
+        <p>
+          健康检查走的是 Gateway 的 <code>/actuator/health</code>，暴露的是 health、info 与 gateway 三类端点<span
+            class="src"
+            data-src="agentscope-service/service-gateway/src/main/resources/application.yml:120-127"
+            >application.yml:120-127</span
+          >。登录账号 <code>admin</code> 与密码来自 <code>AISTIO_BOOTSTRAP_ADMIN</code> /
+          <code>AISTIO_BOOTSTRAP_PASSWORD</code>，而且<strong>只在用户库为空时创建</strong><span
+            class="src"
+            data-src="docs/v2/zh/service/quickstart.md:37"
+            >quickstart.md:37</span
+          >；重启不会把密码重置回 <code>.env</code> 里的值，忘了密码只能走管理员重置流程。
+        </p>
+        <div class="callout warn">
+          <span class="ct">本地工具默认是关的，这不是 bug</span>
+          <p>
+            Managed Agent 要用本机文件系统或 shell，必须先设置
+            <code>BUILDER_ALLOW_LOCAL_ENVIRONMENT=true</code><span
+              class="src"
+              data-src="docs/v2/zh/service/quickstart.md:44"
+              >quickstart.md:44</span
+            >。它的默认值是 <code>false</code>，而且是<strong>双重默认</strong>：compose 里写的是
+            <code>${BUILDER_ALLOW_LOCAL_ENVIRONMENT:-false}</code><span
+              class="src"
+              data-src="agentscope-service/deploy/compose.yaml:76"
+              >compose.yaml:76</span
+            >，Go 控制面自己的 flag 默认值也是 <code>false</code>，注释写着「只应在可信的开发环境打开」<span
+              class="src"
+              data-src="agentscope-service/aistio/cmd/aistiod/main.go:411-412"
+              >main.go:411-412</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="first-agent">第一个云端 Agent：从「资料助手」到两轮对话</h2>
+        <p>
+          官方快速开始用「整理会议待办」串起整条链路，第一步只有三个动作<span
+            class="src"
+            data-src="docs/v2/zh/service/first-session.md:16-25"
+            >first-session.md:16-25</span
+          >：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">DESIGN → Agents → 新建</span>
+            <div>
+              名字填「资料助手」，Runtime 选 <strong>AgentScope Managed</strong>，Model
+              <strong>留空</strong>——留空表示使用管理员在部署里配置的默认模型，不是「没有模型」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">写 Instructions，选 Environment</span>
+            <div>
+              把职责写成可验收的句子，例如「列出任务、负责人、期限与待确认事项；缺少资料时明确说明，不虚构来源」。Advanced
+              settings 里选一个可用 Environment，再保存。
+            </div>
+          </li>
+          <li>
+            <span class="sh">WORK → Chat → New chat</span>
+            <div>
+              选择「资料助手」，粘贴一段会议记录，检查回复是否包含负责人、期限和「评审时间待确认」；再追问「还缺少哪些信息？」，
+              刷新页面重新打开这个 Chat，两轮历史都应该在<span
+                class="src"
+                data-src="docs/v2/zh/service/first-session.md:29-36"
+                >first-session.md:29-36</span
+              >。
+            </div>
+          </li>
+        </ol>
+        <p>
+          这一段验证的其实是三件不同的事：<strong>Agent 定义</strong>存进了 Control 的目录库；<strong>Session</strong>
+          由 Dataplane 执行并把事件写进会话日志；<strong>账号与权限</strong>由 Control 的 JWT 链路负责。三件事任何一件没配好，
+          表现都是「发出去没回复」，但排查位置完全不同。
+        </p>
+        <div class="compare">
+          <div class="col pick">
+            <h4>你在控制台看到的</h4>
+            <ul>
+              <li>Agent 列表里出现「资料助手」</li>
+              <li>Chat 里能看到流式回复</li>
+              <li>刷新后历史还在</li>
+            </ul>
+          </div>
+          <div class="col">
+            <h4>平台里实际发生的</h4>
+            <ul>
+              <li>Control 写入 Agent 定义与版本</li>
+              <li>Dataplane 建 Session、跑模型循环、写事件</li>
+              <li>Gateway 把 SSE 原样转给浏览器</li>
+            </ul>
+          </div>
+        </div>
+
+        <h2 id="run">端到端：一条消息在五个组件之间怎么走</h2>
+        <p>
+          把「在 Chat 里发一句话」摊开成时间轴，就能看出每个组件的边界。下面这条路径对应 Gateway 的默认路由表<span
+            class="src"
+            data-src="agentscope-service/service-gateway/src/main/resources/application.yml:94-108"
+            >application.yml:94-108</span
+          >：
+        </p>
+        <ul class="timeline">
+          <li>
+            <span class="who">浏览器</span>
+            <span class="what">打开 <code>http://localhost:18080</code>，请求控制台静态页；Gateway 落到 <code>control-spa</code> 路由。</span>
+          </li>
+          <li>
+            <span class="who">Gateway → Control</span>
+            <span class="what">登录、读 Agent 列表、建 Session 的元数据都走 <code>/api/**</code>；Control 校验 JWT 并读写 PostgreSQL。</span>
+          </li>
+          <li>
+            <span class="who">Gateway → Dataplane</span>
+            <span class="what">发送消息走 <code>/api/sessions/{id}/events/**</code>，这类 turn 流量被单独路由到 Dataplane<span class="src" data-src="agentscope-service/service-gateway/src/main/resources/application.yml:37-42">application.yml:37-42</span>。</span>
+          </li>
+          <li>
+            <span class="who">Dataplane → 模型</span>
+            <span class="what">Dataplane 里跑的是第 02 章那个 HarnessAgent 循环：组装上下文、调模型、执行工具、产出事件。</span>
+          </li>
+          <li>
+            <span class="who">Dataplane → Gateway → 浏览器</span>
+            <span class="what">事件以 SSE 回传。Gateway 把响应超时放宽到 1 小时，专门为长连接让路<span class="src" data-src="agentscope-service/service-gateway/src/main/resources/application.yml:13-15">application.yml:13-15</span>。</span>
+          </li>
+          <li>
+            <span class="who">Scheduler（异步时）</span>
+            <span class="what">外发消息、IM 回调、定时任务走 Scheduler；它不参与这条同步对话的主链路，但没有它，自动化与渠道都不工作。</span>
+          </li>
+        </ul>
+        <div class="callout">
+          <span class="ct">SSE 是这套架构的「压力测试点」</span>
+          <p>
+            官方在安装文档里专门提醒：反向代理<strong>必须支持 SSE</strong>——及时转发、不缓存事件流、读取超时足够长<span
+              class="src"
+              data-src="docs/v2/zh/service/quickstart.md:68"
+              >quickstart.md:68</span
+            >。因为浏览器看到的「打字机效果」不是前端轮询，而是一条被 Gateway 转发了一个小时的长连接。代理一缓冲，页面就变成
+            「转圈很久，然后一次性出全文」。
+          </p>
+        </div>
+
+        <h2 id="config">配置速查：改哪里、怎么确认生效</h2>
+        <p>
+          Compose 下所有配置都在 <code>.env</code>；Kubernetes 下敏感项放 Secret，其余走 Chart values<span
+            class="src"
+            data-src="docs/v2/zh/service/configuration.md:10"
+            >configuration.md:10</span
+          >。最常改的是这几项：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>变量</th><th>作用</th><th>默认 / 约束</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>BIND_ADDRESS</code> / <code>GATEWAY_PORT</code></td>
+                <td>宿主监听地址与端口</td>
+                <td><code>127.0.0.1</code> / <code>18080</code>；改了要同步公开 URL<span class="src" data-src="docs/v2/zh/service/configuration.md:15">configuration.md:15</span></td>
+              </tr>
+              <tr>
+                <td><code>BUILDER_JWT_SECRET</code></td>
+                <td>用户令牌签名</td>
+                <td>至少 32 字符，相关组件保持一致<span class="src" data-src="docs/v2/zh/service/configuration.md:21">configuration.md:21</span></td>
+              </tr>
+              <tr>
+                <td><code>BUILDER_INTERNAL_TOKEN</code></td>
+                <td>组件间认证</td>
+                <td>至少 32 字符，不用于用户登录<span class="src" data-src="docs/v2/zh/service/configuration.md:22">configuration.md:22</span></td>
+              </tr>
+              <tr>
+                <td><code>BUILDER_VAULT_MASTER_KEY</code></td>
+                <td>Vault 凭据加密</td>
+                <td>各组件一致，必须随数据一起备份<span class="src" data-src="docs/v2/zh/service/configuration.md:23">configuration.md:23</span></td>
+              </tr>
+              <tr>
+                <td><code>AISTIO_BOOTSTRAP_PASSWORD</code></td>
+                <td>初始管理员密码</td>
+                <td>12–72 字节，只在空用户库生效<span class="src" data-src="docs/v2/zh/service/configuration.md:24">configuration.md:24</span></td>
+              </tr>
+              <tr>
+                <td><code>BUILDER_ALLOW_LOCAL_ENVIRONMENT</code></td>
+                <td>是否允许 Local Environment</td>
+                <td>默认 <code>false</code><span class="src" data-src="docs/v2/zh/service/configuration.md:27">configuration.md:27</span>；打开后 shell 在 Dataplane 容器里执行，宿主文件不会自动挂进来<span class="src" data-src="docs/v2/zh/service/quickstart.md:48">quickstart.md:48</span></td>
+              </tr>
+              <tr>
+                <td><code>BUILDER_OAUTH_PUBLIC_URL</code></td>
+                <td>用户可访问的公开 origin</td>
+                <td>必须与 OAuth 回调一致<span class="src" data-src="docs/v2/zh/service/configuration.md:28">configuration.md:28</span></td>
+              </tr>
+              <tr>
+                <td><code>DASHSCOPE_API_KEY</code></td>
+                <td>默认 DashScope 模型凭据</td>
+                <td>只在使用该模型路径时需要<span class="src" data-src="docs/v2/zh/service/configuration.md:29">configuration.md:29</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>改完之后怎么确认生效，官方给了一张按「修改位置」区分的表，摘要成三步：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">Compose 改 <code>.env</code>：重新创建容器</span>
+            <div>
+              <code>docker compose up -d --wait</code>。仅 <code>restart</code> 不会把新的环境变量注入已有容器<span
+                class="src"
+                data-src="docs/v2/zh/service/configuration.md:48"
+                >configuration.md:48</span
+              >。
+            </div>
+          </li>
+          <li>
+            <span class="sh">改 Agent Instructions：保存并发布 revision</span>
+            <div>控制台里的草稿不会自动生效；要绑到目标 revision，再新建工作验证<span class="src" data-src="docs/v2/zh/service/configuration.md:50">configuration.md:50</span>。</div>
+          </li>
+          <li>
+            <span class="sh">改 Memory 正文：让 Agent 再读一次</span>
+            <div>旧回复不会因为知识库更新而自动改写<span class="src" data-src="docs/v2/zh/service/configuration.md:52">configuration.md:52</span>。</div>
+          </li>
+        </ol>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. 装完站、建了 Agent，一用工具就「没有可用环境」</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>Managed Agent 创建或运行时提示环境不可用，或者工具列表是空的；日志里没有模型错误。</dd>
+            <dt>因为</dt>
+            <dd><code>BUILDER_ALLOW_LOCAL_ENVIRONMENT</code> 默认 <code>false</code>，compose 与 Go 控制面双重默认<span class="src" data-src="agentscope-service/deploy/compose.yaml:76">compose.yaml:76</span><span class="src" data-src="agentscope-service/aistio/cmd/aistiod/main.go:411-412">main.go:411-412</span>。没有打开时，Local Environment 根本不会出现在可选列表里。</dd>
+            <dt>改成</dt>
+            <dd>只在可信的本地开发环境把它设成 <code>true</code>，并重新创建容器；同时明白它的边界：shell 在 <strong>Dataplane 容器</strong>里执行，宿主目录不会自动出现<span class="src" data-src="docs/v2/zh/service/quickstart.md:48">quickstart.md:48</span>。生产环境不要为了省事打开它。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 改了 <code>.env</code>，<code>docker compose restart</code> 后配置没生效</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>端口、密钥或开关明明改了，行为还是旧的。</dd>
+            <dt>因为</dt>
+            <dd>环境变量是在<strong>创建容器</strong>时注入的，<code>restart</code> 只重启进程，不会重新读 <code>.env</code><span class="src" data-src="docs/v2/zh/service/configuration.md:48">configuration.md:48</span>。</dd>
+            <dt>改成</dt>
+            <dd>用 <code>docker compose up -d --wait --wait-timeout 600</code> 重建；改端口时同步改 <code>BUILDER_OAUTH_PUBLIC_URL</code>，否则 OAuth 与渠道回调会回错地址<span class="src" data-src="docs/v2/zh/service/quickstart.md:66-68">quickstart.md:66-68</span>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. 一条 <code>docker compose down -v</code> 把数据卷删了</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>重新起站后账号、Agent、会话全没了；<code>.env</code> 还在，但数据库空了。</dd>
+            <dt>因为</dt>
+            <dd>三个命名卷分别保存 PostgreSQL、共享 Workspace 和 Artifact<span class="src" data-src="docs/v2/zh/service/quickstart.md:72">quickstart.md:72</span>，<code>-v</code> 会连卷一起删<span class="src" data-src="docs/v2/zh/service/quickstart.md:91">quickstart.md:91</span>。</dd>
+            <dt>改成</dt>
+            <dd>日常停止只用 <code>docker compose down</code>；要做「干净重来」之前先确认不需要里面的数据，并把 Vault 主密钥和备份放在一起。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 照抄示例 <code>.env</code>，版本号是旧的</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>拉镜像时提示版本不存在，或者拉到的不是你要的版本。</dd>
+            <dt>因为</dt>
+            <dd>仓库里的 <code>.env.example</code> 示例值仍是 <code>2.0.3-rc.1</code><span class="src" data-src="agentscope-service/deploy/.env.example:17">.env.example:17</span>，它只是格式示例，不是当前版本。</dd>
+            <dt>改成</dt>
+            <dd>以 Release 的 <code>release-manifest.json</code> 为准，把 <code>SERVICE_VERSION</code> 写成发布说明里的准确值；<code>init-env.sh</code> 会用正则校验版本格式，但不会替你判断新旧<span class="src" data-src="agentscope-service/deploy/init-env.sh:8">init-env.sh:8</span>。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>Gateway 没有数据库、也没有自己的鉴权，为什么不怕被绕过？</summary>
+          <p>
+            因为它只做路径转发，真正的校验在目标组件：用户 API 校验 JWT，组件之间校验内部令牌<span
+              class="src"
+              data-src="agentscope-service/service-gateway/src/main/java/io/agentscope/builder/GatewayApp.java:24-26"
+              >GatewayApp.java:24-26</span
+            >。同时 Gateway 会把客户端伪造的内部头（<code>X-Builder-Internal-Token</code> 等）剥掉<span
+              class="src"
+              data-src="agentscope-service/service-gateway/src/main/resources/application.yml:16-19"
+              >application.yml:16-19</span
+            >，并且把 <code>/api/internal/**</code> 直接 404<span
+              class="src"
+              data-src="agentscope-service/service-gateway/src/main/resources/application.yml:24-30"
+              >application.yml:24-30</span
+            >。
+          </p>
+        </details>
+        <details>
+          <summary>把 <code>BUILDER_ALLOW_LOCAL_ENVIRONMENT</code> 改成 <code>true</code> 之后，Agent 的文件和命令在哪里执行？</summary>
+          <p>
+            在 <strong>Dataplane 容器</strong>里，不是在你的宿主机上。官方安装文档写得很直接：Local 工具运行在 Dataplane 容器内，
+            主机的文件不会自动挂载<span class="src" data-src="docs/v2/zh/service/quickstart.md:48">quickstart.md:48</span>。
+            要访问宿主目录，得显式配挂载，并保证容器用户 <code>65532:65532</code> 有权限<span
+              class="src"
+              data-src="docs/v2/zh/service/quickstart.md:74"
+              >quickstart.md:74</span
+            >。
+          </p>
+        </details>
+        <details>
+          <summary>同事把 <code>GATEWAY_PORT</code> 从 18080 改成 18081，为什么登录后的 OAuth 回调还是回到 18080？</summary>
+          <p>
+            因为 <code>GATEWAY_PORT</code> 只改宿主端口映射，公开 origin 由 <code>BUILDER_OAUTH_PUBLIC_URL</code> 单独决定<span
+              class="src"
+              data-src="agentscope-service/deploy/.env.example:26-28"
+              >.env.example:26-28</span
+            >。两者不一致时，浏览器会被重定向回旧地址。改端口要同时改公开 URL，并重新创建容器。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <p>目标：亲手验证「端口映射」和「重建才生效」这两件最容易记错的事。</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">起站并确认健康</span>
+            <div>
+              按本章命令起站，<code>docker compose ps</code> 应该看到 db/control/data/scheduler/gateway 五个服务；<code>curl
+              http://localhost:18080/actuator/health</code> 返回 <code>{"status":"UP"}</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">确认宿主端口与容器端口</span>
+            <div>
+              <code>docker compose port gateway 8080</code> 应返回 <code>127.0.0.1:18080</code>。这一步证明你访问的 18080
+              是映射出来的，容器里的 Gateway 仍监听 8080。
+            </div>
+          </li>
+          <li>
+            <span class="sh">只 restart，验证配置没变</span>
+            <div>
+              把 <code>.env</code> 的 <code>GATEWAY_PORT</code> 改成 <code>18081</code>，执行 <code>docker compose
+              restart gateway</code>，再访问 18081——应该连不上，18080 仍可用。
+            </div>
+          </li>
+          <li>
+            <span class="sh">重建，验证配置生效</span>
+            <div>
+              执行 <code>docker compose up -d --wait</code>，这次 18081 可用、18080 失效。改回 18080 再重建一次收尾。
+            </div>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <span class="ct">练习的验收标准</span>
+          <p>
+            你能不看文档解释：为什么 <code>restart</code> 不生效、为什么容器端口和宿主端口可以不同、为什么改端口还要动
+            <code>BUILDER_OAUTH_PUBLIC_URL</code>。三个都答上来，这一章就算过关。
+          </p>
+        </div>
+
+        <h2 id="next">完成这一章之后</h2>
+        <p>
+          你现在有了一个能登录、能对话的 Service。下一步是把它<strong>发布出去</strong>：Endpoint 怎么建、API key 怎么发、
+          SSE 事件长什么样、幂等键与状态查询怎么配合。那是 <a href="20-endpoints-sse.html">第 20 章</a> 的内容。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方「什么是 AgentScope Service」</td><td>五种能力定义、工作与执行对象、Namespace 与版本模型，本章只取了骨架<span class="src" data-src="docs/v2/zh/service/index.md:52-85">index.md:52-85</span></td></tr>
+              <tr><td>官方「本地安装」</td><td>远程访问、数据持久化、更新与排错的完整命令<span class="src" data-src="docs/v2/zh/service/quickstart.md:64-93">quickstart.md:64-93</span></td></tr>
+              <tr><td><a href="../appendix/errata.html">附录 E · 勘误汇总</a></td><td>Service 文档目前仍标「预览」，读的时候把版本号和源码事实分开看</td></tr>
+              <tr><td><a href="18-gateway-channel-bus.html">18 网关、渠道与异步</a></td><td>Service 的 Gateway 与这一章的 HarnessGateway 不是同一个东西；先分清「进程内网关」与「平台网关」</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          Service 相关文档在 2.0.4 仓库里仍带「此为预览文档，正式版本尚未发布」的提示<span
+            class="src"
+            data-src="docs/v2/zh/service/index.md:6-8"
+            >index.md:6-8</span
+          >。本章的组件、端口与默认值都对到了 <code>agentscope-service/</code> 的配置与源码；文档更新后，以源码为准重新核对一遍。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

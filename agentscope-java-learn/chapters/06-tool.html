@@ -1,0 +1,807 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="模型只会说话，工具才是它伸向世界的手。这一章解决四件事：怎么把一个 Java 方法写成模型能正确调用的工具、五条注册路径怎么选、一次工具调用在框架里到底走了哪几步、以及工具多了以后怎么用分组和 MCP 管住上下文。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="06 工具系统：@Tool、注册路径、分组与 MCP · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="模型只会说话，工具才是它伸向世界的手。这一章解决四件事：怎么把一个 Java 方法写成模型能正确调用的工具、五条注册路径怎么选、一次工具调用在框架里到底走了哪几步、以及工具多了以后怎么用分组和 MCP 管住上下文。" />
+    <title>06 工具系统：@Tool、注册路径、分组与 MCP · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="06-tool" data-root="..">
+    <main>
+      <article class="article">
+        <h1>06 · 工具系统</h1>
+        <p class="lede">
+          模型只会说话，工具才是它伸向世界的手。这一章解决四件事：怎么把一个 Java 方法写成<strong>模型能正确调用</strong>的工具、五条注册路径怎么选、一次工具调用在框架里到底走了哪几步、以及工具多了以后怎么用分组和 MCP 管住上下文。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>用 <code>@Tool</code> / <code>@ToolParam</code> 写出 schema 正确的工具，并说清哪些参数是给模型的、哪些是框架注入的</li>
+          <li>在「注解扫描 / ToolBase / 只给 schema / MCP / 子 Agent」五条注册路径里选对一条</li>
+          <li>画出一次 tool call 从模型吐 JSON 到结果回填的完整链路，并解释<strong>工具报错为什么不会中断对话</strong></li>
+          <li>用 ToolGroup + meta tool 做按需披露，接一个 MCP server 并知道它真实的命名规则</li>
+        </ul>
+
+        <h2 id="why">先说为什么：工具不是「函数」，是给模型看的说明书</h2>
+        <p>
+          写普通 Java 方法时，调用者是你：参数类型编译期就检查，异常自己 try-catch。工具不一样——调用者是<strong>一个从没看过你源码的模型</strong>，它只能看到 <code>name</code>、<code>description</code> 和一段 JSON Schema，然后决定调不调、传什么。
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h4>普通方法：给人用</h4>
+            <ul>
+              <li>谁调用：你的代码，调用点固定</li>
+              <li>参数：编译期检查，IDE 会提示</li>
+              <li>返回值：你自己消费</li>
+              <li>失败：抛异常，调用栈往上冒</li>
+              <li>重点在<strong>实现</strong></li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4>工具：给模型用</h4>
+            <ul>
+              <li>谁调用：模型在运行时决定，可能根本不调</li>
+              <li>参数：模型生成 JSON，框架按 schema 校验后再反射填充</li>
+              <li>返回值：序列化后当成消息喂回模型</li>
+              <li>失败：转成 <code>ToolResultBlock.error</code>，对话继续</li>
+              <li>重点在<strong>描述与 schema</strong>，实现反而简单</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          所以这一章会反复出现一个判断标准：<em>这段代码是写给模型看的，还是写给 JVM 看的？</em>
+          <code>description</code>、参数名、枚举值、返回文本都是写给模型的；类型转换、并发、超时、重试是 JVM 和框架的事。两者混在一起想，就会写出「能编译但模型永远调不对」的工具。
+        </p>
+
+        <h2 id="minimal">最小可跑：三个注解，让 Agent 自己选工具</h2>
+        <p>先不碰 MCP、不碰分组，只写一个最普通的类：</p>
+        <pre data-lang="java" data-file="WeatherTools.java">import io.agentscope.core.tool.Tool;
+import io.agentscope.core.tool.ToolParam;
+
+public class WeatherTools {
+
+    @Tool(
+            name = "get_weather",
+            description = "查询指定城市的当前天气。用户问气温、下雨、穿衣建议时调用。",
+            readOnly = true)
+    public String getWeather(
+            @ToolParam(name = "city", description = "城市名，例如 杭州") String city,
+            @ToolParam(name = "unit", description = "温度单位：c 或 f", required = false) String unit) {
+        double celsius = "杭州".equals(city) ? 24.5 : 18.0;
+        boolean fahrenheit = unit != null &amp;&amp; unit.equalsIgnoreCase("f");
+        double value = fahrenheit ? celsius * 9 / 5 + 32 : celsius;
+        return String.format("%s：%.1f°%s", city, value, fahrenheit ? "F" : "C");
+    }
+}</pre>
+        <p>注册只需要一行，然后把 toolkit 交给 agent：</p>
+        <pre data-lang="java" data-file="FirstToolAgent.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.tool.Toolkit;
+
+Toolkit toolkit = new Toolkit();
+toolkit.registerTool(new WeatherTools());
+
+ReActAgent agent =
+        ReActAgent.builder()
+                .name("WeatherAssistant")
+                .sysPrompt("需要天气数据时调用 get_weather，不要凭记忆回答。")
+                .model("dashscope:qwen-plus")
+                .toolkit(toolkit)
+                .build();
+
+Msg reply = agent.call("杭州现在多少度？", RuntimeContext.empty()).block();
+System.out.println(reply.getTextContent());</pre>
+        <p class="src-line">
+          扫描注解并注册：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:166">Toolkit.java:166</span>；注册入口：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:159">Toolkit.java:159</span>；<code>call(String, RuntimeContext)</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:868">ReActAgent.java:868</span>
+        </p>
+        <div class="loop">
+          <div class="lp model">① 推理<small>模型看到工具清单，决定「要查天气」</small></div>
+          <div class="lp-arrow">→</div>
+          <div class="lp tool">② 行动<small>框架执行 get_weather，拿到 "杭州：24.5°C"</small></div>
+          <div class="lp-arrow">→</div>
+          <div class="lp stop">③ 观察<small>结果回喂模型，模型写成人话</small></div>
+          <div class="loop-note">你只发了一次 <code>call</code>，但模型被调用了两轮——第二轮才有自然语言答案。</div>
+        </div>
+        <div class="callout tip">
+          <span class="ct">先看 schema，再调模型</span>
+          <p>
+            调试工具时最省时间的一步：注册完立刻打印
+            <code>toolkit.getToolSchemas().get(0).getParameters()</code>。模型看到的就是这段 JSON；如果参数没出现、类型不对、必填项不对，模型再聪明也调不对。
+          </p>
+        </div>
+
+        <h2 id="line-by-line">逐行解读：注解、参数、返回值</h2>
+        <h3 id="tool-annotation">1. <code>@Tool</code> 的 11 个属性（文档只列了 7 个）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>属性</th><th>默认值</th><th>作用与容易踩的点</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>name</code></td><td>方法名</td><td>暴露给模型的工具名。建议 snake_case；不写就用方法名。</td></tr>
+              <tr><td><code>description</code></td><td><code>"Tool: " + name</code></td><td>模型判断「什么时候调」的唯一依据。不写会得到一个毫无信息量的默认串。</td></tr>
+              <tr><td><code>strict</code></td><td><code>false</code></td><td>为 <code>true</code> 时把 <code>strict</code> 放进 schema，支持的服务商会更严格地约束参数。</td></tr>
+              <tr><td><code>readOnly</code></td><td><code>false</code></td><td>声明无副作用。<code>EXPLORE</code> 模式下只读工具自动放行（第 08 章）。</td></tr>
+              <tr><td><code>concurrencySafe</code></td><td><strong><code>true</code></strong></td><td>是否可并发调用。<strong>文档表格写的是 <code>false</code>，代码里是 <code>true</code></strong>；要串行执行必须显式写 <code>false</code>。</td></tr>
+              <tr><td><code>externalTool</code></td><td><code>false</code></td><td>执行交给框架之外（人工/外部系统）。框架只发 <code>TOOL_SUSPENDED</code>，不跑方法体。</td></tr>
+              <tr><td><code>stateInjected</code></td><td><code>false</code></td><td>为 <code>true</code> 时必须有一个 <code>AgentState</code> 参数，否则<strong>注册时就抛异常</strong>。</td></tr>
+              <tr><td><code>returnDirect</code></td><td><code>false</code></td><td>结果直接当本轮最终回答，跳过下一轮模型调用。批次里要<strong>全部</strong>工具都为 true 且全部成功才生效。</td></tr>
+              <tr><td><code>dangerousFiles</code></td><td><code>{}</code></td><td>追加敏感文件名，命中后权限系统会要求确认。</td></tr>
+              <tr><td><code>dangerousDirectories</code></td><td><code>{}</code></td><td>追加敏感目录名，按路径段匹配。</td></tr>
+              <tr><td><code>converter</code></td><td><code>DefaultToolResultConverter</code></td><td>自定义返回值到 <code>ToolResultBlock</code> 的转换器，适合脱敏、截断、改格式。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          全部定义：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Tool.java:70">Tool.java:70</span>；<code>concurrencySafe</code> 默认值：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Tool.java:117">Tool.java:117</span>；<code>returnDirect</code> 语义：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Tool.java:140">Tool.java:140</span>
+        </p>
+
+        <h3 id="tool-param">2. <code>@ToolParam</code> 与「参数三分法」</h3>
+        <p>
+          <code>@ToolParam</code> 只有三个属性，但有一个硬约束：<code>name()</code> <strong>没有默认值</strong>，不写就编译不过。原因写在注释里——Java 默认不保留参数名（除非加 <code>-parameters</code>），框架不能靠反射名去猜。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>属性</th><th>默认值</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>name</code></td><td>无（必填）</td><td>写进 schema 的属性名，也是从模型 JSON 里取值的 key。</td></tr>
+              <tr><td><code>description</code></td><td><code>""</code></td><td>写清楚格式和取值范围，比在方法里做二次校验更有效。</td></tr>
+              <tr><td><code>required</code></td><td><code>true</code></td><td>为 false 时，模型可以省略；方法会收到 <code>null</code>（对象）或默认值（基本类型）。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>真正决定「参数从哪来」的不是注解本身，而是<strong>参数类型 + 有没有注解</strong>。框架的判断顺序是这样的：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>参数长什么样</th><th>从哪来</th><th>会不会出现在 schema</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>带 <code>@ToolParam</code></td><td>模型生成的 JSON</td><td>会</td></tr>
+              <tr><td><code>ToolEmitter</code></td><td>框架注入（流式进度）</td><td>不会</td></tr>
+              <tr><td><code>Agent</code> / <code>AgentState</code> / <code>RuntimeContext</code></td><td>框架注入</td><td>不会</td></tr>
+              <tr><td>用户自定义 POJO（无注解）</td><td><code>RuntimeContext.get(类型)</code></td><td>不会</td></tr>
+              <tr><td>基本类型 / <code>String</code> / <code>Msg</code> / <code>ContentBlock</code>，且<strong>没注解</strong></td><td>仍按参数名去 JSON 里取——但 schema 里没有它</td><td>不会，所以通常永远是 <code>null</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          注入顺序与用户 POJO 判定：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolMethodInvoker.java:149">ToolMethodInvoker.java:149</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolMethodInvoker.java:218">:218</span>；<code>AgentState</code> 参数的三条校验：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ReflectiveFunctionTool.java:84">ReflectiveFunctionTool.java:84</span>
+        </p>
+        <p>自定义 POJO 的用法很实用：调用方按类型放进去，所有需要它的工具都能拿到，而且<strong>模型完全看不到这个参数</strong>。</p>
+        <pre data-lang="java" data-file="UserContextTools.java">import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.tool.Tool;
+import io.agentscope.core.tool.ToolParam;
+
+public record UserContext(String username, String locale) {}
+
+public class GreetingTools {
+
+    @Tool(name = "greet", description = "用当前用户名向用户打招呼。")
+    public String greet(
+            @ToolParam(name = "greeting", description = "问候语，例如 你好") String greeting,
+            UserContext user) {                 // 无 @ToolParam → 由 RuntimeContext 注入
+        String who = user == null ? "访客" : user.username();
+        return greeting + "，" + who + "！";
+    }
+}</pre>
+        <pre data-lang="java" data-file="CallWithUserContext.java">RuntimeContext ctx =
+        RuntimeContext.builder()
+                .put(UserContext.class, new UserContext("alice", "zh-CN"))
+                .userId("alice")
+                .build();
+
+agent.call("跟我打个招呼", ctx).block();</pre>
+
+        <h3 id="tool-return">3. 返回值怎么变成 <code>ToolResultBlock</code></h3>
+        <p>默认转换器（<code>DefaultToolResultConverter</code>）的规则只有五条，记住就不会意外：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法返回值</th><th>最终回给模型的文本</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>null</code></td><td>字符串 <code>"null"</code></td></tr>
+              <tr><td><code>void</code></td><td>字符串 <code>"Done"</code></td></tr>
+              <tr><td>本来就是 <code>ToolResultBlock</code></td><td>原样返回（想完全控制输出就返回它）</td></tr>
+              <tr><td>任意 POJO / List / Map</td><td>JSON 字符串</td></tr>
+              <tr><td>序列化失败</td><td>退化成 <code>toString()</code>，并打一条 warn 日志</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          转换规则：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/DefaultToolResultConverter.java:44">DefaultToolResultConverter.java:44</span>；方法支持 <code>String</code>、<code>Mono</code>、<code>CompletableFuture</code> 三种返回形态：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolMethodInvoker.java:69">ToolMethodInvoker.java:69</span>
+        </p>
+        <p>想截断或脱敏，不必改方法，写一个转换器挂到注解上即可：</p>
+        <pre data-lang="java" data-file="ShortTextConverter.java">import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.tool.ToolResultConverter;
+import java.lang.reflect.Type;
+
+public class ShortTextConverter implements ToolResultConverter {
+
+    @Override
+    public ToolResultBlock convert(Object result, Type returnType) {
+        String text = String.valueOf(result);
+        String clipped = text.length() &gt; 200 ? text.substring(0, 200) + "…" : text;
+        return ToolResultBlock.text(clipped);
+    }
+}</pre>
+        <pre data-lang="java" data-file="TruncatedTool.java">@Tool(
+        name = "fetch_page",
+        description = "抓取网页正文，返回前 200 个字符。",
+        converter = ShortTextConverter.class)
+public String fetchPage(@ToolParam(name = "url", description = "完整 URL") String url) {
+    return httpGet(url);
+}</pre>
+
+        <h3 id="tool-scan">4. 一个容易忽略的扫描范围</h3>
+        <p>
+          <code>registerTool(Object)</code> 用的是 <code>getClass().getDeclaredMethods()</code>——<strong>只扫本类声明的方法</strong>，父类里的 <code>@Tool</code> 不会被继承注册。把公共工具方法抽到基类后，记得在子类要么重新声明，要么直接注册基类实例。
+        </p>
+        <p class="src-line">扫描实现：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:188">Toolkit.java:188</span></p>
+
+        <h2 id="register">端到端：五条注册路径，选一条就够</h2>
+        <p>工具最终都进同一个注册表，但入口有五种，差别在「schema 谁写」和「执行谁做」：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>路径</th><th>入口</th><th>schema 来源</th><th>执行</th><th>适合</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>注解扫描</td><td><code>registerTool(Object)</code></td><td>反射方法签名</td><td>框架反射调用</td><td>90% 的业务工具</td></tr>
+              <tr><td><code>ToolBase</code> / <code>AgentTool</code></td><td><code>registerTool(...)</code> / <code>registerAgentTool(...)</code></td><td>你手写 Map</td><td>你实现 <code>callAsync</code></td><td>要自定义权限、schema 动态生成</td></tr>
+              <tr><td>只给 schema</td><td><code>registerSchema(ToolSchema)</code></td><td>你手写</td><td><strong>不执行</strong>，返回 suspended</td><td>外部系统/人工执行的工具</td></tr>
+              <tr><td>MCP</td><td><code>registerMcpClient(...)</code> 或 <code>registration().mcpClient(...)</code></td><td>MCP server 提供</td><td>MCP client 转发</td><td>复用现成工具生态</td></tr>
+              <tr><td>子 Agent</td><td><code>registration().subAgent(...)</code></td><td>固定两参数</td><td>内嵌一个 agent</td><td>把「专家」封装成工具</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          带配置时用流式 API <code>toolkit.registration()</code>，它把「注册 + 分组 + 预设参数 + MCP 过滤」收进一个链式调用：
+        </p>
+        <pre data-lang="java" data-file="FluentRegistration.java">import io.agentscope.core.tool.Toolkit;
+import java.util.Map;
+
+Toolkit toolkit = new Toolkit();
+
+toolkit.registration()
+        .tool(new DatabaseTools())
+        .group("database")
+        // preset 参数不会出现在 schema 里，执行时强制覆盖模型给的值
+        .presetParameters(Map.of("db_query", Map.of("tenant", "acme")))
+        .apply();</pre>
+        <p class="src-line">
+          <code>registration()</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:151">Toolkit.java:151</span>；<code>apply()</code> 的四种分支与互斥校验：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:1237">Toolkit.java:1237</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">预设参数是「覆盖」，不是「默认值」</span>
+          <p>
+            <code>ToolExecutor</code> 合并输入的顺序是「模型参数 → 预设参数」，后者用 <code>putAll</code> 直接盖掉前者<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolExecutor.java:269"
+              >ToolExecutor.java:269</span
+            >。所以 <code>tenant</code> 这类参数适合放租户身份、API key、固定目录——<strong>不要拿它做「用户可以改的默认值」</strong>，模型改不动。
+          </p>
+        </div>
+        <p>注册表内部只做四件事，顺序固定：</p>
+        <ul class="timeline">
+          <li><span class="who">注册</span><div class="what">把对象变成 <code>AgentTool</code>：注解式包成 <code>ReflectiveFunctionTool</code>，<code>ToolBase</code> 子类直接用。</div></li>
+          <li><span class="who">建 schema</span><div class="what">只收集带 <code>@ToolParam</code> 的参数；泛型交给 <code>JsonSchemaUtils</code>；嵌套类型的 <code>$defs</code> 会被提升到根节点。</div></li>
+          <li><span class="who">存表</span><div class="what"><code>ToolRegistry.registerTool(name, ...)</code>——底层是 <code>Map.put</code>，同名<strong>直接覆盖，不报错</strong>。</div></li>
+          <li><span class="who">取用</span><div class="what">Agent 构建时 <code>toolkit.copy()</code> 复制注册表；每次推理按当前会话的激活组过滤出 <code>List&lt;ToolSchema&gt;</code>。</div></li>
+        </ul>
+        <p class="src-line">
+          schema 生成：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolSchemaGenerator.java:59">ToolSchemaGenerator.java:59</span>；同名覆盖：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolRegistry.java:52">ToolRegistry.java:52</span>；构建期复制：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:946">Toolkit.java:946</span>
+        </p>
+
+        <h2 id="execute">端到端：一次工具调用，框架替你做了 9 件事</h2>
+        <ul class="timeline">
+          <li><span class="who">模型</span><div class="what">在回复里给出 <code>tool_calls</code>：工具名 + 一段 JSON 参数，框架把它解析成 <code>ToolUseBlock</code>。</div></li>
+          <li><span class="who">权限</span><div class="what">权限引擎给出 ALLOW / ASK / DENY；只有放行的调用才继续（第 08 章展开）。</div></li>
+          <li><span class="who">合并配置</span><div class="what"><code>ExecutionConfig</code> 按「Agent 级 &gt; Toolkit 级 &gt; <code>TOOL_DEFAULTS</code>」合并，得到超时与重试预算。</div></li>
+          <li><span class="who">排序</span><div class="what">并行为 true 时，<strong>连续的 concurrencySafe 工具</strong>并发执行，不安全的单独占一个串行槽位；最终顺序与模型给出的一致。</div></li>
+          <li><span class="who">查找</span><div class="what">按名字取工具；取不到 → 直接返回 <code>ToolResultBlock.error("Tool not found: ...")</code>，不抛异常。</div></li>
+          <li><span class="who">校验</span><div class="what">激活组检查（未激活 → <code>Unauthorized tool call</code>）+ JSON Schema 校验；可选参数里的显式 null 会先被剪掉。</div></li>
+          <li><span class="who">执行</span><div class="what">外部工具 → 返回 suspended；否则合并预设参数、注入上下文，调 <code>callAsync</code> 或反射方法。</div></li>
+          <li><span class="who">兜底</span><div class="what">业务异常 → error 结果；<code>ToolSuspendException</code> → suspended；空返回 → error 结果。超时、重试、停机守卫都在这一层。</div></li>
+          <li><span class="who">回填</span><div class="what">Agent 侧推导最终状态（SUCCESS / ERROR / RUNNING），写进消息与历史，下一轮推理喂回模型。</div></li>
+        </ul>
+        <p class="src-line">
+          执行核心：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolExecutor.java:201">ToolExecutor.java:201</span>；并行分槽：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolExecutor.java:405">:405</span>；INFRA（超时/重试/停机）：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolExecutor.java:472">:472</span>
+        </p>
+        <div class="callout danger">
+          <span class="ct">工具失败不会炸掉整轮对话，这是设计而不是巧合</span>
+          <p>
+            <code>executeWithInfrastructure</code> 最后有一个 <code>onErrorResume</code>：任何漏出来的异常都会被包成
+            <code>ToolResultBlock.error("Tool execution failed: ...")</code> 并带上 tool id<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolExecutor.java:481"
+              >ToolExecutor.java:481</span
+            >。ReActAgent 那层还会再兜一次，保证每个 <code>ToolUseBlock</code> 都有配对的 <code>ToolResultBlock</code>——否则历史里会出现「有调用没结果」的坏状态。
+          </p>
+        </div>
+        <h3 id="tool-no-retry">工具默认<strong>不重试</strong></h3>
+        <p>
+          这是与模型调用最大的差别：模型默认 <code>maxAttempts=3</code>，工具的 <code>TOOL_DEFAULTS</code> 是
+          <strong>5 分钟超时 + 1 次尝试</strong>。而且要注意：工具方法自己抛的异常在 <code>executeCore</code> 里已经被转成「正常的 error 结果」，不再是错误信号，所以<strong>即使你调大 <code>maxAttempts</code>，业务异常也不会触发重试</strong>；只有超时这类真正以 error 信号结束的情况才会重试。
+        </p>
+        <p class="src-line">
+          工具默认值：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ExecutionConfig.java:163">ExecutionConfig.java:163</span>；重试只作用于错误信号：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolExecutor.java:514">ToolExecutor.java:514</span>
+        </p>
+
+        <h2 id="group">工具分组：把「上下文预算」当回事</h2>
+        <p>
+          工具一多，最先撑爆的不是显存，是上下文：每个工具都要把 name、description、JSON Schema 塞进系统提示，二十个工具就是几千 token，模型还更容易选错。分组解决的就是这件事——<strong>默认只给常驻工具，其余按需披露</strong>。
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h4>不分组</h4>
+            <ul>
+              <li>注册即常驻，每一轮都在 schema 里</li>
+              <li>工具少于 8 个时最省事</li>
+              <li>工具多起来只能靠超长 description 硬撑区分度</li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4>分组 + meta tool</h4>
+            <ul>
+              <li>组没激活 → schema 里根本不出现，模型不知道有这个能力</li>
+              <li>模型自己调 <code>reset_equipped_tools</code> 开关</li>
+              <li>按业务域切（数据库 / 工单 / 计费），适合 8 个以上</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          关键机制只有一句：<strong>没归组的工具视为常驻；归了组的工具，只有所属组处于激活状态时才会进 schema</strong><span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolSchemaProvider.java:83"
+            >ToolSchemaProvider.java:83</span
+          >。上一章说的「每轮推理前按激活组过滤」就是指这一段。
+        </p>
+
+        <h3 id="group-create">1. 建组、归组、开 meta tool</h3>
+        <pre data-lang="java" data-file="GroupedTools.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.tool.Toolkit;
+
+Toolkit toolkit = new Toolkit();
+
+// ① 建组：名字 + 给模型看的描述 + 默认是否激活
+//    两参/三参重载的 scope 都是 META（模型可通过 meta tool 管理）
+toolkit.createToolGroup("database", "查库：表结构、只读 SQL、慢查询分析", false);
+
+// ② 注册时归组；不写 .group() 就是常驻工具
+toolkit.registration()
+        .tool(new DatabaseTools())
+        .group("database")
+        .apply();
+
+// ③ 打开 meta tool，模型才有开关组的手段
+ReActAgent agent =
+        ReActAgent.builder()
+                .name("DBAssistant")
+                .sysPrompt("需要查库时先激活 database 工具组。")
+                .model("dashscope:qwen-plus")
+                .toolkit(toolkit)
+                .enableMetaTool(true)
+                .build();</pre>
+        <p class="src-line">
+          <code>createToolGroup</code> 三个重载：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:689">Toolkit.java:689</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:703">:703</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:715">:715</span>；<code>enableMetaTool</code> 挂载 meta tool：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5592">ReActAgent.java:5592</span>
+        </p>
+
+        <h3 id="group-model-view">2. 模型看到的是什么</h3>
+        <p>
+          <code>enableMetaTool(true)</code> 会往注册表里塞一个名为 <code>reset_equipped_tools</code> 的工具<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/tool/MetaToolFactory.java:51"
+            >MetaToolFactory.java:51</span
+          >。它只有一个参数 <code>to_activate</code>，类型是字符串数组，<strong>枚举值只列出 META 域里的组名</strong>——模型没法激活一个你没建的组。
+        </p>
+        <pre data-lang="json" data-file="模型发出的调用">{
+  "name": "reset_equipped_tools",
+  "arguments": { "to_activate": ["database"] }
+}</pre>
+        <ul class="timeline">
+          <li><span class="who">首轮</span><div class="what">schema 里只有常驻工具 + <code>reset_equipped_tools</code>；<code>database</code> 组的工具一个都不出现。</div></li>
+          <li><span class="who">模型</span><div class="what">判断「要查库」，调用 <code>reset_equipped_tools</code>，传 <code>["database"]</code>。</div></li>
+          <li><span class="who">框架</span><div class="what">把这次激活写进<strong>本会话</strong>的 <code>ToolContextState</code>，返回一段文本告诉模型现在激活了哪些组。</div></li>
+          <li><span class="who">次轮</span><div class="what">重新取 schema，这次带上了 <code>database</code> 组——模型才第一次看见 <code>db_query</code> 这些工具名。</div></li>
+        </ul>
+        <div class="callout tip">
+          <span class="ct">组的 <code>description</code> 会变成给模型的指令</span>
+          <p>
+            激活成功后，meta tool 会把每个组的 description 包进 <code>&lt;tool-instructions&gt;</code> 一起返回<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/tool/MetaToolFactory.java:190"
+              >MetaToolFactory.java:190</span
+            >。所以别写「数据库工具」这种废话，写「什么场景该用、什么场景别用」，这是你唯一能影响模型取舍的地方。
+          </p>
+        </div>
+        <div class="callout warn">
+          <span class="ct"><code>to_activate</code> 是「最终清单」，不是「增量」</span>
+          <p>
+            它走的是<strong>替换语义</strong>：<code>replaceActivatedGroups</code> 会把你没列出来的 META 组全部关掉<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/tool/MetaToolFactory.java:169"
+              >MetaToolFactory.java:169</span
+            >。传空数组 <code>[]</code> 等于「把 META 组全关」。这跟很多人直觉里的「激活一个」正好相反，写系统提示时要提醒模型<strong>一次列全</strong>。
+          </p>
+        </div>
+
+        <h3 id="group-meta-external">3. META 与 EXTERNAL：谁有权动这个组</h3>
+        <p>
+          <code>ToolGroupScope</code> 在 2.0.4 里<strong>只有两个值</strong>，没有 <code>SESSION</code>、没有 <code>GLOBAL</code>：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>scope</th><th>谁管理</th><th>进 meta tool 的 enum</th><th>被 <code>reset_equipped_tools</code> 影响</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>META</code>（默认）</td><td>模型，经 meta tool</td><td>是</td><td>是：不在清单里的全被关掉</td></tr>
+              <tr><td><code>EXTERNAL</code></td><td>你的代码</td><td>否</td><td>否：模型既看不见也改不了</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          枚举定义与语义注释：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolGroupScope.java:29">ToolGroupScope.java:29</span>；EXTERNAL 组被校验拦下：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/MetaToolFactory.java:154">MetaToolFactory.java:154</span>
+        </p>
+        <pre data-lang="java" data-file="ExternalGroup.java">import io.agentscope.core.tool.ToolGroup;
+import io.agentscope.core.tool.ToolGroupScope;
+
+// ① 直接建一个 EXTERNAL 组：模型看不见它，也就关不掉它
+toolkit.createToolGroup(
+        "billing", "计费工具，仅在结算会话中由代码开启", false, ToolGroupScope.EXTERNAL);
+
+// ② 需要自己持有 ToolGroup 对象（比如继承做自定义组）时走 builder + registerToolGroup
+toolkit.registerToolGroup(
+        ToolGroup.builder()
+                .name("reports")
+                .description("报表导出")
+                .active(false)
+                .scope(ToolGroupScope.EXTERNAL)
+                .build());</pre>
+        <p class="src-line">
+          <code>ToolGroup</code> 没有 public 构造器，只能 builder：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolGroup.java:59">ToolGroup.java:59</span>；builder 默认 <code>active=true</code> / <code>scope=META</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolGroup.java:187">ToolGroup.java:187</span>
+        </p>
+        <div class="callout danger">
+          <span class="ct">分组这块有三处文档和代码对不上</span>
+          <p>
+            ① 文档里写 <code>ToolGroupScope.SESSION</code>——不存在，只有 <code>META</code> / <code>EXTERNAL</code>；<br />
+            ② 文档里用 <code>new ToolGroup(name, desc, scope, false)</code>——构造器是 <code>protected</code>，编译不过，要用 <code>ToolGroup.builder()</code> 或 <code>toolkit.createToolGroup(...)</code>；<br />
+            ③ 文档说 <code>registerTool(Object)</code> 会把工具放进 <code>"basic"</code> 组——全仓库没有 <code>"basic"</code> 这个组名，<strong>不归组就是常驻</strong>。
+          </p>
+        </div>
+        <p>
+          最后一个容易踩的点：<code>updateToolGroups(List, boolean)</code> 是<strong>旧版单会话 API</strong>，改的是共享的激活标记，多会话并发时会互相污染<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:792"
+            >Toolkit.java:792</span
+          >。真正的按会话隔离靠 <code>AgentState</code> 里的 <code>ToolContextState</code>——这也是为什么手动调 <code>reset_equipped_tools</code> 时如果 <code>RuntimeContext</code> 里没有 <code>AgentState</code>，它会直接返回 <code>Error: reset_equipped_tools requires a per-session runtime context</code>，而不是退回去改共享状态<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/tool/MetaToolFactory.java:162"
+            >MetaToolFactory.java:162</span
+          >。
+        </p>
+        <p>
+          顺便记住激活组检查的报错文本：工具存在但组没激活，<code>ToolExecutor</code> 返回的是 <code>Unauthorized tool call</code><span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolExecutor.java:221"
+            >ToolExecutor.java:221</span
+          >，<strong>不是</strong> <code>Tool not found</code>。看到前者去查分组，别去查注册代码。两种错在 <a href="../appendix/errors.html#err-tool-not-found-by-model">附录 B · 模型调了不存在的工具</a> 有对照。
+        </p>
+
+        <h2 id="mcp">MCP：把别人的工具服务器挂进来</h2>
+        <p>
+          MCP（Model Context Protocol）是「工具服务」的标准协议：server 端暴露一堆工具，client 端把它们翻译成 <code>AgentTool</code>。对框架来说 MCP 工具和你手写的工具在注册表里<strong>没有区别</strong>——同样进 schema、同样走上面那 9 步，区别只在 <code>callAsync</code> 里做的是网络请求或子进程通信。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>传输</th><th>builder 方法</th><th>典型场景</th><th>生命周期</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>StdIO</td><td><code>stdioTransport(command, args...)</code></td><td>本地 MCP server（npx / python / 自己的 jar）</td><td>框架拉起子进程，<code>close()</code> 时结束</td></tr>
+              <tr><td>SSE</td><td><code>sseTransport(url)</code></td><td>有状态的长连接 HTTP server</td><td>连接常驻，适合需要推送的 server</td></tr>
+              <tr><td>StreamableHTTP</td><td><code>streamableHttpTransport(url)</code></td><td>无状态 HTTP server，最容易水平扩展</td><td>每请求独立</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="mcp-local">1. 本地 server：四行接进来</h3>
+        <pre data-lang="java" data-file="McpStdio.java">import io.agentscope.core.tool.mcp.McpClientBuilder;
+import io.agentscope.core.tool.mcp.McpClientWrapper;
+
+McpClientWrapper filesystem =
+        McpClientBuilder.create("filesystem")
+                .stdioTransport(
+                        "npx", "-y", "@modelcontextprotocol/server-filesystem", "D:/tmp")
+                .buildSync();          // 也可以 buildAsync().block()
+
+// 注册时框架会自己 initialize() + listTools()，你不用手动连
+toolkit.registerMcpClient(filesystem).block();</pre>
+        <p class="src-line">
+          <code>create</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/mcp/McpClientBuilder.java:119">McpClientBuilder.java:119</span>；<code>stdioTransport</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/mcp/McpClientBuilder.java:133">:133</span>；<code>buildSync</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/mcp/McpClientBuilder.java:542">:542</span>；注册即初始化 + 列举工具：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/McpClientManager.java:246">McpClientManager.java:246</span>
+        </p>
+        <div class="callout tip">
+          <span class="ct">Windows 上 stdio 的第一个参数</span>
+          <p>
+            <code>stdioTransport</code> 拼的是真实进程，Windows 下 <code>npx</code> / <code>pnpm</code> 这类脚本通常要写成 <code>npx.cmd</code>，否则会收到「找不到命令」。报错发生在 <code>registerMcpClient(...).block()</code> 那一刻，不是编译期。
+          </p>
+        </div>
+
+        <h3 id="mcp-remote">2. 远程 server：过滤、加前缀、归组</h3>
+        <pre data-lang="java" data-file="McpRemote.java">import io.agentscope.core.tool.Toolkit;
+import java.time.Duration;
+import java.util.List;
+
+Toolkit toolkit = new Toolkit();
+toolkit.createToolGroup("remote", "公司内网 MCP 工具：工单查询与创建", false);
+
+McpClientWrapper remote =
+        McpClientBuilder.create("corp-mcp")
+                .streamableHttpTransport("https://mcp.example.com/http")
+                .header("Authorization", "Bearer " + System.getenv("MCP_TOKEN"))
+                .timeout(Duration.ofSeconds(60))
+                .buildSync();
+
+toolkit.registration()
+        .mcpClient(remote)
+        .enableTools(List.of("search_ticket", "get_ticket"))   // 留空/不写 = 全开
+        .mcpToolNamePrefix("corp_")                             // 默认是空串
+        .group("remote")
+        .apply();</pre>
+        <p>
+          <code>apply()</code> 内部对 MCP 分支是 <code>registerMcpClient(...).block()</code>，所以这一步是<strong>同步且会真的去连</strong>的<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:1264"
+            >Toolkit.java:1264</span
+          >。放在应用启动路径上时要给它包一层 try-catch——server 挂了不该让整个服务起不来。
+        </p>
+
+        <h3 id="mcp-details">3. 四个容易误判的细节</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>细节</th><th>真实行为</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>工具名</td><td><code>toolNamePrefix + mcpTool.name()</code>，<strong>没有</strong> <code>mcp__{server}__{tool}</code> 这种命名空间，默认前缀是空串</td></tr>
+              <tr><td>同名冲突</td><td>底层 <code>Map.put</code>，后注册的<strong>静默覆盖</strong>，不报错不打日志</td></tr>
+              <tr><td>只读判定</td><td>取 server 返回的 <code>annotations().readOnlyHint()</code>；只读工具权限层放行，其余默认 ASK</td></tr>
+              <tr><td>并发</td><td><code>McpTool</code> 固定 <code>concurrencySafe(false)</code>，所以 MCP 调用永远串行——即使 <code>ToolkitConfig</code> 开了并行</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          命名与前缀：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/McpClientManager.java:307">McpClientManager.java:307</span>；<code>readOnlyHint</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/McpClientManager.java:300">:300</span>；固定不可并发：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/mcp/McpTool.java:114">McpTool.java:114</span>；权限 allow/ask：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/mcp/McpTool.java:194">:194</span>
+        </p>
+        <div class="callout danger">
+          <span class="ct">多 server 场景一定加前缀，否则工具会凭空消失</span>
+          <p>
+            两个 server 都有 <code>search</code> 时，后注册的那个把前一个<strong>直接覆盖</strong>（<code>ToolRegistry.registerTool</code> 就是一次 <code>tools.put</code><span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolRegistry.java:52"
+              >ToolRegistry.java:52</span
+            >）。现象是：你明明接了两个 server，<code>getToolSchemas()</code> 里却只有一个 <code>search</code>，而且描述来自不是你预期的那台。
+          </p>
+        </div>
+        <p>
+          还有一个安全开关值得知道：默认情况下 <code>RuntimeContext</code> 里登记的 <code>McpMeta</code> 和本次调用的 tool-call id 会作为 <code>meta</code> 字段发给 server。接第三方不可信 server 时，在注册处加 <code>.propagateMeta(false)</code>，<strong>整条连接</strong>就不再外发元数据；也可以只对单个工具关（<code>propagateMeta("toolName", false)</code>）。三层是<strong>逻辑与</strong>：工具级 &gt; 注册级 &gt; 连接级，连接级是实时读取的，改一次立刻对已注册工具生效。
+        </p>
+
+        <h2 id="cheatsheet">速查</h2>
+        <h3 id="builtin-tools">1. 内置工具：框架已经写好了，但不会自动注册</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>类</th><th>工具名</th><th>关键参数</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>TodoTools</code></td><td><code>todo_write</code></td><td><code>todos[]</code></td><td>会话任务清单；<code>stateInjected=true</code>，写进 <code>AgentState.tasksContext</code>，随状态存储一起持久化</td></tr>
+              <tr><td><code>ShellCommandTool</code></td><td><code>execute_shell_command</code></td><td>构造参数：<code>baseDir</code> / 命令白名单 / <code>approvalCallback</code></td><td>实现 <code>AgentTool</code>；默认按平台选 Windows / Unix 命令校验器</td></tr>
+              <tr><td><code>ReadFileTool</code></td><td><code>view_text_file</code>、<code>list_directory</code></td><td><code>file_path</code>、<code>ranges</code>、<code>dir_path</code></td><td>注解式，一个类带两个 <code>@Tool</code></td></tr>
+              <tr><td><code>WriteFileTool</code></td><td><code>insert_text_file</code>、<code>write_text_file</code></td><td><code>file_path</code>、<code>content</code>、<code>line_number</code></td><td>注解式，插入与覆盖分开两个工具</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          清单来源：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/builtin/TodoTools.java:92">TodoTools.java:92</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/coding/ShellCommandTool.java:354">ShellCommandTool.java:354</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/file/ReadFileTool.java:92">ReadFileTool.java:92</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/file/WriteFileTool.java:238">WriteFileTool.java:238</span>
+        </p>
+        <p><code>TodoTools</code> 是 <code>stateInjected</code> 最好的参考实现：方法签名里带一个 <code>AgentState state</code>，注解开 <code>stateInjected = true</code>，这个参数<strong>不会</strong>进 schema，模型也看不到。</p>
+
+        <h3 id="want-table">2. 「我想…」对照表</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>用哪条路</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>让模型查我的数据库 / 调我的 service</td><td><code>@Tool</code> 方法 + <code>registerTool(bean)</code>；连接池这类依赖走无注解 POJO 注入</td></tr>
+              <tr><td>schema 要按租户/配置动态生成</td><td><code>ToolBase</code> 子类，手写 <code>getParameters()</code></td></tr>
+              <tr><td>工具其实由外部系统或人工执行</td><td><code>registerSchema(ToolSchema)</code> 只给 schema，或 <code>@Tool(externalTool = true)</code>/抛 <code>ToolSuspendException</code></td></tr>
+              <tr><td>复用现成的 MCP 生态</td><td><code>McpClientBuilder</code> + <code>registerMcpClient</code></td></tr>
+              <tr><td>把某个专家 agent 当工具用</td><td><code>registration().subAgent(provider, config)</code>，暴露 <code>message</code> + <code>session_id</code> 两个参数</td></tr>
+              <tr><td>工具太多塞不进上下文</td><td>ToolGroup + <code>enableMetaTool(true)</code></td></tr>
+              <tr><td>参数里带 token、租户这类模型不该改的值</td><td><code>presetParameters(...)</code>，执行时强制覆盖</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="doc-mismatch">3. 文档与 2.0.4 代码的 7 处不一致</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>#</th><th>官方文档</th><th>2.0.4 代码</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>1</td><td>meta tool 名为 <code>reset_tools</code></td><td><code>reset_equipped_tools</code>，参数 <code>to_activate</code></td></tr>
+              <tr><td>2</td><td><code>ToolGroupScope.SESSION</code></td><td>只有 <code>META</code> / <code>EXTERNAL</code></td></tr>
+              <tr><td>3</td><td><code>new ToolGroup(name, desc, scope, false)</code></td><td>构造器 <code>protected</code>，只能 <code>ToolGroup.builder()</code></td></tr>
+              <tr><td>4</td><td><code>registerTool(Object)</code> 进 <code>"basic"</code> 组</td><td>没有 <code>"basic"</code>；未归组 = 常驻</td></tr>
+              <tr><td>5</td><td><code>concurrencySafe</code> 默认 <code>false</code></td><td><code>@Tool</code> 与 <code>ToolBase.builder</code> 都是 <strong><code>true</code></strong></td></tr>
+              <tr><td>6</td><td>MCP 工具名 <code>mcp__{server}__{tool}</code></td><td>无命名空间，<code>prefix + 原名</code>，默认前缀空串</td></tr>
+              <tr><td>7</td><td><code>McpClientBuilder.stdio()/command()/args()/build()</code></td><td><code>create(name)</code>、<code>stdioTransport(cmd, args...)</code>、<code>buildSync()/buildAsync()</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          这几条不是「文档写早了」这么简单——照文档写会直接<strong>编译不过</strong>（第 2、3、7 条）或<strong>静默跑错</strong>（第 1、4、5、6 条）。核对方式永远是同一个：在 <code>agentscope-java-2.0.4</code> 里搜符号名。
+        </p>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. 参数没加 <code>@ToolParam</code>，运行时永远是 <code>null</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>方法能跑，但 <code>String type</code> 这个参数总是 <code>null</code>，模型说「我传了」。</dd>
+            <dt>因为</dt>
+            <dd>schema 只收集带 <code>@ToolParam</code> 的参数，没有它的参数根本不在 schema 里，模型没地方填。</dd>
+            <dt>改成</dt>
+            <dd>凡是该由模型给的参数，一律写 <code>@ToolParam(name = ..., description = ...)</code>；改完先打印 <code>toolkit.getToolSchemas()</code> 核对。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 同名工具静默覆盖</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>注册了 6 个工具，模型只看到 5 个；或者某个工具的行为跟源码对不上。</dd>
+            <dt>因为</dt>
+            <dd><code>ToolRegistry</code> 底层是 <code>Map.put</code>，同名直接覆盖，<strong>不校验、不打日志</strong>。</dd>
+            <dt>改成</dt>
+            <dd>工具名加业务前缀（<code>crm_search</code> / <code>kb_search</code>）；启动时打一遍全部工具名做查重，这是最便宜的防线。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. 以为 <code>maxRetries</code> 管工具</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>模型调用配了重试，工具却不重试；调大之后还是不重试。</dd>
+            <dt>因为</dt>
+            <dd>工具走自己的 <code>TOOL_DEFAULTS</code>（5 分钟 + 1 次尝试）；而且业务异常在 <code>executeCore</code> 里已转成正常 error 值，不再是错误信号，<code>Retry</code> 根本收不到。</dd>
+            <dt>改成</dt>
+            <dd>想在工具内部重试就自己写循环（记得幂等）；只靠框架的话，只有超时这类以 error 信号结束的情况才会被重试。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 以为抛异常能中断对话</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>工具里抛了 <code>RuntimeException</code>，可模型下一轮还在继续说话，只是变成了「抱歉工具失败了」。</dd>
+            <dt>因为</dt>
+            <dd>框架保证每个 <code>ToolUseBlock</code> 都有配对的 <code>ToolResultBlock</code>，异常会被包成 <code>error</code> 结果喂回模型。</dd>
+            <dt>改成</dt>
+            <dd>要真的停下，用 <code>ToolSuspendException</code>（→ suspended，等外部执行）或让权限层 deny；不要靠抛异常「炸掉」循环。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. 父类的 <code>@Tool</code> 不会被注册</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>把公共工具方法抽到基类后，子类注册了，但那些工具消失了。</dd>
+            <dt>因为</dt>
+            <dd><code>registerTool(Object)</code> 用 <code>getDeclaredMethods()</code>，只扫本类声明的方法。</dd>
+            <dt>改成</dt>
+            <dd>要么把基类实例也注册一遍，要么在子类重写并重新标注。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">6. <code>stateInjected</code> 和方法签名不匹配</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>工具注册那一刻就抛 <code>IllegalArgumentException</code>，agent 起不来。</dd>
+            <dt>因为</dt>
+            <dd>构建 <code>ReflectiveFunctionTool</code> 时有四条校验：<code>AgentState</code> 参数不能带 <code>@ToolParam</code>、最多一个、开了 <code>stateInjected</code> 必须有、有 <code>AgentState</code> 参数就必须开。</dd>
+            <dt>改成</dt>
+            <dd>两个方向对齐即可；参考 <code>TodoTools.todoWrite</code> 的写法。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>下面哪个参数<strong>不会</strong>出现在 schema 里：<code>String city</code>（带 <code>@ToolParam</code>）、<code>String unit</code>（带 <code>@ToolParam</code>）、<code>AgentState state</code>、<code>int retries</code>（带 <code>@ToolParam</code>）？</summary>
+          <p>
+            只有 <code>AgentState</code> 不会。它是框架按<strong>类型</strong>注入的，永远不进 schema<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolMethodInvoker.java:149"
+              >ToolMethodInvoker.java:149</span
+            >。另外注意题干里的陷阱：<code>int retries</code> 如果<strong>不带</strong>注解，同样不会进 schema，运行时因为取不到值会落到基本类型的默认值（<code>0</code>），不会报错——这类 bug 最难查。
+          </p>
+        </details>
+        <details>
+          <summary>工具方法里抛了 <code>RuntimeException</code>，这一轮对话会怎样？</summary>
+          <p>
+            不会中断。异常在 <code>executeCore</code> 里被转成带 tool id 的 <code>ToolResultBlock.error</code>，模型看到错误文本后可以换个参数重试、或者向用户解释。所以<strong>工具里的报错信息要写给模型看</strong>：告诉它错在哪、下次该怎么传，而不是丢一段堆栈。
+          </p>
+        </details>
+        <details>
+          <summary>当前激活的是 <code>[web, database]</code>，模型调 <code>reset_equipped_tools</code> 传 <code>["database"]</code>，结果是什么？</summary>
+          <p>
+            <code>web</code> 被<strong>关闭</strong>，只剩 <code>database</code>。这是替换语义而不是增量语义，也是新手最容易误判的一处；传 <code>[]</code> 会把所有 META 组关掉。EXTERNAL 组完全不受影响——它压根不在 <code>to_activate</code> 的枚举里。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">亲眼看 schema 少了什么</span>
+            <div>
+              给 <code>getWeather</code> 加一个<strong>不带注解</strong>的 <code>String traceId</code> 参数，先打印 <code>toolkit.getToolSchemas()</code> 里 <code>get_weather</code> 的 parameters（确认没有它），再在方法里打印这个参数的值（会是 <code>null</code>）。这比读十遍文档都管用。
+            </div>
+          </li>
+          <li>
+            <span class="sh">复现一次静默覆盖</span>
+            <div>
+              写两个类，各有一个 <code>@Tool(name = "search")</code> 的方法，注册进同一个 toolkit，然后打印 <code>getToolSchemas().size()</code> 和那条 schema 的 description。你会看到只有一个 <code>search</code>，且没有警告——这就是为什么多 MCP server 一定要加前缀。
+            </div>
+          </li>
+          <li>
+            <span class="sh">跑通一次按需披露</span>
+            <div>
+              建一个 <code>database</code> 组（<code>active=false</code>），agent 开 <code>enableMetaTool(true)</code>，用 <code>agent.streamEvents(msg, ctx)</code> 遍历事件<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1160">ReActAgent.java:1160</span>，把工具名和 <code>tool_calls</code> 里的名字打出来。你应该能看到：第一轮没有组内工具 → 出现 <code>reset_equipped_tools</code> 调用 → 之后才出现组内工具。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          到这一章为止，Agent 已经能「说话 + 动手」了。但它每次 <code>call</code> 都像是失忆的：上一轮说过什么、激活了哪些工具组，这些状态到底存在哪？下一章 <a href="07-memory-context.html">07 记忆与上下文</a>就讲这件事——<code>AgentState</code> 里到底装了什么、<code>AgentStateStore</code> 的三种实现怎么选、以及「引擎无状态」这句话到底是什么意思。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想确认的事</th><th>去哪看</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方工具章节（结构可参考，API 以代码为准）</td><td><span class="src" data-src="docs/v2/zh/docs/building-blocks/tool.md:1">tool.md:1</span></td></tr>
+              <tr><td>工具结果写回历史的位置</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:3669">ReActAgent.java:3669</span></td></tr>
+              <tr><td>每次调用自动注入 <code>AgentState</code></td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:739">ReActAgent.java:739</span></td></tr>
+              <tr><td>激活状态从哪读</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/MetaToolFactory.java:129">MetaToolFactory.java:129</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

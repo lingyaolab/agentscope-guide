@@ -1,0 +1,977 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="前面十章都是零件：消息、模型、工具、状态、权限、中间件。这一章把它们装成一台能用的机器——四个文件、一百多行 Java 的命令行笔记助手：能调工具、能看到流式输出、删笔记前会停下来问你、关掉再打开还记得上次聊了什么。代码全部按 2.0.4 的签名写，可以直接粘进 Maven 工程跑。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="11 综合案例：一个能用的命令行笔记 Agent · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="前面十章都是零件：消息、模型、工具、状态、权限、中间件。这一章把它们装成一台能用的机器——四个文件、一百多行 Java 的命令行笔记助手：能调工具、能看到流式输出、删笔记前会停下来问你、关掉再打开还记得上次聊了什么。代码全部按 2.0.4 的签名写，可以直接粘进 Maven 工程跑。" />
+    <title>11 综合案例：一个能用的命令行笔记 Agent · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="11-capstone" data-root="..">
+    <main>
+      <article class="article">
+        <h1>11 · 综合案例：一个能用的命令行笔记 Agent</h1>
+        <p class="lede">
+          前面十章都是零件：消息、模型、工具、状态、权限、中间件。这一章把它们装成一台能用的机器——<strong>四个文件、
+          一百多行 Java</strong> 的命令行笔记助手：能调工具、能看到流式输出、删笔记前会停下来问你、关掉再打开还记得上次聊了什么。
+          代码全部按 2.0.4 的签名写，可以直接粘进 Maven 工程跑。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>独立写出一个「工具 + 状态 + 权限 + 流式」四件套齐全的最小 Agent 工程，知道每个文件负责什么</li>
+          <li>用 <code>streamEvents</code> 同时做三件事：打增量文本、显示工具执行结果、接住 <code>RequireUserConfirmEvent</code></li>
+          <li>写对 HITL 闭环：从暂停判定到 <code>ConfirmResult</code> 续跑，中间不丢 <code>ToolUseBlock</code> 原件</li>
+          <li>让会话跨进程存活：<code>JsonFileAgentStateStore</code> 放进哪个目录、磁盘上长什么样、什么时候会「失忆」</li>
+          <li>把这个 core 版案例迁到 <code>HarnessAgent</code>，知道要改哪三行、又多拿到什么</li>
+        </ul>
+
+        <h2 id="brief">先说清楚：这个案例到底做什么</h2>
+        <p>
+          需求只有一句话：<strong>在终端里跟一个笔记助手聊天，它能记住你说的话，能读写一个本地文件，删文件前必须问你。</strong>
+          听起来像玩具，但它把 SDK 里最难拼的四块接缝全用上了——工具注册、会话状态、权限确认、事件流。把这四块拼对，
+          换成真实业务只是把 <code>NotesTools</code> 里的三个方法换掉。
+        </p>
+        <pre data-lang="text" data-file="目录结构">notes-agent/
+├── pom.xml
+└── src/main/java/com/example/notes/
+    ├── NotesTools.java     <!-- 工具：写 / 列 / 删 -->
+    ├── NotesAgent.java     <!-- 装配：模型 + 提示词 + 工具 + 权限 + 状态存储 -->
+    └── Cli.java            <!-- 交互：REPL + 流式打印 + 审批续跑 -->
+
+运行后产生（都在用户目录下，不污染项目）：
+~/.notes-agent/
+├── notes/notes.txt          ← 笔记正文
+└── state/local/cli/         ← 会话状态：agent_state.json + memory_messages.jsonl</pre>
+        <p>
+          一次「删笔记」的完整链路长这样，六步里有三步是普通 CRUD 应用里没有的：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">读一行输入</span>
+            <div><code>Cli</code> 从 <code>System.in</code> 读一句「把笔记清空」，连同同一个 <code>RuntimeContext</code> 交给 agent。</div>
+          </li>
+          <li>
+            <span class="sh">流式跑第一轮</span>
+            <div><code>streamEvents(text, ctx)</code> 持续吐 <code>TextBlockDeltaEvent</code>；模型决定调 <code>delete_note</code>，进入 acting。</div>
+          </li>
+          <li>
+            <span class="sh">权限引擎拦下</span>
+            <div>规则命中 <code>ASK</code>，这一轮以 <code>PERMISSION_ASKING</code> 结束，同时发出 <code>RequireUserConfirmEvent</code> 与携带 ASKING 工具的 <code>AgentResultEvent</code>。</div>
+          </li>
+          <li>
+            <span class="sh">就地提问</span>
+            <div><code>Cli</code> 读到 reason 是 <code>PERMISSION_ASKING</code>，用 <code>BufferedReader</code> 问一句「允许吗？」——注意这里<strong>没有回调、没有阻塞等待</strong>，agent 早就返回了。</div>
+          </li>
+          <li>
+            <span class="sh">带答案再跑一轮</span>
+            <div>把 <code>ConfirmResult</code> 塞进新 <code>UserMessage</code> 的 metadata，拿<strong>同一个 ctx</strong> 再调一次 <code>streamEvents</code>；框架按 id 找到挂起的工具，这次真的执行。</div>
+          </li>
+          <li>
+            <span class="sh">存盘</span>
+            <div>本轮结束后，<code>stateStore</code> 把 <code>AgentState</code> 与消息列表写进磁盘；下次启动同 <code>sessionId</code>，模型能看到上次的上下文。</div>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <span class="ct">为什么用 core 而不是 Harness 写这个案例</span>
+          <p>
+            因为案例要「每一行都看得见源头」。<code>HarnessAgent</code> 会自动挂十几个中间件、一批内置工具和默认落盘，
+            调试审批回路时分不清是谁在暂停。第 10 章已经讲清两者是同一颗引擎，这里用 <code>ReActAgent</code>
+            显式装配；最后一节给出换成 Harness 的 diff。
+          </p>
+        </div>
+
+        <h2 id="pom">文件一：<code>pom.xml</code></h2>
+        <p>
+          只需要两个依赖：<code>agentscope-core</code> 提供 agent 与工具，<code>agentscope-extensions-model-dashscope</code>
+          让 <code>"dashscope:qwen-plus"</code> 这个字符串能被解析成真实模型。注意<strong>不要</strong>再引
+          <code>agentscope-harness</code>——本案用不到它，两个都引只会让 classpath 变厚。
+        </p>
+        <pre data-lang="xml" data-file="pom.xml">&lt;project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             https://maven.apache.org/xsd/maven-4.0.0.xsd"&gt;
+  &lt;modelVersion&gt;4.0.0&lt;/modelVersion&gt;
+
+  &lt;groupId&gt;com.example&lt;/groupId&gt;
+  &lt;artifactId&gt;notes-agent&lt;/artifactId&gt;
+  &lt;version&gt;1.0.0&lt;/version&gt;
+
+  &lt;properties&gt;
+    &lt;maven.compiler.release&gt;17&lt;/maven.compiler.release&gt;
+    &lt;project.build.sourceEncoding&gt;UTF-8&lt;/project.build.sourceEncoding&gt;
+    &lt;agentscope.version&gt;2.0.4&lt;/agentscope.version&gt;
+  &lt;/properties&gt;
+
+  &lt;dependencies&gt;
+    &lt;dependency&gt;
+      &lt;groupId&gt;io.agentscope&lt;/groupId&gt;
+      &lt;artifactId&gt;agentscope-core&lt;/artifactId&gt;
+      &lt;version&gt;${agentscope.version}&lt;/version&gt;
+    &lt;/dependency&gt;
+
+    &lt;dependency&gt;
+      &lt;groupId&gt;io.agentscope&lt;/groupId&gt;
+      &lt;artifactId&gt;agentscope-extensions-model-dashscope&lt;/artifactId&gt;
+      &lt;version&gt;${agentscope.version}&lt;/version&gt;
+    &lt;/dependency&gt;
+  &lt;/dependencies&gt;
+&lt;/project&gt;</pre>
+        <p>
+          <code>maven.compiler.release=17</code> 是硬要求：框架 class 文件的版本就是 17，用 11 编译会直接报
+          <code>UnsupportedClassVersionError</code>。用 JDK 21 编译没问题，release 定在 17 即可。
+        </p>
+
+        <h2 id="tools">文件二：<code>NotesTools.java</code>——三个工具，一个要审批</h2>
+        <p>
+          工具类就是普通 Java 类，方法上标 <code>@Tool</code>、参数上标 <code>@ToolParam</code>，然后整类注册进
+          <code>Toolkit</code>。这里刻意做了三个不同性质的工具：<strong>写</strong>（有副作用但不危险）、<strong>读</strong>
+          （幂等）、<strong>删</strong>（不可恢复，必须问人）。
+        </p>
+        <pre data-lang="java" data-file="NotesTools.java">package com.example.notes;
+
+import io.agentscope.core.tool.Tool;
+import io.agentscope.core.tool.ToolParam;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.List;
+
+public class NotesTools {
+
+    private final Path dir;
+
+    public NotesTools(Path dir) {
+        this.dir = dir;
+    }
+
+    @Tool(name = "write_note", description = "把一条笔记追加到 notes.txt，返回写入的文件路径")
+    public String write(@ToolParam(name = "text", description = "笔记正文") String text) {
+        try {
+            Files.createDirectories(dir);
+            Path file = dir.resolve("notes.txt");
+            Files.writeString(file, text + System.lineSeparator(),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            return "已写入 " + file.toAbsolutePath();
+        } catch (IOException e) {
+            return "写入失败：" + e.getMessage();
+        }
+    }
+
+    @Tool(name = "list_notes", description = "按行列出 notes.txt 的全部内容；没有笔记时返回 (空)")
+    public String list() {
+        Path file = dir.resolve("notes.txt");
+        try {
+            if (!Files.exists(file)) {
+                return "(空)";
+            }
+            List&lt;String&gt; lines = Files.readAllLines(file);
+            return lines.isEmpty() ? "(空)" : String.join("\n", lines);
+        } catch (IOException e) {
+            return "读取失败：" + e.getMessage();
+        }
+    }
+
+    @Tool(name = "delete_note", description = "删除整个 notes.txt，不可恢复")
+    public String delete() {
+        Path file = dir.resolve("notes.txt");
+        try {
+            return Files.deleteIfExists(file) ? "已删除 " + file : "文件本来就不存在";
+        } catch (IOException e) {
+            return "删除失败：" + e.getMessage();
+        }
+    }
+}</pre>
+        <p class="src-line">
+          <code>@Tool</code> / <code>@ToolParam</code> 的扫描规则：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:159">Toolkit.java:159</span>；工具方法返回值会变成 <code>ToolResultBlock</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolExecutor.java:163">ToolExecutor.java</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">工具里自己 <code>catch</code>，别让受检异常飞出去</span>
+          <p>
+            这三个方法都没有 <code>throws IOException</code>：读写失败一律变成一句人话返回。原因是工具抛出的异常会被框架包成
+            <code>ToolResultState.ERROR</code> 的结果再喂给模型——能用，但错误信息经过反射包装后往往变成一串
+            <code>InvocationTargetException</code>，模型看不懂、你也难排查。自己接住并给出可读原因，模型才有机会换方案（比如先建目录再写）。
+          </p>
+        </div>
+        <p>
+          还有一个设计取舍：<strong><code>write_note</code> 没有做「追加还是覆盖」的参数</strong>。工具的参数 schema 越简单，
+          模型调对的概率越高；需要覆盖时它会先调 <code>delete_note</code>（触发审批）再写，行为反而是安全的。
+        </p>
+
+        <h2 id="wiring">文件三：<code>NotesAgent.java</code>——五行装配，三个都不能省</h2>
+        <p>
+          装配类的职责只有一个：把所有可变配置集中到一处，让 <code>Cli</code> 只拿到一个建好的 agent。这里最容易被忽略的是
+          <strong>权限上下文</strong>：不写 <code>.permissionContext(...)</code> 时，<code>@Tool</code> 默认
+          <code>PASSTHROUGH</code>，<code>delete_note</code> 会<strong>直接执行</strong>，根本不会问你。
+        </p>
+        <pre data-lang="java" data-file="NotesAgent.java">package com.example.notes;
+
+import io.agentscope.core.ReActAgent;
+import io.agentscope.core.permission.PermissionBehavior;
+import io.agentscope.core.permission.PermissionContextState;
+import io.agentscope.core.permission.PermissionMode;
+import io.agentscope.core.permission.PermissionRule;
+import io.agentscope.core.state.JsonFileAgentStateStore;
+import io.agentscope.core.tool.Toolkit;
+
+import java.nio.file.Path;
+
+public final class NotesAgent {
+
+    private NotesAgent() {
+    }
+
+    public static ReActAgent build(Path home) {
+        // 1) 工具：数据目录跟着 home 走，测试时传临时目录即可
+        Toolkit toolkit = new Toolkit();
+        toolkit.registerTool(new NotesTools(home.resolve("notes")));
+
+        // 2) 权限：默认模式 + 一条「delete_note 永远先问」的规则
+        PermissionContextState permission = PermissionContextState.builder()
+                .mode(PermissionMode.DEFAULT)
+                .addAskRule("delete_note",
+                        new PermissionRule("delete_note", null, PermissionBehavior.ASK, "session"))
+                .build();
+
+        // 3) Agent：模型、提示词、工具、权限、状态存储
+        return ReActAgent.builder()
+                .name("notes")
+                .sysPrompt("""
+                        你是终端里的笔记助手。
+                        - 用户要记东西，调用 write_note，把原话整理成一句再写。
+                        - 用户问有哪些笔记，调用 list_notes，按原样列出来。
+                        - 用户要清空或删除，调用 delete_note；这一步会由用户确认，你不需要再问一遍。
+                        回答保持简短；不要编造笔记内容。
+                        """)
+                .model("dashscope:qwen-plus")
+                .toolkit(toolkit)
+                .permissionContext(permission)
+                .stateStore(new JsonFileAgentStateStore(home.resolve("state")))
+                .maxIters(8)
+                .build();
+    }
+}</pre>
+        <p class="src-line">
+          <code>addAskRule</code> 的签名：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionContextState.java:233">PermissionContextState.java:233</span>；<code>stateStore</code> 装配点：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5166">ReActAgent.java:5166</span>；<code>JsonFileAgentStateStore</code> 构造器：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:92">JsonFileAgentStateStore.java:92</span>
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>这行配置</th><th>去掉会怎样</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>.permissionContext(permission)</code></td><td><code>delete_note</code> 直接执行，永不暂停</td><td><code>@Tool</code> 默认 <code>PASSTHROUGH</code>，没有规则就没有 ASK 来源</td></tr>
+              <tr><td><code>.stateStore(...)</code></td><td>进程一退，上下文全丢；重启后同 session 也接不上</td><td>只有配上存储，<code>AgentState</code> 才跨进程存活</td></tr>
+              <tr><td><code>.maxIters(8)</code></td><td>默认 10，够用；显式写出来是为了让「一轮对话最多几次推理」有据可查</td><td>触顶后框架会<strong>多做一次摘要调用</strong>，不是抛异常</td></tr>
+              <tr><td><code>.model("dashscope:qwen-plus")</code></td><td>没有模型，<code>build()</code> 直接失败</td><td>字符串 id 由 <code>ServiceLoader</code> 找到 dashscope provider</td></tr>
+              <tr><td><code>sysPrompt</code> 里的「这一步会由用户确认」</td><td>模型有时会自己先问「你确定吗」，多一轮废话</td><td>把「谁负责确认」写清楚，模型就不会重复问</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct"><code>PermissionRule</code> 第四个参数 <code>"session"</code> 是什么意思</span>
+          <p>
+            它是规则的<strong>作用域标签</strong>，跟着规则一起存进权限上下文；本章只用它做「这条规则属于本会话」的语义标注。
+            真正让规则长期生效的是把它放进 <code>PermissionContextState</code>（构建时）或通过
+            <code>ConfirmResult.rules</code> 动态加入（只在当前引擎实例里有效，换模式重建引擎就没了，08 章验证过）。
+          </p>
+        </div>
+
+        <h2 id="cli">文件四：<code>Cli.java</code>——REPL、流式、审批，一个循环搞定</h2>
+        <p>
+          这是本章唯一有「逻辑」的文件。它只做三件事：读一行、跑一轮、如果这一轮停在 <code>PERMISSION_ASKING</code>
+          就地问人再把答案跑一轮。把它拆成三个方法看，每个方法都不超过 30 行。
+        </p>
+        <pre data-lang="java" data-file="Cli.java">package com.example.notes;
+
+import io.agentscope.core.ReActAgent;
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.event.AgentResultEvent;
+import io.agentscope.core.event.ConfirmResult;
+import io.agentscope.core.event.RequireUserConfirmEvent;
+import io.agentscope.core.event.TextBlockDeltaEvent;
+import io.agentscope.core.event.ToolResultEndEvent;
+import io.agentscope.core.message.GenerateReason;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.ToolCallState;
+import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.message.UserMessage;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+
+public class Cli {
+
+    /** 一轮的结果：最终消息 + 这一轮里被挂起的工具调用 */
+    record Round(Msg msg, List&lt;ToolUseBlock&gt; asking) {
+        boolean paused() {
+            return msg != null &amp;&amp; msg.getGenerateReason() == GenerateReason.PERMISSION_ASKING;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Path home = Path.of(System.getProperty("user.home"), ".notes-agent");
+        RuntimeContext ctx = RuntimeContext.builder().userId("local").sessionId("cli").build();
+
+        try (ReActAgent agent = NotesAgent.build(home);
+             BufferedReader in = new BufferedReader(
+                     new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
+
+            System.out.println("笔记助手已就绪，状态目录：" + home.resolve("state"));
+            System.out.println("命令：/exit 退出    /new 换新会话（旧会话留在磁盘上）");
+
+            while (true) {
+                System.out.print("\n你&gt; ");
+                String line = in.readLine();
+                if (line == null || line.equals("/exit")) {
+                    break;
+                }
+                if (line.isBlank()) {
+                    continue;
+                }
+                if (line.equals("/new")) {
+                    ctx = RuntimeContext.builder().userId("local")
+                            .sessionId("cli-" + System.currentTimeMillis()).build();
+                    System.out.println("已切到新会话 " + ctx.getSessionId());
+                    continue;
+                }
+                try {
+                    converse(agent, ctx, line, in);
+                } catch (IllegalStateException e) {
+                    System.out.println("\n这一轮没跑完：" + e.getMessage());
+                    System.out.println("如果上次退出时有没答完的确认，输入 /new 换个会话再试。");
+                }
+            }
+        }
+    }
+
+    /** 一轮对话：跑一次；若暂停，问人，再带着答案跑一次；如此往复 */
+    static void converse(ReActAgent agent, RuntimeContext ctx, String input, BufferedReader in)
+            throws IOException {
+        List&lt;Msg&gt; msgs = List.of(new UserMessage(input));
+        while (true) {
+            Round round = runRound(agent, ctx, msgs);
+            System.out.println();
+            if (!round.paused()) {
+                return;
+            }
+            msgs = List.of(ask(round.asking(), in));
+        }
+    }
+
+    /** 订阅事件流：文本逐字打，工具结果打一行，顺手记下最后的消息与被挂起的工具 */
+    static Round runRound(ReActAgent agent, RuntimeContext ctx, List&lt;Msg&gt; msgs) {
+        AtomicReference&lt;Msg&gt; result = new AtomicReference&lt;&gt;();
+        AtomicReference&lt;List&lt;ToolUseBlock&gt;&gt; asking = new AtomicReference&lt;&gt;(List.of());
+
+        agent.streamEvents(msgs, ctx)
+                .doOnNext(ev -&gt; {
+                    if (ev instanceof TextBlockDeltaEvent delta) {
+                        System.out.print(delta.getDelta());
+                    } else if (ev instanceof ToolResultEndEvent tool) {
+                        System.out.printf("%n  [tool] %s -&gt; %s%n",
+                                tool.getToolCallName(), tool.getState());
+                    } else if (ev instanceof RequireUserConfirmEvent confirm) {
+                        asking.set(confirm.getToolCalls());
+                    } else if (ev instanceof AgentResultEvent done) {
+                        result.set(done.getResult());
+                    }
+                })
+                .blockLast();
+
+        Msg msg = result.get();
+        List&lt;ToolUseBlock&gt; pending = asking.get().isEmpty() ? askingOf(msg) : asking.get();
+        return new Round(msg, pending);
+    }
+
+    /** 兜底：事件流没接住时，直接从结果消息里筛 ASKING 的工具调用 */
+    static List&lt;ToolUseBlock&gt; askingOf(Msg msg) {
+        if (msg == null) {
+            return List.of();
+        }
+        return msg.getContent().stream()
+                .filter(ToolUseBlock.class::isInstance)
+                .map(ToolUseBlock.class::cast)
+                .filter(t -&gt; t.getState() == ToolCallState.ASKING)
+                .toList();
+    }
+
+    /** 把「允许 / 拒绝」包成 ConfirmResult，塞进下一条用户消息的 metadata */
+    static Msg ask(List&lt;ToolUseBlock&gt; calls, BufferedReader in) throws IOException {
+        List&lt;ConfirmResult&gt; answers = new ArrayList&lt;&gt;();
+        for (ToolUseBlock call : calls) {
+            System.out.printf("%n需要确认：%s %s%n允许吗？[y/N] ", call.getName(), call.getInput());
+            String line = in.readLine();
+            boolean ok = line != null &amp;&amp; line.trim().equalsIgnoreCase("y");
+            answers.add(ok
+                    ? new ConfirmResult(true, call)
+                    : new ConfirmResult(false, call, null, "用户拒绝，请不要重试"));
+        }
+        return UserMessage.builder()
+                .metadata(Map.of(Msg.METADATA_CONFIRM_RESULTS, answers))
+                .build();
+    }
+}</pre>
+        <p class="src-line">
+          事件流与 <code>call()</code> 共用同一个核心：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1038">ReActAgent.java:1038</span>；<code>AgentResultEvent</code> 在 <code>AgentEndEvent</code> 前发出：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1090">ReActAgent.java:1090</span>；确认 metadata 的 key：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:77">Msg.java:77</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">这段代码为什么<strong>不用</strong> <code>call()</code></span>
+          <p>
+            <code>call()</code> 也能跑通审批（08 章就是用 <code>call()</code> 写的），但它只在整轮结束后给你一个
+            <code>Msg</code>：模型吐字的过程看不到，工具执行到哪一步也不知道。命令行里这会让每次响应看起来「卡住十秒然后一次性刷屏」。
+            <code>streamEvents()</code> 把同一条生命周期拆成事件，代价是你要自己处理「流完了吗、结果在哪」——所以才需要
+            <code>AgentResultEvent</code>。
+          </p>
+        </div>
+
+        <h2 id="run">跑起来：一次真实的四轮对话</h2>
+        <p>
+          配好 key、把三个类放进 <code>src/main/java/com/example/notes/</code>，然后编译运行。这里不需要额外插件，
+          <code>exec:java</code> 会按 <code>-Dexec.mainClass</code> 找入口。
+        </p>
+        <div class="tabs">
+          <pre data-lang="bash" data-file="PowerShell" class="tab-panel" data-label="PowerShell">$env:DASHSCOPE_API_KEY = "sk-你的key"
+mvn -q compile exec:java -Dexec.mainClass=com.example.notes.Cli</pre>
+          <pre data-lang="bash" data-file="bash / zsh" class="tab-panel" data-label="bash / zsh">export DASHSCOPE_API_KEY="sk-你的key"
+mvn -q compile exec:java -Dexec.mainClass=com.example.notes.Cli</pre>
+        </div>
+        <p>下面是一段真实形状的输出（模型措辞每次不同，但事件顺序是固定的）：</p>
+        <pre data-lang="text" data-file="终端">笔记助手已就绪，状态目录：C:\Users\you\.notes-agent\state
+命令：/exit 退出    /new 换新会话（旧会话留在磁盘上）
+
+你&gt; 记一下：周五交周报，附上 Q3 数据
+  [tool] write_note -&gt; SUCCESS
+已记下这条：周五交周报，附上 Q3 数据。
+
+你&gt; 我都有哪些笔记？
+  [tool] list_notes -&gt; SUCCESS
+你现在有一条笔记：周五交周报，附上 Q3 数据。
+
+你&gt; 把笔记清空
+需要确认：delete_note {}
+允许吗？[y/N] y
+  [tool] delete_note -&gt; SUCCESS
+笔记已经清空了。
+
+你&gt; /exit</pre>
+        <p>
+          注意第三轮的两处细节：<strong>确认问题出现在工具执行之前</strong>，此时没有任何 <code>[tool]</code> 行；
+          只有在你敲了 <code>y</code> 之后，第二轮流里才出现 <code>delete_note -&gt; SUCCESS</code>。如果敲 <code>n</code>，
+          框架会把「用户拒绝，请不要重试」当成这次工具的结果喂回去，模型通常回一句「好的，那就不删了」。
+        </p>
+        <div class="callout tip">
+          <span class="ct">验证「跨进程记忆」只要做一件事</span>
+          <p>
+            把上面四轮跑完，<code>/exit</code>，重新启动，直接问「我刚才让你记了什么？」。因为 <code>sessionId</code>
+            固定是 <code>cli</code>，<code>JsonFileAgentStateStore</code> 会把上次的消息列表读回来，模型能答出「周五交周报」。
+            再把 <code>main</code> 里的 <code>sessionId("cli")</code> 改成别的值跑一次——它会立刻「失忆」。这就是
+            <code>(userId, sessionId)</code> 槽位最直观的演示。
+          </p>
+        </div>
+
+        <h2 id="line-by-line">逐行解读：四个必须想明白的接缝</h2>
+
+        <h3 id="four-events">1. 事件流里只需要认四种事件</h3>
+        <p>
+          <code>streamEvents</code> 会吐十几种事件，但一个终端 UI 只需要四种。剩下的（<code>AgentStartEvent</code>、
+          <code>ModelCallEndEvent</code>、<code>ToolCallStartEvent</code> 等）不是没用，而是这个场景不需要：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>事件</th><th>在这里干什么</th><th>不接会怎样</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>TextBlockDeltaEvent</code></td><td><code>getDelta()</code> 直接 <code>print</code>，得到打字机效果</td><td>整轮静默，最后一次性出结果（如果还接了 <code>AgentResultEvent</code>）</td></tr>
+              <tr><td><code>ToolResultEndEvent</code></td><td>打一行「工具名 -&gt; 状态」，让用户知道真的动了文件</td><td>模型说「已删除」但你无法判断它是在执行还是只在说话</td></tr>
+              <tr><td><code>RequireUserConfirmEvent</code></td><td>拿到 <code>getToolCalls()</code>，这是要问人的那批工具</td><td>不知道要确认什么；只能退而从结果消息里筛</td></tr>
+              <tr><td><code>AgentResultEvent</code></td><td><code>getResult()</code> 拿到本轮最终 <code>Msg</code>，判断 <code>PERMISSION_ASKING</code></td><td><strong>无法判断这一轮是否暂停</strong>，审批回路直接断掉</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          <code>TextBlockDeltaEvent.getDelta()</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/TextBlockDeltaEvent.java:59">TextBlockDeltaEvent.java:59</span>；<code>RequireUserConfirmEvent.getToolCalls()</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/RequireUserConfirmEvent.java:56">RequireUserConfirmEvent.java:56</span>；<code>AgentResultEvent.getResult()</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentResultEvent.java:57">AgentResultEvent.java:57</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">只监听 <code>TextBlockDeltaEvent</code> 的经典 bug</span>
+          <p>
+            很多人写流式只接增量文本，然后发现「删文件时程序没反应」。实际上 agent 已经正常返回了，只是那一轮没有文本增量
+            （模型输出的是 <code>ToolUseBlock</code>），而暂停信号藏在 <code>AgentResultEvent.getResult().getGenerateReason()</code>
+            里。判断「跑没跑完」永远看 result，不要看有没有文字。
+          </p>
+        </div>
+
+        <h3 id="permission-asking">2. <code>PERMISSION_ASKING</code> 是「这一轮的结局」，不是异常</h3>
+        <p>
+          <code>converse</code> 里那个 <code>while (true)</code> 的退出条件只有一条：<code>!round.paused()</code>。
+          换言之，「暂停」被当成一种<strong>正常的轮次结果</strong>来处理，跟「模型说完了」是同一个层级的事件。这是
+          AgentScope 的 HITL 与其他框架最大的差别：没有 future、没有回调、没有线程挂起，<code>streamEvents</code>
+          正常 <code>complete</code>，你手里拿到一条 reason 为 <code>PERMISSION_ASKING</code> 的 <code>Msg</code>。
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h4>直觉写法（会卡住）</h4>
+            <ul>
+              <li>调 <code>call()</code>，然后 <code>Thread.sleep</code> 等用户输入</li>
+              <li>在工具内部弹一个对话框，阻塞等结果</li>
+              <li>用 <code>CompletableFuture</code> 把 agent 线程挂起</li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4>框架的实际模型</h4>
+            <ul>
+              <li>第一次调用<strong>正常结束</strong>，返回「暂停」这个结果</li>
+              <li>进程可以退出、可以换机器、可以把确认请求丢给前端</li>
+              <li>回答时带着 <code>ConfirmResult</code> 再调一次，同一槽位接着跑</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          这也解释了为什么 <code>ask()</code> 里拒绝时要传一句理由：拒绝不是「取消」，而是<strong>一条工具结果</strong>。
+          模型看到「用户拒绝，请不要重试」才会换方案；只传 <code>new ConfirmResult(false, call)</code>，模型常常会再试一次同样的调用，
+          然后又被拒，来回烧 token。
+        </p>
+
+        <h3 id="confirm-original">3. <code>ConfirmResult</code> 必须拿「原件」，不能重新造一个</h3>
+        <p>
+          框架恢复挂起调用时，靠的是 <code>ToolUseBlock.getId()</code> 去匹配。所以 <code>ask()</code> 里的 <code>call</code>
+          必须是 <strong>agent 当初发出来的那个对象</strong>（或至少是 id 完全相同的副本）。下面这些写法都会失败：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>错误写法</th><th>结果</th><th>为什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>new ConfirmResult(true, ToolUseBlock.builder().name("delete_note").build())</code></td><td><code>IllegalStateException</code>：引用了非 ASKING 的调用</td><td>id 是新生成的，槽位里找不到</td></tr>
+              <tr><td>把 <code>getInput()</code> 改完再 new 一个 block</td><td>同上</td><td>要改参数就用 <code>ToolUseBlock.builder().id(原 id).name(...).input(新参数).build()</code>，id 必须原样（08 章有例子）</td></tr>
+              <tr><td>只确认一部分（一批 3 个只回 1 个）</td><td>合法：只执行确认过的，其余<strong>继续等待</strong></td><td>源码注释明确允许 subset；但下次还得处理它们</td></tr>
+              <tr><td>一条 <code>ConfirmResult</code> 都不给就再 call</td><td><code>IllegalStateException</code>，错误信息里带恢复代码</td><td>上下文里还有 ASKING，框架不替你猜</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          恢复时按 id 匹配并校验：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1960">ReActAgent.java:1960</span>；确认后转为 ALLOWED 并注册规则：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:2098">ReActAgent.java:2098</span>
+        </p>
+
+        <h3 id="memory-slot-disk">4. 「记住上次」靠的不是模型，是槽位 + 磁盘</h3>
+        <p>
+          模型本身没有记忆。第二轮能把第一轮的话接上，是因为每次 <code>call</code> 前框架都把 <strong>整个消息列表</strong>
+          从 <code>AgentState</code> 里取出来、拼进模型输入。而 <code>AgentState</code> 能不能活过进程退出，取决于
+          <code>stateStore</code>。这个案例里它的磁盘布局是：
+        </p>
+        <pre data-lang="text" data-file="磁盘布局">~/.notes-agent/state/
+└── local/                        ← userId
+    └── cli/                      ← sessionId
+        ├── agent_state.json      ← 权限上下文、已注册规则等
+        └── memory_messages.jsonl ← 一条消息一行，追加写</pre>
+        <p>
+          <code>JsonFileAgentStateStore</code> 的根目录由构造器决定，槽位两级目录就是 <code>(userId, sessionId)</code>。
+          名字里出现 <code>/</code>、中文、空格等不安全字符时，框架会做 Base64-URL 编码，所以不用担心路径炸掉。
+        </p>
+        <p class="src-line">
+          目录规则与 <code>safe(...)</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:47">JsonFileAgentStateStore.java:47</span>；默认根目录 <code>~/.agentscope/state</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:83">JsonFileAgentStateStore.java:83</span>
+        </p>
+        <div class="callout tip">
+          <span class="ct">为什么这里用绝对路径 <code>user.home</code></span>
+          <p>
+            <code>new JsonFileAgentStateStore(Path.of("state"))</code> 是相对<strong>当前工作目录</strong>的。你在 IDE 里跑、
+            在项目根跑、在别的目录跑 <code>java -jar</code>，会得到三个不同的 <code>state/</code>，看起来就像「记忆时有时无」。
+            演示项目用 <code>~/.notes-agent</code> 是为了让行为稳定；生产里更常见的是显式配置一个绝对路径或换成 Redis。
+          </p>
+        </div>
+        <div class="callout warn">
+          <span class="ct">换了 <code>sessionId</code>，新会话看不到旧消息，但<strong>权限规则也会重置</strong></span>
+          <p>
+            因为 <code>PermissionContextState</code> 也存在 <code>AgentState</code> 里，跟着槽位走。所以 <code>/new</code>
+            之后如果模型又要删笔记，会重新问你一次——这不是 bug，是隔离。同理，用 <code>ConfirmResult.rules</code>
+            临时加的「本会话免问」规则，在 <code>/new</code> 之后同样不复存在。
+          </p>
+        </div>
+
+        <h2 id="upgrade">升级路线：换 Harness、换模型、换存储</h2>
+
+        <h3 id="switch-harness">1. 换成 <code>HarnessAgent</code>：换装配类，再改三处类型声明</h3>
+        <p>
+          第 10 章说过两者是同一颗引擎，但它们的<strong>关系不是父子类</strong>：<code>HarnessAgent</code> 声明的就是
+          <code>implements Agent, AutoCloseable</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:169">HarnessAgent.java:169</span>，
+          内部持有一个 <code>ReActAgent delegate</code> 并转发配置。所以 <code>NotesTools</code> 一行不动，
+          <code>Cli</code> 则必须把三处 <code>ReActAgent</code> 类型声明改成 <code>HarnessAgent</code>：
+          <code>try</code> 资源声明，以及 <code>converse</code> / <code>runRound</code> 的形参。把案例拆成
+          <code>NotesAgent</code> + <code>Cli</code> 的价值也在这里：改动被压在三行类型上，逻辑一行没碰。
+        </p>
+        <pre data-lang="java" data-file="NotesAgent.java（Harness 版）">import io.agentscope.core.permission.PermissionBehavior;
+import io.agentscope.core.permission.PermissionContextState;
+import io.agentscope.core.permission.PermissionMode;
+import io.agentscope.core.permission.PermissionRule;
+import io.agentscope.core.state.JsonFileAgentStateStore;
+import io.agentscope.core.tool.Toolkit;
+import io.agentscope.harness.agent.HarnessAgent;
+
+import java.nio.file.Path;
+
+public final class NotesAgent {
+
+    private NotesAgent() {
+    }
+
+    public static HarnessAgent build(Path home) {
+        Toolkit toolkit = new Toolkit();
+        toolkit.registerTool(new NotesTools(home.resolve("notes")));
+
+        PermissionContextState permission = PermissionContextState.builder()
+                .mode(PermissionMode.DEFAULT)
+                .addAskRule("delete_note",
+                        new PermissionRule("delete_note", null, PermissionBehavior.ASK, "session"))
+                .build();
+
+        return HarnessAgent.builder()
+                .name("notes")
+                .sysPrompt("你是终端里的笔记助手。")
+                .model("dashscope:qwen-plus")
+                .toolkit(toolkit)
+                .permissionContext(permission)
+                .workspace(home.resolve("workspace"))   // ← 新增：文件工具的根
+                .maxIters(8)
+                .build();
+    }
+}</pre>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>改哪里</th><th>core 版</th><th>Harness 版</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>pom.xml</code></td><td><code>agentscope-core</code></td><td><code>agentscope-harness</code>（会带进 core）</td></tr>
+              <tr><td>装配类</td><td><code>io.agentscope.core.ReActAgent</code></td><td><code>io.agentscope.harness.agent.HarnessAgent</code></td></tr>
+              <tr><td><code>Cli</code> 的类型</td><td><code>ReActAgent</code> 三处</td><td><code>HarnessAgent</code> 三处：<code>try</code> 声明 + <code>converse</code> / <code>runRound</code> 形参</td></tr>
+              <tr><td>工作区</td><td>无</td><td><code>.workspace(...)</code>，文件 / Shell 工具的根目录</td></tr>
+              <tr><td>状态存储</td><td>显式 <code>JsonFileAgentStateStore</code></td><td>可省：默认就是 <code>~/.agentscope/state/&lt;agentId&gt;/</code>；写出来只是固定位置</td></tr>
+              <tr><td>工具</td><td>只有你注册的三个</td><td>再加文件、Shell、记忆、子 agent、计划模式等内置工具</td></tr>
+              <tr><td>上下文</td><td>不压缩，聊到爆为止</td><td>默认挂压缩中间件（<code>CompactionConfig</code> 可调）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="ct">为什么不能图省事把类型声明成 <code>Agent</code></span>
+          <p>
+            因为 <code>streamEvents(...)</code> <strong>不在 <code>Agent</code> 接口上</strong>。
+            <code>Agent</code> 只继承 <code>CallableAgent</code>、<code>StreamableAgent</code>、<code>ObservableAgent</code>
+            <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/Agent.java:47">Agent.java:47</span>，
+            其中 <code>StreamableAgent</code> 只有已废弃的 <code>stream(...)</code>；<code>streamEvents</code> 是
+            <code>ReActAgent</code> 与 <code>HarnessAgent</code> 各自声明的 public 方法。所以写成 <code>Agent agent = ...</code>
+            之后只剩 <code>call(...)</code> 可用，本案例的流式打印与暂停判定会一起丢掉。
+          </p>
+        </div>
+        <div class="callout warn">
+          <span class="ct">迁移后第一件事：打印一遍工具名</span>
+          <p>
+            规则表是按<strong>工具名</strong>匹配的。你的 <code>delete_note</code> 规则还在，但 Harness 额外挂的内置工具
+            不在规则里，它们会不会问你，取决于各自的权限自检与当前模式。调试时先跑
+            <code>toolkit.getToolNames()</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:281">Toolkit.java:281</span>
+            把实际注册的名字打出来，再决定要不要给「删文件」这类内置工具也加 <code>ASK</code> 规则。
+          </p>
+        </div>
+
+        <h3 id="switch-model">2. 换模型：改一个字符串，但要记得换依赖</h3>
+        <p>
+          <code>.model("dashscope:qwen-plus")</code> 里的值由 <code>ModelRegistry</code> 解析，前缀决定用哪个 provider。
+          换成 <code>"openai:gpt-5.5"</code> 时，如果 <code>pom.xml</code> 里没有
+          <code>agentscope-extensions-model-openai</code>，运行时会在构建阶段就报「无法解析模型」——不会静默降级。
+          模型 id 本身不带参数；温度、topP、最大 token 这些走 <code>generateOptions(...)</code>（第 05 章）。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想换的</th><th>改哪里</th><th>别忘了</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>同一家的另一个模型</td><td>只改 <code>.model("dashscope:qwen-max")</code></td><td>无</td></tr>
+              <tr><td>另一家厂商</td><td>改字符串 + 换扩展依赖</td><td>新厂商的 API key 环境变量</td></tr>
+              <tr><td>同一个 agent 两套模型</td><td><code>fallbackModel(...)</code> 或 <code>onModelCall</code> 中间件</td><td>两套 key 都要在</td></tr>
+              <tr><td>模型参数</td><td><code>generateOptions(...)</code></td><td>不同 provider 支持的字段不一样</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="switch-store">3. 换存储：只改 <code>NotesAgent</code> 里那一行</h3>
+        <p>
+          状态存储是构造器注入的接口，<code>Cli</code> 完全感知不到。单机演示用
+          <code>JsonFileAgentStateStore</code>；多副本部署换成 Redis 或 MySQL（都在
+          <code>agentscope-extensions</code> 下），构造器参数不同，但用法一样：
+        </p>
+        <pre data-lang="java" data-file="换存储（示意）">// 现在的写法
+.stateStore(new JsonFileAgentStateStore(home.resolve("state")))
+
+// 换成 Redis（需引 agentscope-extensions-redis；builder 里四选一：jedis / lettuce / 集群 / redisson）
+.stateStore(RedisAgentStateStore.builder().jedisClient(unifiedJedis).build())
+
+// 换成 MySQL（需引 agentscope-extensions-mysql）
+.stateStore(new MysqlAgentStateStore(dataSource))</pre>
+        <p>
+          换之前先确认一件事：你需要的是「重启还在」还是「多副本共享」。前者文件就够；后者必须用支持
+          版本化 / CAS 的后端，否则两个副本同时写同一个会话会互相覆盖（07 章讲过
+          <code>saveIfVersion</code> 的三种语义）。
+        </p>
+        <div class="callout tip">
+          <span class="ct">一句话记住这个案例的分层</span>
+          <p>
+            <strong>工具</strong>只管读写文件，不知道有 agent；<strong>装配</strong>只管把权限、状态、模型拼起来，不知道有终端；
+            <strong>终端</strong>只管事件与输入输出，不知道工具长什么样。所以换 Harness 只动装配类加三行类型声明，
+            换存储只动一行，加工具只动工具类。
+          </p>
+        </div>
+
+        <h2 id="cheatsheet">速查</h2>
+        <h3 id="event-quick">1. 事件速查</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>事件</th><th>什么时候发</th><th>常用 getter</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>AgentStartEvent</code></td><td>一次调用开始时，最先</td><td><code>getReplyId()</code>、<code>getName()</code></td></tr>
+              <tr><td><code>TextBlockDeltaEvent</code></td><td>模型每吐一段文本</td><td><code>getDelta()</code>、<code>getBlockId()</code></td></tr>
+              <tr><td><code>ToolResultEndEvent</code></td><td>一个工具执行完</td><td><code>getToolCallName()</code>、<code>getState()</code></td></tr>
+              <tr><td><code>RequireUserConfirmEvent</code></td><td>权限判定为 ASK，准备暂停</td><td><code>getToolCalls()</code>、<code>getReplyId()</code></td></tr>
+              <tr><td><code>AgentResultEvent</code></td><td>生命周期正常结束（含暂停），在 End 前</td><td><code>getResult()</code></td></tr>
+              <tr><td><code>AgentEndEvent</code></td><td><code>doFinally</code> 里必发，最后</td><td><code>getReplyId()</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          六个事件类：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentEndEvent.java:24">AgentEndEvent.java:24</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentStartEvent.java:24">AgentStartEvent.java:24</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/ToolResultEndEvent.java:23">ToolResultEndEvent.java:23</span>
+        </p>
+
+        <h3 id="want-table">2. 「我想…」对照表</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想要</th><th>写在哪</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>打字机效果</td><td><code>TextBlockDeltaEvent.getDelta()</code> 直接 <code>print</code>，别加换行</td></tr>
+              <tr><td>看工具真的执行了</td><td><code>ToolResultEndEvent</code>，看 <code>getState()</code> 是否 <code>SUCCESS</code></td></tr>
+              <tr><td>删除前问一句</td><td><code>PermissionContextState.addAskRule(工具名, rule)</code></td></tr>
+              <tr><td>把确认做成卡片</td><td><code>RequireUserConfirmEvent.getToolCalls()</code> 渲染，回传 <code>ConfirmResult</code></td></tr>
+              <tr><td>重启后还记得</td><td><code>stateStore(...)</code> + 固定 <code>(userId, sessionId)</code></td></tr>
+              <tr><td>换会话</td><td>新建 <code>RuntimeContext</code>，换 <code>sessionId</code>，其余不变</td></tr>
+              <tr><td>无人值守</td><td><code>PermissionMode.DONT_ASK</code>，把 ASK 降级成 DENY</td></tr>
+              <tr><td>只读分析</td><td><code>PermissionMode.EXPLORE</code> + 工具标 <code>readOnly = true</code></td></tr>
+              <tr><td>识别触顶</td><td><code>msg.getGenerateReason() == GenerateReason.MAX_ITERATIONS</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="source-locations">3. 这个案例的源码位置</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想确认的事</th><th>去哪看</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>工具怎么被扫描成 schema</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/Toolkit.java:159">Toolkit.java:159</span></td></tr>
+              <tr><td>ASK 规则怎么进权限引擎</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/permission/PermissionContextState.java:233">PermissionContextState.java:233</span></td></tr>
+              <tr><td>恢复时怎么匹配确认结果</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1960">ReActAgent.java:1960</span></td></tr>
+              <tr><td>流式与 call 共用的核心</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:1038">ReActAgent.java:1038</span></td></tr>
+              <tr><td>状态怎么落盘</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:102">JsonFileAgentStateStore.java:102</span></td></tr>
+              <tr><td>官方 HITL 可编译示例</td><td><span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/hitl/PermissionHITLExample.java:159">PermissionHITLExample.java:159</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. 只接了 <code>TextBlockDeltaEvent</code>，没有接 <code>AgentResultEvent</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>输入「把笔记清空」，模型回一句「好的」，程序直接回到提示符，磁盘上的 <code>notes.txt</code> 还在。</dd>
+            <dt>因为</dt>
+            <dd>那一轮模型输出的是 <code>ToolUseBlock</code> 而不是文本，所以 delta 流里几乎没有东西；暂停信号在
+            <code>AgentResultEvent.getResult().getGenerateReason()</code> 里，你没接就丢了。</dd>
+            <dt>改成</dt>
+            <dd>把 <code>AgentResultEvent</code> 当成唯一的「本轮结束」信号；<code>TextBlockDeltaEvent</code> 只负责显示。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 用 <code>call()</code> 却期待打字机效果</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>终端安静十几秒，然后整段回答一次性刷出来；工具执行也只有一个总结果。</dd>
+            <dt>因为</dt>
+            <dd><code>call()</code> 内部确实跑的是同一条 <code>buildAgentStream</code>，但它只把最终 <code>Msg</code> 交给你，
+            中间事件全部被消费掉了。</dd>
+            <dt>改成</dt>
+            <dd>要增量就用 <code>streamEvents</code>；只要最终结果、不在乎过程，就继续用 <code>call</code>。两者共用生命周期，
+            <code>onAgent</code> 中间件不会因为换方法而跑两遍。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. <code>ConfirmResult</code> 里放了一个新造的 <code>ToolUseBlock</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>IllegalStateException</code>，信息里说引用了非 <code>ASKING</code> 的调用，还列出当前挂起的 id。</dd>
+            <dt>因为</dt>
+            <dd>恢复靠 <code>getId()</code> 匹配。新造的 block 即使工具名、参数都一样，id 也不同。</dd>
+            <dt>改成</dt>
+            <dd>只从 <code>RequireUserConfirmEvent.getToolCalls()</code> 或结果消息里筛 <code>ASKING</code> 的原件；
+            要改参数就重建但保留原 id（<code>ToolUseBlock.builder().id(原 id)...</code>）。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 拒绝时不写理由</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>模型被拒后不死心，换个说法再调一次 <code>delete_note</code>，又被拒，来回好几轮。</dd>
+            <dt>因为</dt>
+            <dd>不传 <code>reason</code> 时，模型只看到默认文案「Permission denied by user」，它不知道你是「误操作」还是「永久禁止」。
+            提示词里又没写「别重试」。</dd>
+            <dt>改成</dt>
+            <dd>拒绝时传一句明确指令：<code>new ConfirmResult(false, call, null, "用户拒绝，请不要重试")</code>。
+            想永久免问就带上 <code>ALLOW</code> 规则（见练习 2）。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. 上次暂停没答完就退出，重启后直接问新问题</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>第一句话就抛 <code>IllegalStateException</code>，说还有待确认的工具调用，并贴出一段恢复代码。</dd>
+            <dt>因为</dt>
+            <dd><code>sessionId</code> 还是 <code>cli</code>，槽位里存着上次的 <code>ASKING</code>。框架不允许在悬挂状态下
+            开启新话题，否则上下文会错乱。</dd>
+            <dt>改成</dt>
+            <dd>三个选项：把上次的 <code>ConfirmResult</code> 补上；用 <code>/new</code> 换会话；或者启动时用时间戳当
+            <code>sessionId</code>（代价是丢掉跨重启记忆）。<code>Cli</code> 里那个 <code>catch</code> 就是给这个场景兜底的。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">6. <code>stateStore</code> 用了相对路径</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>有时重启能记住、有时失忆；项目目录里冒出一个 <code>state/</code>，用户目录里又有一个。</dd>
+            <dt>因为</dt>
+            <dd><code>Path.of("state")</code> 相对的是<strong>进程工作目录</strong>。IDE、项目根、<code>java -jar</code>
+            三处运行就有三个不同的库。</dd>
+            <dt>改成</dt>
+            <dd>用绝对路径（这个案例用 <code>user.home</code>），或者从配置文件读一个固定目录；多副本部署换 Redis / MySQL。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>为什么不直接看「有没有收到 <code>RequireUserConfirmEvent</code>」来判断暂停？</summary>
+          <p>
+            因为事件只是给 UI 的提示，不是状态本身。中间件可能把它过滤掉（09 章的坑）；<code>DONT_ASK</code> 模式下
+            本该 ASK 的调用会被降级成 DENY，也不会发这个事件。唯一权威的判据是
+            <code>AgentResultEvent.getResult().getGenerateReason()</code>。事件用来「拿要确认的工具」，reason 用来「决定要不要问」。
+          </p>
+        </details>
+        <details>
+          <summary>第二次调用时换一个新的 <code>sessionId</code>，会发生什么？</summary>
+          <p>
+            新槽位里没有那条 <code>ASKING</code> 记录，<code>ConfirmResult</code> 里的工具 id 匹配不上，直接抛
+            <code>IllegalStateException</code>。而且就算不抛，模型也看不到上一轮的对话，会把你当成新用户。
+            恢复必须用<strong>同一个</strong> <code>RuntimeContext</code>。
+          </p>
+        </details>
+        <details>
+          <summary>把 <code>runRound</code> 换成 <code>agent.call(msgs, ctx).block()</code>，代码还能跑吗？要改什么？</summary>
+          <p>
+            能跑：返回的 <code>Msg</code> 同样带 <code>PERMISSION_ASKING</code>，<code>paused()</code> 逻辑不变。
+            要改两处：拿不到 <code>TextBlockDeltaEvent</code> / <code>ToolResultEndEvent</code>，流式展示退化成一次性输出；
+            <code>asking</code> 只能从 <code>msg.getContent()</code> 里筛（也就是 <code>askingOf</code> 那条兜底路径变成唯一路径）。
+          </p>
+        </details>
+
+        <h2 id="exercise">30 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">加一个只读工具，验证它不会被问</span>
+            <div>
+              写 <code>search_notes(keyword)</code>，标上 <code>@Tool(..., readOnly = true)</code>，在 <code>NotesTools</code>
+              里用 <code>Files.readAllLines</code> 过滤包含关键字的行。先确认 DEFAULT 模式下它直接执行；再把
+              <code>NotesAgent</code> 里的模式改成 <code>PermissionMode.EXPLORE</code>，观察两件事：它仍然能跑，而
+              <code>delete_note</code> 不再是 ASK，而是<strong>直接被拒</strong>（EXPLORE 对非只读工具先 DENY）。
+            </div>
+          </li>
+          <li>
+            <span class="sh">做一次「本会话内免问」</span>
+            <div>
+              在 <code>ask()</code> 里，用户输入 <code>a</code>（always）时构造
+              <code>new ConfirmResult(true, call, List.of(new PermissionRule(call.getName(), null, PermissionBehavior.ALLOW, "session")))</code>。
+              同一个 session 里再让它删一次，应该不再问；输入 <code>/new</code> 之后再删，又恢复了询问——验证规则存在槽位里。
+            </div>
+          </li>
+          <li>
+            <span class="sh">加启动参数，一次看三种模式</span>
+            <div>
+              给 <code>main</code> 加一个 <code>--mode</code> 参数，把 <code>NotesAgent.build(home, mode)</code> 的
+              <code>PermissionMode</code> 变成可配。分别跑 <code>DEFAULT</code> / <code>BYPASS</code> /
+              <code>DONT_ASK</code>，对同一句「把笔记清空」观察三种结局：问 / 直接删 / 直接被拒——尤其是
+              <code>DONT_ASK</code>，它把 ASK 降级成 DENY，不是「不问就放行」。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">完成这一章之后</h2>
+        <p>
+          到这里，SDK 地基的 11 章走完了。你现在应该能独立回答三个问题：一次 <code>call</code> 到底走了哪些阶段；
+          一个需要暂停的能力该怎么接；把 demo 变成生产前缺哪几块。这个笔记 Agent 只有一百多行，但它用的接缝与官方
+          coding agent 是同一批——剩下的差距在工程能力，不在 API。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接下来想做什么</th><th>从哪开始</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>把术语、报错、API 一次查完</td><td><a href="../appendix/glossary.html">附录 A 术语表</a>、<a href="../appendix/errors.html">附录 B 报错手册</a>、<a href="../appendix/api-cheatsheet.html">附录 C API 速查</a></td></tr>
+              <tr><td>搞清楚一个需求该看哪个包</td><td><a href="../appendix/source-map.html">附录 D 源码地图</a></td></tr>
+              <tr><td>要工作区、技能、子 agent、上下文压缩</td><td><a href="12-workspace-filesystem.html">第 12–17 章</a>逐章展开：工作区与文件系统、沙箱、子 agent 与团队、压缩与记忆、技能、计划模式与 MCP</td></tr>
+              <tr><td>要接真实渠道 / 多用户服务</td><td><a href="18-gateway-channel-bus.html">第 18 章</a>（Gateway、渠道路由、会话串行、消息总线与异步工具）；更上层的 <code>agentscope-service</code> 本站不收录</td></tr>
+              <tr><td>要接前端协议</td><td><code>agentscope-extensions-protocol</code>（AG-UI / A2A / Agent Protocol）</td></tr>
+              <tr><td>要把状态放进 Redis / MySQL</td><td>第 07 章的存储取舍表 + <code>agentscope-extensions-*</code> 下对应模块</td></tr>
+              <tr><td>要观测每次调用的耗时与 token</td><td>第 09 章：<code>onAgent</code> / <code>onModelCall</code>，或直接用 <code>OtelTracingMiddleware</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">最后一句：先跑通，再抽象</span>
+          <p>
+            这个项目的四个文件不是「唯一正确分层」，但它刻意把<strong>工具、装配、交互</strong>分开，让你能单独替换其中一层。
+            真实项目往往在它上面加三样东西：一个配置层（模型 / 路径 / 开关）、一套日志与追踪、一组集成测试。
+            先把这一百多行跑通，再往上加，比一开始就设计一个「通用 Agent 平台」快得多。
+          </p>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

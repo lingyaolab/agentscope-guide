@@ -1,0 +1,1228 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 23 章拆 Hosted Agent 的三层结构：控制面、Runtime Host 与 provider。内容包括 CLI 安装与连接、五类 provider 的能力差异、Host / Profile / Agent 三层配置、claim 派发与租约、工作目录与定义投影、工具审批、恢复与排障。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="23 Hosted Agent 与 Runtime Host · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 23 章拆 Hosted Agent 的三层结构：控制面、Runtime Host 与 provider。内容包括 CLI 安装与连接、五类 provider 的能力差异、Host / Profile / Agent 三层配置、claim 派发与租约、工作目录与定义投影、工具审批、恢复与排障。" />
+    <title>23 Hosted Agent 与 Runtime Host · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="23-hosted-agent" data-root="..">
+    <main>
+      <article class="article">
+        <h1>23 · Hosted Agent 与 Runtime Host</h1>
+        <p class="lede">
+          第 22 章把<strong>一个应用</strong>注册进目录；这一章把<strong>一台已经装好 Coding Agent 的机器</strong>接进来。
+          Hosted 既不运行你的 Agent 代码，也不替你管理模型账号——它把「工作派发」做成一个 Host 主动 claim 的循环：
+          控制面记录工作与调度，Runtime Host 在你的电脑或服务器上启动 provider，provider 用你本机已登录的账号执行。
+          难点不在 <code>connect</code> 那一行，而在分清 <strong>Host 在线、provider 可探测、Agent 可派发</strong>是三个不同的检查点。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 Managed、External、Hosted 三者分别「谁在运行 Agent」，以及 Hosted 为什么是拉取而不是推送</li>
+          <li>安装三个 CLI 可执行文件，用交互登录、enrollment token 或已有 Host 凭据完成连接</li>
+          <li>解释 Host / Runtime Profile / Agent 三层配置各自负责什么，模型覆盖按什么顺序生效</li>
+          <li>对照五类 provider 的能力矩阵，判断指令、技能、MCP、工具策略、子 Agent 与会话恢复是否可用</li>
+          <li>读懂 claim 的准入条件、容量与租约，定位「Host 在线但任务不来」到底卡在哪一项</li>
+          <li>按「目录 → claim → 工作目录 → provider → 审批 / 恢复」的顺序做验收与排障</li>
+        </ul>
+
+        <h2 id="why">边界：Service 安排工作，主机执行工作</h2>
+        <p>
+          Hosted 的定义可以压成一句：Service 负责工作、调度和协作记录；Runtime Host 在本机启动 provider 并回传结果；
+          模型、工具和 provider 账号由你管理<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent.md:10"
+            >hosted-agent.md:10</span
+          >。所以 Hosted 的重点不是「Agent 定义存在哪」，而是「执行进程运行在哪台机器、用谁的账号登录」。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方式</th><th>谁运行 Agent</th><th>工作怎么到达</th><th>你主要维护什么</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Managed</strong></td>
+                <td>Service 的 Harness 与 Dataplane</td>
+                <td>控制面内部调度</td>
+                <td>定义、Instructions、绑定的资源</td>
+              </tr>
+              <tr>
+                <td><strong>External</strong></td>
+                <td>你自己的应用进程</td>
+                <td>注册 + 会话合约；任务能力另走 ASDP</td>
+                <td>进程、框架、模型与工具凭据、任务实现</td>
+              </tr>
+              <tr>
+                <td><strong>Hosted</strong></td>
+                <td>本机 Coding Agent provider</td>
+                <td>Host 主动 claim <code>ExecutionAttempt</code></td>
+                <td>主机在线、provider 登录、Profile / Pool / 容量</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          这三条路径共享工作入口，但执行责任不同。官方特别提醒：Host 在线不等于 provider 已登录，也不等于所有工具权限都可用<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent.md:31"
+            >hosted-agent.md:31</span
+          >。排查时先问「缺的是哪一层」，不要把所有失败都归因成「Agent 没创建好」。
+        </p>
+        <div class="callout tip">
+          <span class="ct">一句话边界</span>
+          <p>
+            Managed 把 Agent 交给 Service 跑；External 把身份和会话交给 Service，进程仍归你；Hosted 把<strong>一台已登录 provider 的主机</strong>交给 Service 调度。
+            Runtime Host 不是托管 Agent 的 Hands Worker，它管理的是 provider 进程与任务工作目录<span
+              class="src"
+              data-src="docs/v2/zh/service/runtime-host.md:53"
+              >runtime-host.md:53</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="topology">三层结构：控制面、Host 守护进程、provider</h2>
+        <p>把 Hosted 拆开看，稳定只有三层，故障也基本落在这三层里：</p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">控制面：记录与调度</span>
+            <div class="ld">
+              Agent 目录、Runtime Profile / Pool、<code>ExecutionAttempt</code>、租约、工具审批、Issue / Team 记录。
+              它决定「这活该给哪个池、哪个 Host、哪个 provider」，但不执行模型循环<span
+                class="src"
+                data-src="docs/v2/zh/service/hosted-agent-execution.md:10"
+                >hosted-agent-execution.md:10</span
+              >。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">Runtime Host：领取、准备、拉起、回传</span>
+            <div class="ld">
+              注册稳定身份与能力，按容量 claim 工作，准备任务目录，把可移植定义投影成 provider 能读的格式，
+              启动 provider 子进程，上报事件、checkpoint 和最终状态<span
+                class="src"
+                data-src="docs/v2/zh/service/hosted-agent-execution.md:12-19"
+                >hosted-agent-execution.md:12-19</span
+              >。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">Provider：真正跑模型与工具</span>
+            <div class="ld">
+              Codex、Claude Code、Qoder、QwenPaw、OpenClaw 等本机 CLI。模型、登录态、工具权限都在这一层；
+              适配器只负责把平台事件翻译成 provider 的原生协议<span
+                class="src"
+                data-src="docs/v2/zh/service/hosted-agent-providers.md:10"
+                >hosted-agent-providers.md:10</span
+              >。
+            </div>
+          </div>
+        </div>
+        <p>
+          和 External 最大的结构差别是<strong>方向</strong>：External 的 <code>ExecutionAttempt</code> 由控制面通过 ASDP 长连接推给应用；
+          Hosted 的 Host 则按 <code>poll-interval</code> 主动 POST 到 claim 端点，拿到一条 Attempt 后才开始执行<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/engine.go:109-128"
+            >engine.go:109-128</span
+          >。因此控制面不需要回连 Host 守护进程；它只需要 Host 能出站访问 Service。
+        </p>
+        <p>
+          claim 的响应不是一个空壳：它同时带回冻结的 Runtime Profile、Agent 定义、任务上下文，以及 attempt token 与 task token<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/client.go:169-193"
+            >client.go:169-193</span
+          >。Host 不需要在派发时再拼一次配置；它执行的是控制面在入队时冻结的那份快照。
+        </p>
+        <p>
+          执行者与平台协作也走两层：MCP 可用的 provider 优先用 <code>agentscope-collaboration</code>；
+          只能跑 Shell 的 provider 用任务范围 CLI 读写 Issue、发进度、上传 Artifact<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/runtime-host-cli.md:80-98"
+            >runtime-host-cli.md:80-98</span
+          >。这两条通道都需要任务范围凭据，而不是主机凭据。
+        </p>
+
+        <h2 id="install">安装：三个可执行文件，provider 不算在内</h2>
+        <p>
+          从同一 Service Release 下载对应操作系统与 CPU 架构的 <code>agentscope-cli-VERSION-OS-ARCH.tar.gz</code>，
+          包里有 <code>agentscope</code>、别名 <code>aistioctl</code> 和 <code>aistio-runtime-host</code>。
+          三个文件必须放在同一个 PATH 目录中<span
+            class="src"
+            data-src="docs/v2/zh/service/runtime-host.md:14"
+            >runtime-host.md:14</span
+          >。provider 本体需要另行安装、登录并确认可运行<span
+            class="src"
+            data-src="docs/v2/zh/service/runtime-host.md:16"
+            >runtime-host.md:16</span
+          >。
+        </p>
+        <pre data-lang="bash" data-file="解压到 PATH：三个文件放在同一目录">mkdir -p agentscope-cli "$HOME/.local/bin"
+tar -xzf agentscope-cli-VERSION-OS-ARCH.tar.gz -C agentscope-cli
+install -m 0755 agentscope-cli/agentscope agentscope-cli/aistioctl \
+  agentscope-cli/aistio-runtime-host "$HOME/.local/bin/"
+export PATH="$HOME/.local/bin:$PATH"</pre>
+        <p>
+          包名按 <code>linux</code>/<code>darwin</code> 与 <code>amd64</code>/<code>arm64</code> 组合；
+          不确定平台时先用 <code>uname -sm</code> 看<span
+            class="src"
+            data-src="docs/v2/zh/service/runtime-host.md:20-27"
+            >runtime-host.md:20-27</span
+          >。如果是从源码构建，仓库里也提供了 <code>make install-runtime-cli PREFIX=...</code> 的入口<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/runtime-host-cli.md:6-13"
+            >runtime-host-cli.md:6-13</span
+          >。
+        </p>
+        <p>
+          升级时先检查活跃任务，再替换配套二进制并重新启动；<code>config.json</code>、<code>state/host.id</code> 与
+          <code>workspaces/</code> 这些持久状态要保留<span
+            class="src"
+            data-src="docs/v2/zh/service/runtime-host.md:77"
+            >runtime-host.md:77</span
+          >。把它们删掉不会「清理环境」，只会让这台机器换一个身份。
+        </p>
+
+        <h2 id="connect">连接：先登录 provider，再让 Host 拿到身份</h2>
+        <p>
+          正确顺序是先在目标主机安装并登录 provider，用本机完成一个简单请求，确认模型与授权可用；
+          再连接 Runtime Host<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent.md:23"
+            >hosted-agent.md:23</span
+          >。连接成功后，<code>status</code> 看守护进程，<code>probe</code> 看 provider 探测：
+        </p>
+        <pre data-lang="bash" data-file="连接与日常检查">agentscope connect https://agentscope.example.com
+agentscope runtime status
+agentscope runtime probe</pre>
+        <p>
+          不传 URL 时，CLI 会依次探测 <code>http://127.0.0.1:18080</code>、<code>:8080</code>、<code>:8081</code> 的
+          <code>/healthz</code>，每个候选 800ms；都探不到就要求显式传入 Service 地址<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/connect.go:208-229"
+            >connect.go:208-229</span
+          >。这对本地 Compose 很方便，也意味着「连不上」时先确认地址，而不是先怀疑 token。
+        </p>
+        <p>身份有四种来源，选一种即可，不能把两种凭据混着传：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方式</th><th>你提供什么</th><th>换取什么</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>交互登录</td>
+                <td>控制台用户名与密码，走 <code>/api/auth/login</code></td>
+                <td>平台 token，再换成本机范围的 <code>asrh_</code> 凭据<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/connect.go:241-299">connect.go:241-299</span></td>
+              </tr>
+              <tr>
+                <td>Enrollment token</td>
+                <td>操作者生成的短期 <code>asre_</code> token，放进 <code>AGENTSCOPE_ENROLLMENT_TOKEN</code></td>
+                <td>绑定本机 host key 与 token 范围的 <code>asrh_</code> 凭据<span class="src" data-src="agentscope-service/docs/controlplane/service-v5-api-contract.md:86-92">service-v5-api-contract.md:86-92</span></td>
+              </tr>
+              <tr>
+                <td>已有 Host 凭据</td>
+                <td><code>AGENTSCOPE_RUNTIME_TOKEN</code> 或 <code>--token</code></td>
+                <td>校验证书里的 host key / tenant / namespace 后直接复用<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/connect.go:119-131">connect.go:119-131</span></td>
+              </tr>
+              <tr>
+                <td>平台 token</td>
+                <td><code>AGENTSCOPE_API_TOKEN</code></td>
+                <td>调用认证过的 Host enrollment 接口换 <code>asrh_</code><span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/connect.go:144-166">connect.go:144-166</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          enrollment token 是给无人值守服务器用的：操作者先执行 <code>agentscope runtime enrollment-token create</code>，
+          在目标主机设置环境变量后再 connect；服务端只接受 <code>asre_</code> bearer 加本地 <code>hostKey</code>，
+          换出绑定三者的 <code>asrh_</code> 凭据<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/service-v5-api-contract.md:88-91"
+            >service-v5-api-contract.md:88-91</span
+          >。不要把 enrollment token 或 <code>config.json</code> 放进共享脚本<span
+            class="src"
+            data-src="docs/v2/zh/service/runtime-host.md:63"
+            >runtime-host.md:63</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">重复 connect 不是「只加一个参数」</span>
+          <p>
+            命令会先读已有配置，只覆盖显式传入的 URL、provider、pool、capacity、workspace 与 state 根目录；
+            如果旧守护进程在跑，它会先停掉旧进程，再保存配置并启动新进程<span
+              class="src"
+              data-src="agentscope-service/aistio/cmd/aistioctl/connect.go:55-60"
+              >connect.go:55-60</span
+            >。所以「补一个 <code>--capacity</code>」会顺带重启 Host，正在执行的任务要提前检查。
+          </p>
+        </div>
+        <p>
+          非前台启动会等 <code>state/daemon.ready</code>，最长 15 秒；超时会停掉子进程并回显最后几行日志<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:241"
+            >local_runtime_process.go:241</span
+          >。看到这个超时，先看日志里是注册失败、provider 探测失败，还是控制面不可达，不要反复 connect 刷屏。
+        </p>
+
+        <h2 id="config">配置：Host、Profile、Agent 三层，不要混着改</h2>
+        <p>
+          Hosted 有三层配置：Host 的连接与容量、Runtime Profile 的 provider 参数、Agent 的职责与模型覆盖<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-configuration.md:10"
+            >hosted-agent-configuration.md:10</span
+          >。排障时先确认改的是哪一层，否则很容易「在 Agent 里改了模型，却以为是主机容量问题」。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>层</th><th>谁维护</th><th>关键字段</th><th>典型问题</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Host</strong></td>
+                <td>运维 / 主机所有者</td>
+                <td><code>pool</code>、<code>capacity</code>、<code>providers</code>、两个根目录</td>
+                <td>池名不匹配、容量满、provider 未发现</td>
+              </tr>
+              <tr>
+                <td><strong>Runtime Profile</strong></td>
+                <td>管理员</td>
+                <td><code>provider</code>、<code>configuration</code>、<code>requirements</code></td>
+                <td>沙箱 / 权限参数不适配，requirements 与主机能力不符</td>
+              </tr>
+              <tr>
+                <td><strong>Agent</strong></td>
+                <td>Agent 作者</td>
+                <td>Instructions、<code>model</code>、Workspace、skills / subagents、执行覆盖</td>
+                <td>模型覆盖写错、请求了 provider 不支持的能力</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p><code>connect</code> 侧的常用参数与默认值如下：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>参数 / 环境变量</th><th>含义</th><th>默认值</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>URL 或 <code>--server</code></td><td>Host 可访问的 Service HTTP 地址</td><td>不传则探测本机 18080 / 8080 / 8081<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/connect.go:213-228">connect.go:213-228</span></td></tr>
+              <tr><td><code>--providers</code></td><td><code>auto</code> 或逗号分隔的 provider 列表</td><td><code>auto</code><span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/connect.go:197">connect.go:197</span></td></tr>
+              <tr><td><code>--pool</code></td><td>Runtime Pool 名称</td><td><code>coding-default</code><span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_config.go:62-72">local_runtime_config.go:62-72</span></td></tr>
+              <tr><td><code>--capacity</code></td><td>Host 最大并发执行数</td><td>1，只接受大于 0 的值<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/connect.go:200">connect.go:200</span></td></tr>
+              <tr><td><code>--workspace-root</code></td><td>任务目录根路径</td><td><code>~/.agentscope/runtime-host/workspaces</code><span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_config.go:70">local_runtime_config.go:70</span></td></tr>
+              <tr><td><code>--state-root</code></td><td>Host 身份与持久执行状态</td><td><code>~/.agentscope/runtime-host/state</code><span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_config.go:71">local_runtime_config.go:71</span></td></tr>
+              <tr><td><code>--runtime-host-binary</code></td><td><code>aistio-runtime-host</code> 路径</td><td>先找配置，再找同目录 / PATH<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:284-293">local_runtime_process.go:284-293</span></td></tr>
+              <tr><td><code>AGENTSCOPE_RUNTIME_CONFIG</code></td><td>覆盖本地配置文件路径</td><td><code>~/.agentscope/runtime-host/config.json</code><span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_config.go:51-59">local_runtime_config.go:51-59</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          配置文件本身是 owner-only：目录 0700，<code>config.json</code> 以 0600 临时文件写完再原子替换<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_config.go:99-131"
+            >local_runtime_config.go:99-131</span
+          >。默认字段包括 <code>version</code>、<code>controlPlane</code>、<code>credential</code>、
+          <code>tenant</code>、<code>namespace</code>、<code>pool</code>、<code>capacity</code>、
+          <code>workspaceRoot</code>、<code>stateRoot</code>、<code>providers</code>，源码还保留了
+          <code>runtimeHostBinary</code> 与配置版本号<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_config.go:37-49"
+            >local_runtime_config.go:37-49</span
+          >。
+        </p>
+        <div class="callout">
+          <span class="ct">模型覆盖的顺序</span>
+          <p>
+            Agent 的 <code>model</code> 非空时优先于 Profile 的 <code>model</code>；两者都为空时使用 provider 自己的默认配置<span
+              class="src"
+              data-src="docs/v2/zh/service/hosted-agent-configuration.md:41"
+              >hosted-agent-configuration.md:41</span
+            >。源码里的 <code>DefinitionModel(request, fallback)</code> 也是这个顺序：先看 Agent 定义，再退回 Profile 配置<span
+              class="src"
+              data-src="agentscope-service/aistio/internal/runtimehost/provider/provider.go:169-174"
+              >provider.go:169-174</span
+            >。
+          </p>
+        </div>
+        <p>
+          Agent 绑定还可以带执行覆盖：<code>reasoningEffort</code>、<code>serviceTier</code>、
+          <code>providerConfiguration</code> 与 <code>customArgs</code>。这些值在派发时解析并冻结到本次 Attempt，
+          不会修改共享的 Runtime Profile<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/controlplane/model/agent_catalog.go:94-134"
+            >agent_catalog.go:94-134</span
+          >。自定义参数最多 64 条，单条最长 1024 字符，并按 argv token 传递，不经过 Shell<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/provider.go:130-146"
+            >provider.go:130-146</span
+          >；工作目录、模型、沙箱、协议、resume、MCP 与权限相关的保留参数不能覆盖<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-configuration.md:63"
+            >hosted-agent-configuration.md:63</span
+          >。
+        </p>
+
+        <h2 id="providers">五类 provider：先看能力，再看模型名</h2>
+        <p>
+          当前 Runtime Host 包含五类适配器；<code>runtime probe</code> 只验证可执行文件可探测，实际工作还需要 provider 登录、模型与工具可用<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-providers.md:10"
+            >hosted-agent-providers.md:10</span
+          >。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>控制台名称</th><th><code>--providers</code></th><th>默认可执行文件</th><th>执行方式</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Codex</td><td><code>codex</code></td><td><code>codex</code></td><td>app-server 线程与事件<span class="src" data-src="docs/v2/zh/service/hosted-agent-providers.md:16">hosted-agent-providers.md:16</span></td></tr>
+              <tr><td>Claude Code</td><td><code>claude-code</code></td><td><code>claude</code></td><td>CLI 流式 JSON<span class="src" data-src="docs/v2/zh/service/hosted-agent-providers.md:17">hosted-agent-providers.md:17</span></td></tr>
+              <tr><td>Qoder</td><td><code>qoder</code></td><td><code>qodercli</code></td><td>CLI 流式事件与控制请求<span class="src" data-src="docs/v2/zh/service/hosted-agent-providers.md:18">hosted-agent-providers.md:18</span></td></tr>
+              <tr><td>QwenPaw</td><td><code>qwenpaw</code></td><td><code>qwenpaw</code></td><td>ACP Session<span class="src" data-src="docs/v2/zh/service/hosted-agent-providers.md:19">hosted-agent-providers.md:19</span></td></tr>
+              <tr><td>OpenClaw</td><td><code>openclaw</code></td><td><code>openclaw</code></td><td><code>agent exec</code><span class="src" data-src="docs/v2/zh/service/hosted-agent-providers.md:20">hosted-agent-providers.md:20</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          自动探测会按顺序找 PATH 上的 <code>codex</code>、<code>claude</code>、<code>qodercli</code>、<code>qwenpaw</code>、
+          <code>openclaw</code>，也接受 <code>AISTIO_CODEX_BINARY</code> 等五个环境变量覆盖，以及 <code>~/.local/bin</code> 下的同名文件<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_discovery.go:37-57"
+            >local_runtime_discovery.go:37-57</span
+          >。每个候选的 <code>--version</code> 只等 4 秒，超时或报错就跳过<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_discovery.go:81-86"
+            >local_runtime_discovery.go:81-86</span
+          >。
+        </p>
+        <p>
+          指定 <code>--providers codex,qoder</code> 时不会「能装几个算几个」：只要列表里有一个已知 provider 没找到，connect 就直接失败；
+          写了未知名字也会报不支持<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_discovery.go:91-106"
+            >local_runtime_discovery.go:91-106</span
+          >。这能避免「以为启用了 Qoder，实际上只注册了 Codex」。
+        </p>
+        <p>
+          还有第二道探测：守护进程启动时会再对所有已配置 provider 执行一次 <code>Detect</code>，任何一个失败都会让 Host 注册失败<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/engine.go:139-146"
+            >engine.go:139-146</span
+          >。connect 之后卸载了某个 CLI，现象就是守护进程起不来，而不是「少一个 provider 继续跑」。
+        </p>
+
+        <h2 id="capabilities">能力矩阵：支持不等于你装了就能用</h2>
+        <p>
+          官方矩阵把可移植定义拆成指令、技能、MCP、Managed 风格工具策略、子 Agent 与会话恢复六列<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-providers.md:26-32"
+            >hosted-agent-providers.md:26-32</span
+          >。下面把「审批」也单列出来，因为它是 Tool 权限里最容易误解的一列：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Provider</th><th>指令 / 技能</th><th>MCP</th><th>内置工具策略</th><th>子 Agent</th><th>审批接入</th><th>恢复</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Codex</strong></td>
+                <td>developerInstructions / <code>.agents/skills</code></td>
+                <td>支持</td>
+                <td><strong>不支持</strong>，用原生 sandbox / 审批</td>
+                <td>支持共享工作区，0.153.4+</td>
+                <td>control-plane</td>
+                <td>支持</td>
+              </tr>
+              <tr>
+                <td><strong>Claude Code</strong></td>
+                <td><code>CLAUDE.md</code> / <code>.claude/skills</code></td>
+                <td>支持</td>
+                <td>映射允许 / 拒绝列表</td>
+                <td>当前未声明</td>
+                <td>由 CLI 权限控制</td>
+                <td>支持</td>
+              </tr>
+              <tr>
+                <td><strong>Qoder</strong></td>
+                <td>Prompt / 定义技能目录</td>
+                <td>支持</td>
+                <td>映射允许 / 拒绝列表</td>
+                <td>支持共享工作区，1.0.37+</td>
+                <td>control-plane</td>
+                <td>支持</td>
+              </tr>
+              <tr>
+                <td><strong>QwenPaw</strong></td>
+                <td>Prompt / <code>skills</code></td>
+                <td>支持</td>
+                <td>原生策略</td>
+                <td>当前未声明</td>
+                <td>control-plane</td>
+                <td>支持</td>
+              </tr>
+              <tr>
+                <td><strong>OpenClaw</strong></td>
+                <td>Prompt / <code>skills</code></td>
+                <td><strong>不支持</strong></td>
+                <td>原生策略</td>
+                <td>当前未声明</td>
+                <td>不接入</td>
+                <td><strong>不支持</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「支持」只表示适配器有对应集成，仍需要目标 CLI 版本与账户能力。Codex 原生子 Agent 映射要求 0.153.4+，
+          Qoder 要求 1.0.37+，且当前映射要求共享工作区<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-providers.md:34"
+            >hosted-agent-providers.md:34</span
+          >。源码还会拒绝两类声明：Codex 子 Agent 不能带 <code>tools</code> 或 <code>maxIters</code>；
+          Qoder 子 Agent 的工具名必须能映射到原生工具名<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/subagents.go:93-114"
+            >subagents.go:93-114</span
+          >。
+        </p>
+        <p>
+          Codex 的「内置工具策略不支持」不是配置遗漏，而是设计选择：它无法执行 Managed 的内置工具设置，
+          需要改用 Runtime Profile 里的 sandbox 与审批语义；MCP 连接仍然支持<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/compatibility.go:73-75"
+            >compatibility.go:73-75</span
+          >。把 Managed 的 Workspace 原样搬过来时，这是最常见的拒绝点。
+        </p>
+        <p>
+          Claude Code 的权限通过其 CLI 配置控制，不能承诺与 Codex / Qoder / QwenPaw 相同的控制面确认流程；
+          OpenClaw 使用支持 Shell 的任务 CLI 完成协作，但不支持本适配器的 MCP 注入<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-providers.md:36"
+            >hosted-agent-providers.md:36</span
+          >。同一 Team 可以混用不同 provider，但要先逐个验证成员的独立任务与协作工具，再检查 Leader 的委派与汇总<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-providers.md:42"
+            >hosted-agent-providers.md:42</span
+          >。
+        </p>
+
+        <h2 id="provider-config">Profile 参数：字段、默认值与来源差异</h2>
+        <p>
+          下面是 Runtime Profile <code>configuration</code> 中的字段，不是 <code>connect</code> 参数，也不是所有 provider 通用的表单<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-configuration.md:47"
+            >hosted-agent-configuration.md:47</span
+          >。字段名以源码结构体为准：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Provider</th><th>常用字段</th><th>要特别注意</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Codex</strong></td>
+                <td><code>model</code>、<code>profile</code>、<code>sandbox</code>、<code>reasoningEffort</code>、<code>serviceTier</code><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/codex/adapter.go:36-45">codex/adapter.go:36-45</span></td>
+                <td><code>sandbox</code> 留空默认 <code>workspace-write</code><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/codex/adapter.go:230-235">codex/adapter.go:230-235</span></td>
+              </tr>
+              <tr>
+                <td><strong>Claude Code</strong></td>
+                <td><code>model</code>、<code>permissionMode</code>、<code>allowedTools</code>、<code>disallowedTools</code>、<code>maxTurns</code>、<code>appendSystemPrompt</code>、<code>reasoningEffort</code><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/anthropiccli/adapter.go:40-48">anthropiccli/adapter.go:40-48</span></td>
+                <td>工具名按 provider 的命名使用，权限由 CLI 自身解释</td>
+              </tr>
+              <tr>
+                <td><strong>Qoder</strong></td>
+                <td><code>model</code>、<code>reasoningEffort</code>、<code>contextWindow</code>、<code>permissionMode</code>、<code>allowedTools</code>、<code>disallowedTools</code>、<code>maxTurns</code>、<code>appendSystemPrompt</code>、<code>agent</code><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/qoder/adapter.go:44-56">qoder/adapter.go:44-56</span></td>
+                <td>源码还接受 <code>maxOutputTokens</code> 与 <code>strictMCPConfig</code>，文档表格未列出</td>
+              </tr>
+              <tr>
+                <td><strong>QwenPaw</strong></td>
+                <td><code>agent</code>、<code>model</code>、<code>permissionMode</code>、<code>runtimeProvider</code>、<code>localDiagnostics</code><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/qwenpaw/adapter.go:42-48">qwenpaw/adapter.go:42-48</span></td>
+                <td>通过 ACP Session 与权限请求工作<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/qwenpaw/adapter.go:35-37">qwenpaw/adapter.go:35-37</span></td>
+              </tr>
+              <tr>
+                <td><strong>OpenClaw</strong></td>
+                <td><code>model</code>、<code>fallbacks</code>、<code>thinking</code>、<code>codeMode</code>、<code>timeoutSeconds</code>、<code>localModelLean</code>、<code>isolated</code>、<code>authEnvOnly</code>、<code>reasoningEffort</code><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/openclaw/adapter.go:39-49">openclaw/adapter.go:39-49</span></td>
+                <td><code>agent exec</code> 是一次性工作区，不声明 Session resume<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/openclaw/adapter.go:32-34">openclaw/adapter.go:32-34</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Codex 适配器在 <code>workspace-write</code> 且需要注入协作 MCP 时，会额外打开
+          <code>sandbox_workspace_write.network_access=true</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/codex/adapter.go:186-193"
+            >codex/adapter.go:186-193</span
+          >；线程参数里审批策略固定为 <code>on-request</code>，审批人设为 <code>user</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/codex/adapter.go:247-250"
+            >codex/adapter.go:247-250</span
+          >。这不是「开了网络就一定能访问外网」，仍受主机网络与沙箱策略约束。
+        </p>
+        <p>
+          Profile 保存参数并不会替你安装模型、登录账号或授予外部工具权限<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-configuration.md:57"
+            >hosted-agent-configuration.md:57</span
+          >。同理，增加 Host capacity 不等于增加模型额度或消除 Agent / 任务策略限制<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-configuration.md:43"
+            >hosted-agent-configuration.md:43</span
+          >。
+        </p>
+
+        <h2 id="create">创建 Hosted Agent：选 Runtime，不是选 Managed</h2>
+        <p>
+          在 <strong>DESIGN → Agents</strong> 新建 Agent 时，Runtime 要选择已发现的 Coding Agent provider，而不是 AgentScope Managed；
+          填写职责、可选模型覆盖和 Workspace<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent.md:35"
+            >hosted-agent.md:35</span
+          >。页面会展示 runtime 的指令、工具、技能、子 Agent 等能力映射，按实际支持范围配置<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent.md:35"
+            >hosted-agent.md:35</span
+          >。
+        </p>
+        <p>
+          Hosted 绑定在数据模型里同时需要 <code>runtimeProfileId</code> 与 <code>runtimePoolId</code>，缺一个就验证失败<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/controlplane/model/types.go:182-185"
+            >types.go:182-185</span
+          >。日常使用通常是在控制台选择一个已发现的 Runtime，由它带入 Profile 与 Pool；管理员再维护 Profile 和池<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-configuration.md:43"
+            >hosted-agent-configuration.md:43</span
+          >。
+        </p>
+        <p>
+          Workspace 可以提供可移植的指令、技能和工具定义，适配器把支持的内容映射到 provider；但安装额外 CLI、登录第三方系统与工具权限仍需在目标主机完成。
+          不能只修改 Instructions 就获得主机未安装的程序<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent.md:47"
+            >hosted-agent.md:47</span
+          >。执行前会先做能力校验，请求了 provider 不支持的能力会直接拒绝，而不是「先跑起来再说」<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/compatibility.go:86-94"
+            >compatibility.go:86-94</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">不要把某台机器的路径写成所有 Host 的路径</span>
+          <p>
+            Pool 用来聚合可承载执行的主机，Profile 决定 provider 参数，Agent 只声明自己要什么。把
+            <code>/Users/alice/repo</code> 这类本机路径写进共享 Workspace，换一台 Host 就会失败；任务目录由 Host 自己管理<span
+              class="src"
+              data-src="docs/v2/zh/service/hosted-agent.md:37"
+              >hosted-agent.md:37</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="dispatch">派发：一次 claim 要过多少道门</h2>
+        <p>把一次 Hosted 执行按时间排开，路径是这样的：</p>
+        <ul class="timeline">
+          <li>
+            <span class="who">工作入队</span>
+            <span class="what">Issue / Team / 支持的 Chat 产生 AgentTask，控制面冻结 Runtime 绑定、Profile 配置与能力要求，生成 queued 的 <code>ExecutionAttempt</code><span class="src" data-src="docs/v2/zh/service/hosted-agent-execution.md:14">hosted-agent-execution.md:14</span>。</span>
+          </li>
+          <li>
+            <span class="who">Host 轮询</span>
+            <span class="what">守护进程每 2 秒按自身容量 claim；没有工作就收到 204，不报错<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:67-69">engine.go:67-69</span>。</span>
+          </li>
+          <li>
+            <span class="who">准入匹配</span>
+            <span class="what">数据库在一条语句里检查池名、online 状态、generation、容量、required capabilities、provider 与 hostSelector，然后 <code>SKIP LOCKED</code> 取一条<span class="src" data-src="agentscope-service/aistio/internal/store/postgres/execution_attempts.go:216-245">execution_attempts.go:216-245</span>。</span>
+          </li>
+          <li>
+            <span class="who">prepare</span>
+            <span class="what">Host 上报 preparing，按 session / task 计算工作目录键，准备目录与仓库，然后把可移植定义写入 <code>.agentscope/definition</code><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:218-249">engine.go:218-249</span>。</span>
+          </li>
+          <li>
+            <span class="who">能力复检</span>
+            <span class="what">确认 Profile 存在、provider 已安装，并用该适配器的 Descriptor 再校验一次 Workspace 能力；不通过就以明确 failure code 结束<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:252-271">engine.go:252-271</span>。</span>
+          </li>
+          <li>
+            <span class="who">start 与租约</span>
+            <span class="what">上报 running，启动 provider 子进程；同时每 <code>LeaseTTL / 3</code> 续租，默认 60 秒租约即 20 秒续一次<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:553-584">engine.go:553-584</span>。</span>
+          </li>
+          <li>
+            <span class="who">事件与 checkpoint</span>
+            <span class="what">适配器把 provider 事件交给 Host；Host 写本地 journal、发布到控制面，并在 provider session 变化时提交 checkpoint<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:300-329">engine.go:300-329</span>。</span>
+          </li>
+          <li>
+            <span class="who">收尾</span>
+            <span class="what">成功提交 result 与 checkpoint；失败提交 failure code；取消走 cancelled。终态一旦被控制面确认，时间线封闭，仍在跑的进程会被要求停下<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:330-363">engine.go:330-363</span>。</span>
+          </li>
+        </ul>
+        <p>
+          最容易卡住的是第三步。把 claim 的准入条件拆成表，就能按顺序排除「Host 明明在线，为什么没有任务」：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>准入条件</th><th>怎么满足</th><th>不满足时的现象</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>h.state = online</code></td><td>Host 心跳正常；draining 不接新活</td><td>Host 列表在线状态不对，或已 drain</td></tr>
+              <tr><td><code>h.lease_generation</code> 匹配</td><td>用当前注册返回的 generation claim</td><td>旧进程 claim / heartbeat 报冲突</td></tr>
+              <tr><td><code>e.runtime_pool_name = h.pool_name</code></td><td>Agent 绑定与 Host 用同一个池名</td><td>池里没有能领这条 Attempt 的 Host</td></tr>
+              <tr><td><code>h.active &lt; h.capacity</code></td><td>提高容量，或等当前执行结束</td><td>任务一直 queued</td></tr>
+              <tr><td>required capabilities 是 Host 能力的子集</td><td>Host 真实探测到对应 provider</td><td>能力不匹配，永远不选它</td></tr>
+              <tr><td>Profile provider 在 Host 的 providers 里</td><td>安装并让 Host 探测到该 CLI</td><td>Host 在线，但这条 Profile 无主机可去</td></tr>
+              <tr><td>Pool 的 hostSelector 是 Host labels 的子集</td><td>标签与池选择器一致</td><td>同池但被选择器排除</td></tr>
+              <tr><td><code>preferredHostId</code> 为空或等于本机</td><td>恢复时优先原 Host；不可用则清空</td><td>恢复被路由到别的主机或退回 fresh</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          claim 端点在没有可领工作时返回 <strong>204 No Content</strong>，这是正常状态，不是错误<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:522-525"
+            >taskplane_handler.go:522-525</span
+          >。如果一直 204，按上表从下往上查：先看池与 generation，再看容量与能力，最后才看 Agent 定义。
+        </p>
+        <p>
+          Host 的并发由自己控制：循环里先比较 <code>active</code> 与注册 / 心跳返回的有效容量，再决定是否 claim；
+          注册与心跳响应里的容量会覆盖本地配置<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/engine.go:109-116"
+            >engine.go:109-116</span
+          >。所以控制台调低容量不会杀掉正在跑的执行，只会让 Host 在占用降到容量以下之前不再领新任务。
+        </p>
+
+        <h2 id="workspace">工作目录：Host 管的目录，不是你的 checkout</h2>
+        <p>
+          任务工作目录由 Host 管理，默认位于其状态目录下；不要把它当成你已打开的本地 Git checkout。
+          仓库内容和分支必须按任务的工作区配置准备<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent.md:43"
+            >hosted-agent.md:43</span
+          >。Host 也不会默认切到你正在编辑的仓库<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-execution.md:30"
+            >hosted-agent-execution.md:30</span
+          >。
+        </p>
+        <p>目录键由 Host 计算，规则只有两种：</p>
+        <ul>
+          <li>普通任务：<code>&lt;workspaceRoot&gt;/&lt;tenant&gt;/&lt;taskId&gt;</code>，任务之间隔离<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/workspace.go:70-76">workspace.go:70-76</span>。</li>
+          <li>Hosted Conversation：<code>&lt;tenant&gt;/&lt;namespace&gt;/conversations/&lt;agent&gt;/&lt;sessionId&gt;</code>，同一会话的后续轮次复用同一目录<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/workspace.go:71-74">workspace.go:71-74</span>。</li>
+        </ul>
+        <p>
+          复用目录不是「省事」，而是某些 provider 的原生 session 索引按工作目录划分；目录一变，旧会话可能就找不到了<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/workspace.go:52-57"
+            >workspace.go:52-57</span
+          >。传入的 <code>workspaceKey</code> 还会做路径校验，绝对路径、<code>..</code> 和越界前缀都会被拒绝<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/workspace.go:133-143"
+            >workspace.go:133-143</span
+          >。
+        </p>
+        <p>
+          如果任务上下文带仓库地址，Host 只在目录为空时 <code>git clone</code>；已经存在 <code>.git</code> 就跳过；
+          目录非空且不是 Git 仓库则直接报错<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/workspace.go:159-178"
+            >workspace.go:159-178</span
+          >。这条规则能防止把上一次的残留文件当成干净仓库继续改。
+        </p>
+        <p>
+          可移植 Workspace 文件不会散落在仓库根目录，而是投影到 <code>.agentscope/definition</code>：
+          每次执行先清空再写入，路径不允许逃逸，<code>.agentscope</code> 本身不能是符号链接<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/execution_environment.go:29-69"
+            >execution_environment.go:29-69</span
+          >。provider 再按自己的能力把 skills / subagents 映射到原生目录，例如 Codex 的 <code>.agents/skills</code>、
+          Claude 的 <code>.claude/skills</code>。
+        </p>
+        <p>
+          任务范围身份通过环境注入：Host 只给 provider 子进程任务 token、控制面地址和 task / issue / agent / team / run 标识；
+          <code>AGENTSCOPE_API_TOKEN</code>、<code>AGENTSCOPE_RUNTIME_TOKEN</code>、内部 token 等主机 / 人类凭据会被移除<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/provider.go:250-306"
+            >provider.go:250-306</span
+          >。MCP 配置写成 0600 的临时文件，token 放请求头而不是 argv，避免进程列表泄露<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/provider.go:309-342"
+            >provider.go:309-342</span
+          >。
+        </p>
+        <p>
+          协作入口有两条：MCP 可用的 provider 得到 <code>agentscope-collaboration</code>；
+          Shell 可用的 provider 还能调用 <code>agentscope task context</code>、<code>issue current</code>、
+          <code>task progress</code>、<code>artifact upload</code> 等任务范围命令<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/runtime-host-cli.md:86-98"
+            >runtime-host-cli.md:86-98</span
+          >。如果 Team Leader 既没有 MCP 也没有 CLI，执行会直接失败，而不是静默地「只做一半」<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/engine.go:439-446"
+            >engine.go:439-446</span
+          >。守护进程启动时找不到 <code>agentscope</code> 会告警，Shell-only provider 的协作能力也会随之缺失<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistio-runtime-host/main.go:109-112"
+            >main.go:109-112</span
+          >。
+        </p>
+        <p>
+          provider 能把文件留在 Host 磁盘上，不等于其他协作者能访问；需要共享的结果应上传为 Artifact<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-execution.md:32"
+            >hosted-agent-execution.md:32</span
+          >。
+        </p>
+
+        <h2 id="approval">工具审批：三种 provider 接控制面，两种走原生权限</h2>
+        <p>
+          Codex、Qoder 与 QwenPaw 适配器提供控制面工具确认接入；Claude Code 的权限通过 CLI 配置控制，
+          OpenClaw 也不走本适配器的控制面确认流程<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-providers.md:36"
+            >hosted-agent-providers.md:36</span
+          >。源码里的断言也很直接：Codex 的 Approval 目标是 <code>item/*/requestApproval</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/codex/adapter.go:62"
+            >codex/adapter.go:62</span
+          >，Qoder 是 <code>control_request/can_use_tool</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/qoder/adapter.go:73"
+            >qoder/adapter.go:73</span
+          >，QwenPaw 是 <code>session/request_permission</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/qwenpaw/adapter.go:64"
+            >qwenpaw/adapter.go:64</span
+          >。
+        </p>
+        <ul class="timeline">
+          <li>
+            <span class="who">provider 请求</span>
+            <span class="what">适配器把 provider 的原生审批请求转成 <code>ToolApprovalRequest</code>：工具 ID、名称、输入预览、输入 SHA-256、过期时间<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/provider.go:48-63">provider.go:48-63</span>。</span>
+          </li>
+          <li>
+            <span class="who">创建审批</span>
+            <span class="what">Host 用任务 token 调 <code>POST /api/v1/agent-tasks/{id}/runtime-approvals</code>，kind 为 <code>tool_confirmation</code><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/client.go:273-288">client.go:273-288</span>。</span>
+          </li>
+          <li>
+            <span class="who">轮询决定</span>
+            <span class="what">GET decision；202 表示还没决定，等 1 秒再查；拿到决定后带 decisionVersion 回 ack<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/client.go:290-325">client.go:290-325</span>。</span>
+          </li>
+          <li>
+            <span class="who">幂等重试</span>
+            <span class="what">创建与 ack 对同一 tool-use / decisionVersion 幂等；短暂控制面故障按 250ms 起步、最多 2 秒退避重试，总预算 1 分钟<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/client.go:327-356">client.go:327-356</span>。</span>
+          </li>
+        </ul>
+        <p>
+          这意味着控制台里的「允许 / 拒绝」不是装饰：拒绝消息会回传给 provider；审批记录绑定工具输入哈希，避免审批后输入被替换。
+          但不要把这条流程套到 Claude Code 上——它的权限语义由 CLI 自己解释，平台不能承诺同样的 Inbox 确认体验。
+        </p>
+
+        <h2 id="recovery">恢复：resume 有条件，重试是新 Attempt</h2>
+        <p>
+          适配器把 provider 事件转换成平台执行记录；Host 保留日志、provider session 标识和 checkpoint，用于支持的恢复路径。
+          重启时保留状态目录与 Host 身份，但「声明 Resume 支持」不等于任意中断都能恢复：目标 provider 的会话仍需存在且可访问；
+          OpenClaw 当前不提供 Session resume<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-execution.md:38"
+            >hosted-agent-execution.md:38</span
+          >。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>场景</th><th>发生什么</th><th>会话会复用吗</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>取消</td>
+                <td>取消请求传到执行链路，Host 取消 provider 上下文并确认 cancelled；控制面给 30 秒确认宽限，超时强制取消<span class="src" data-src="agentscope-service/aistio/internal/controller/runtime_control_sweeper.go:190-205">runtime_control_sweeper.go:190-205</span></td>
+                <td>不适用；这是一次执行的终点</td>
+              </tr>
+              <tr>
+                <td>重试</td>
+                <td>产生新的 <code>ExecutionAttempt</code>；只有符合恢复条件时才使用原 provider 会话<span class="src" data-src="docs/v2/zh/service/hosted-agent-execution.md:42">hosted-agent-execution.md:42</span></td>
+                <td>有条件，见下</td>
+              </tr>
+              <tr>
+                <td>跨后端 fresh fallback</td>
+                <td>依赖持久 Issue、评论和 Artifact 重建上下文，不能搬迁进程内记忆<span class="src" data-src="docs/v2/zh/service/hosted-agent-execution.md:42">hosted-agent-execution.md:42</span></td>
+                <td>不复用</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          恢复时会优先找同一会话里最近一次成功的 Attempt，取它的 provider session、workspace key 与 Host；
+          但只有该 Host 仍 online、池名一致、Profile 能力匹配、Pool 选择器也匹配时，才保留这些值，否则全部清空退回 fresh<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/taskplane/service.go:433-455"
+            >service.go:433-455</span
+          >。
+        </p>
+        <p>控制面还有几道时间闸门，排障时先看它们，而不是只看 provider 日志：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>时间 / 状态</th><th>默认</th><th>后果</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Host 心跳</td><td>15 秒<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:70-72">engine.go:70-72</span></td><td>超过 45 秒没心跳，Host 被标记 offline<span class="src" data-src="agentscope-service/aistio/internal/controller/runtime_control_sweeper.go:68-71">runtime_control_sweeper.go:68-71</span></td></tr>
+              <tr><td>执行租约</td><td>60 秒，20 秒续一次<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:73-75">engine.go:73-75</span></td><td>续租失败可容忍到租约到期；到期后取消 provider 并报 <code>lease_lost</code><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:570-583">engine.go:570-583</span></td></tr>
+              <tr><td>启动超时</td><td>30 秒<span class="src" data-src="agentscope-service/aistio/internal/controller/runtime_control_sweeper.go:72-75">runtime_control_sweeper.go:72-75</span></td><td>assigned / preparing 卡住报 <code>startup_timeout</code>，任务重新入队<span class="src" data-src="agentscope-service/aistio/internal/controller/runtime_control_sweeper.go:164-180">runtime_control_sweeper.go:164-180</span></td></tr>
+              <tr><td>运行心跳超时</td><td>45 秒<span class="src" data-src="agentscope-service/aistio/internal/controller/runtime_control_sweeper.go:76-79">runtime_control_sweeper.go:76-79</span></td><td>running / waiting 失联报 <code>heartbeat_timeout</code><span class="src" data-src="agentscope-service/aistio/internal/controller/runtime_control_sweeper.go:171-174">runtime_control_sweeper.go:171-174</span></td></tr>
+              <tr><td>绝对执行超时</td><td>由 Runtime Policy 的 attempt timeout 决定<span class="src" data-src="agentscope-service/aistio/internal/controller/runtime_control_sweeper.go:152-156">runtime_control_sweeper.go:152-156</span></td><td>报 <code>attempt_timeout</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          重启保留 Host 身份，但重新注册会递增 <code>lease_generation</code><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/store/postgres/controlplane_registry.go:317-327"
+            >controlplane_registry.go:317-327</span
+          >。旧进程如果还在用心跳 / claim，会因为 generation 不匹配得到冲突；这是 fencing，不是「服务端抽风」<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/store/postgres/controlplane_registry.go:363-372"
+            >controlplane_registry.go:363-372</span
+          >。
+        </p>
+
+        <h2 id="operations">运维：status、probe、logs、diagnose 各看什么</h2>
+        <p>
+          <code>status</code> 看守护进程是否在跑、PID、Host ID / Host key、Service、范围、Pool、provider 列表、配置与日志路径；
+          没连接过时直接提示先 connect<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:98-133"
+            >local_runtime_process.go:98-133</span
+          >。它不检查 provider 登录，也不检查任务能否派发。
+        </p>
+        <p>
+          <code>probe</code> 是<strong>重新扫描 PATH</strong>，不是检查当前守护进程的配置：它固定用 <code>auto</code> 调用发现逻辑，
+          然后打印每个 provider 的版本与绝对路径<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:156-171"
+            >local_runtime_process.go:156-171</span
+          >。所以 probe 成功只能证明「这台机器上有 CLI」，不能证明「守护进程配置里包含它」。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>命令</th><th>用途</th><th>关键细节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>agentscope runtime logs -f</code></td><td>跟踪守护进程日志</td><td><code>-n</code> 默认显示 50 行<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:141-152">local_runtime_process.go:141-152</span></td></tr>
+              <tr><td><code>agentscope runtime restart</code></td><td>停 10 秒再启动</td><td>先优雅终止，超时才 force kill<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:253-281">local_runtime_process.go:253-281</span></td></tr>
+              <tr><td><code>agentscope runtime diagnose ATTEMPT_ID</code></td><td>收集 Attempt、Run graph 与最近 500 条事件</td><td>按 failure code 给出下一步建议<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/runtime.go:61-120">runtime.go:61-120</span></td></tr>
+              <tr><td><code>agentscope runtime host list</code></td><td>查看主机注册状态</td><td>可带 tenant / namespace 过滤<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/runtime.go:141-149">runtime.go:141-149</span></td></tr>
+              <tr><td><code>agentscope runtime profile/pool apply -f</code></td><td>维护 Profile 与 Pool</td><td>YAML / JSON 提交到控制面<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/runtime.go:150-176">runtime.go:150-176</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          容量可以走控制台或 <code>PATCH /api/v1/runtime-hosts/{id}/capacity</code>，必须同时带
+          <code>capacity</code> 与 <code>expectedCapacity</code>；容量范围 1–50，缺字段或越界返回 400，
+          <code>expectedCapacity</code> 不一致返回 409<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:340-364"
+            >taskplane_handler.go:340-364</span
+          >。控制台改过的容量会被标记为 <code>capacityManaged</code>，Host 重新注册时保留控制面值，而不是被本地配置覆盖<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/store/postgres/controlplane_registry.go:321-325"
+            >controlplane_registry.go:321-325</span
+          >。
+        </p>
+        <p>
+          <code>POST /drain</code> 把状态设为 draining，<code>/resume</code> 设回 online；两者都用当前 generation<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:366-389"
+            >taskplane_handler.go:366-389</span
+          >。draining 期间心跳不会把它改回 online，只有 offline 才会被心跳复活<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/store/postgres/controlplane_registry.go:363-369"
+            >controlplane_registry.go:363-369</span
+          >。但 Host 重启后重新注册会把状态写成 online<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/store/postgres/controlplane_registry.go:321-325"
+            >controlplane_registry.go:321-325</span
+          >，所以 drain 不是跨重启的持久开关。
+        </p>
+
+        <h2 id="cheatsheet">速查：默认值、状态码、失败码</h2>
+        <p>先看「什么都不填会怎样」：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>默认值</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>配置版本 / tenant / namespace</td><td>1 / <code>default</code> / <code>default</code></td><td><span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_config.go:62-72">local_runtime_config.go:62-72</span></td></tr>
+              <tr><td>Pool</td><td><code>coding-default</code></td><td><span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_config.go:68">local_runtime_config.go:68</span></td></tr>
+              <tr><td>Host 容量</td><td>1；控制台可调 1–50</td><td><span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/types.go:262">types.go:262</span></td></tr>
+              <tr><td>claim 轮询</td><td>2 秒</td><td><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:67-69">engine.go:67-69</span></td></tr>
+              <tr><td>Host 心跳 / 离线判定</td><td>15 秒 / 45 秒</td><td><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:70-72">engine.go:70-72</span></td></tr>
+              <tr><td>执行租约 / 续租</td><td>60 秒 / 20 秒</td><td><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:73-75">engine.go:73-75</span></td></tr>
+              <tr><td>启动超时 / 取消宽限</td><td>30 秒 / 30 秒</td><td><span class="src" data-src="agentscope-service/aistio/internal/controller/runtime_control_sweeper.go:72-83">runtime_control_sweeper.go:72-83</span></td></tr>
+              <tr><td>后台启动等待 ready</td><td>15 秒</td><td><span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:241">local_runtime_process.go:241</span></td></tr>
+              <tr><td>审批轮询 / 重试预算</td><td>1 秒 / 1 分钟</td><td><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/client.go:304-330">client.go:304-330</span></td></tr>
+              <tr><td>Codex 默认 sandbox</td><td><code>workspace-write</code></td><td><span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/codex/adapter.go:230-235">codex/adapter.go:230-235</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>再看 HTTP 语义。Hosted 的注册成功是 200，不是 201：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>调用</th><th>成功</th><th>常见失败</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>POST /runtime-hosts/register</code></td><td>200，返回 host 与 <code>heartbeatIntervalSeconds: 15</code><span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:304-315">taskplane_handler.go:304-315</span></td><td>400 缺 hostKey / pool；401 凭据范围不匹配<span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:283-299">taskplane_handler.go:283-299</span></td></tr>
+              <tr><td><code>POST /runtime-hosts/{id}/heartbeat</code></td><td>200，返回更新后的 host<span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:462-467">taskplane_handler.go:462-467</span></td><td>400 缺 generation；409 generation 已过期<span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:458-465">taskplane_handler.go:458-465</span></td></tr>
+              <tr><td><code>POST /execution-attempts/claim</code></td><td>200 返回任务；无工作 204<span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:522-525">taskplane_handler.go:522-525</span></td><td>400 缺 generation / owner / token<span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:510-513">taskplane_handler.go:510-513</span></td></tr>
+              <tr><td><code>PATCH /runtime-hosts/{id}/capacity</code></td><td>200，返回 host<span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:358-363">taskplane_handler.go:358-363</span></td><td>400 容量不在 1–50 或缺 expectedCapacity；409 并发修改<span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:349-352">taskplane_handler.go:349-352</span></td></tr>
+              <tr><td><code>POST /drain</code> 或 <code>/resume</code></td><td>200，返回 host<span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:383-388">taskplane_handler.go:383-388</span></td><td>404 主机不存在；409 generation 冲突<span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:862-872">taskplane_handler.go:862-872</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>最后看失败码。它们会原样出现在 Attempt 里，<code>runtime diagnose</code> 也会按码给建议：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>失败码</th><th>含义</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>runtime_profile_missing</code></td><td>claim 没带 Profile 快照</td><td>老数据或绑定不完整；检查 runtimeProfileId <span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:252-254">engine.go:252-254</span></td></tr>
+              <tr><td><code>provider_unavailable</code></td><td>Profile 指定的 provider 不在本机</td><td>安装 CLI，重启 Host，确认 probe 与配置一致<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:256-259">engine.go:256-259</span></td></tr>
+              <tr><td><code>workspace_capability_unsupported</code></td><td>Workspace 请求了 provider 不支持的能力</td><td>对照能力矩阵删掉不支持项<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:261-263">engine.go:261-263</span></td></tr>
+              <tr><td><code>workspace_prepare_failed</code></td><td>目录 / 仓库准备失败</td><td>workspaceRoot 权限、非空非 Git 目录<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:234-238">engine.go:234-238</span></td></tr>
+              <tr><td><code>definition_materialize_failed</code></td><td>可移植定义写入失败</td><td>符号链接、非法路径、磁盘权限<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:240-243">engine.go:240-243</span></td></tr>
+              <tr><td><code>lease_lost</code></td><td>租约到期且控制面不可达</td><td>网络、控制面健康、Host 是否被隔离<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/engine.go:341-345">engine.go:341-345</span></td></tr>
+              <tr><td><code>provider_permission_denied</code></td><td>provider 拒绝必需工具（例如 Qoder）</td><td>Agent 工具允许列表与 Runtime Profile<span class="src" data-src="agentscope-service/aistio/internal/runtimehost/provider/qoder/adapter.go:441-456">qoder/adapter.go:441-456</span></td></tr>
+              <tr><td><code>heartbeat_timeout</code></td><td>运行中租约 / 心跳丢失</td><td>Host 日志、网络、进程是否还活着<span class="src" data-src="agentscope-service/aistio/internal/controller/runtime_control_sweeper.go:171-174">runtime_control_sweeper.go:171-174</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          Hosted 的注册端点返回 200，而 External 的应用注册返回 201<span class="src" data-src="agentscope-service/aistio/internal/httpapi/agent_catalog_handler.go:160-165">agent_catalog_handler.go:160-165</span>；
+          两章的状态码不要互相套用。另一个小差异是 claim 端点缺省租约 30 秒<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:514-516"
+            >taskplane_handler.go:514-516</span
+          >，但守护进程显式传 60 秒<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistio-runtime-host/main.go:85"
+            >main.go:85</span
+          >；看到 30 这个数字时先确认是谁在调用。
+        </p>
+
+        <h2 id="pitfalls">六个坑：先看方向，再看代码</h2>
+        <p>
+          <strong>坑一：<code>probe</code> 成功，就以为能派发。</strong><code>probe</code> 只是重新扫描 PATH<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:156-171"
+            >local_runtime_process.go:156-171</span
+          >；守护进程用的是保存下来的 provider 列表，启动时还会逐个 <code>Detect</code>，任何一个缺失都会注册失败<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/engine.go:139-146"
+            >engine.go:139-146</span
+          >。正确顺序是：provider 能本机跑 → probe 能看到 → Host 注册成功 → Profile / Pool 匹配 → Agent 可派发。
+        </p>
+        <p>
+          <strong>坑二：只加 capacity，不改 Profile / Pool。</strong>容量只决定「同时能跑几个」，不决定「这条任务能不能来」。
+          claim 还会检查池名、provider 能力、requirements、hostSelector 与 generation<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/store/postgres/execution_attempts.go:226-238"
+            >execution_attempts.go:226-238</span
+          >。容量也不是模型额度，增加 Host 并发不会让 provider 账号多出配额<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-configuration.md:43"
+            >hosted-agent-configuration.md:43</span
+          >。
+        </p>
+        <p>
+          <strong>坑三：把本地 checkout 当任务目录。</strong>Host 为每个任务 / 会话准备自己的目录，不会切到你正在编辑的仓库<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent-execution.md:30"
+            >hosted-agent-execution.md:30</span
+          >。目录非空且不是 Git 仓库会直接报错，而不是「就地覆盖」<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/workspace.go:163-168"
+            >workspace.go:163-168</span
+          >。
+        </p>
+        <p>
+          <strong>坑四：复制或删除 <code>state/</code>。</strong>Host 身份是状态目录里的持久 UUID，不是主机名；删掉会换一个新身份，复制到另一台机器会造成身份冲突<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/identity.go:32-49"
+            >identity.go:32-49</span
+          >。官方也要求保留 Host 身份与状态文件，避免把已有主机错误地注册为新实例<span
+            class="src"
+            data-src="docs/v2/zh/service/runtime-host.md:49"
+            >runtime-host.md:49</span
+          >。
+        </p>
+        <p>
+          <strong>坑五：把 <code>config.json</code> 当模板，或用命令行传 secret。</strong>配置里有 <code>credential</code>，
+          文件权限是 0600；正常路径是环境变量传给守护进程，而不是进程参数<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/runtime-host-cli.md:38-42"
+            >runtime-host-cli.md:38-42</span
+          >。connect 还会把平台 token 从守护进程环境里移除，只保留 Host 范围凭据<span
+            class="src"
+            data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:322-326"
+            >local_runtime_process.go:322-326</span
+          >；把 config 复制进共享脚本，等于把主机身份也共享了。
+        </p>
+        <p>
+          <strong>坑六：请求 provider 根本没有的能力。</strong>Codex 不支持 Managed 内置工具策略，需要改用 sandbox / 审批<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/compatibility.go:73-75"
+            >compatibility.go:73-75</span
+          >；OpenClaw 不支持 MCP 注入，也不提供 Session resume<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/openclaw/adapter.go:62-65"
+            >openclaw/adapter.go:62-65</span
+          >；Claude Code 当前适配器没有声明控制面 Approval，不能指望与 Codex 相同的确认流程<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/runtimehost/provider/anthropiccli/adapter.go:52-65"
+            >anthropiccli/adapter.go:52-65</span
+          >。这些都会在执行前被拒绝，属于「设计上不支持」，不是重试能解决的。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary><code>runtime probe</code> 能看到 Qoder，创建 Agent 时却选不到对应 Runtime，先查什么？</summary>
+          <p>
+            先查守护进程实际配置的 provider 列表，而不是 probe 的输出。probe 固定用 <code>auto</code> 重新扫描 PATH<span
+              class="src"
+              data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:156-171"
+              >local_runtime_process.go:156-171</span
+            >；如果 connect 时只选了 Codex，配置里就没有 Qoder，Host 注册的能力里也不会出现它。其次再看 Host 是否 online、
+            池名与 Profile 是否匹配、容量是否已满。
+          </p>
+        </details>
+        <details>
+          <summary>Host 重启后，旧进程还在发心跳，为什么会得到 409？</summary>
+          <p>
+            重新注册会递增 <code>lease_generation</code><span
+              class="src"
+              data-src="agentscope-service/aistio/internal/store/postgres/controlplane_registry.go:317-327"
+              >controlplane_registry.go:317-327</span
+            >；心跳要求请求里的 generation 与当前记录一致，否则返回冲突<span
+              class="src"
+              data-src="agentscope-service/aistio/internal/store/postgres/controlplane_registry.go:363-372"
+              >controlplane_registry.go:363-372</span
+            >。这是 fencing：旧进程不能再代表这台主机领任务或续租。
+          </p>
+        </details>
+        <details>
+          <summary>一次执行报 <code>heartbeat_timeout</code> 后重试，一定会回到原来的 provider 会话吗？</summary>
+          <p>
+            不一定。重试会产生新的 Attempt；只有同一会话里存在成功的 checkpoint，且原 Host 仍 online、池名、Profile 能力与 Pool 选择器都匹配时，
+            才保留 provider session 与 workspace key，否则退回 fresh<span
+              class="src"
+              data-src="agentscope-service/aistio/internal/taskplane/service.go:433-455"
+              >service.go:433-455</span
+            >。跨后端时只能靠 Issue、评论与 Artifact 重建上下文，进程内记忆不会跟着搬<span
+              class="src"
+              data-src="docs/v2/zh/service/hosted-agent-execution.md:42"
+              >hosted-agent-execution.md:42</span
+            >。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：接通一台 Host，再故意让它接不到任务</h2>
+        <p>目标不是「看到绿色」，而是能独立判断每一层坏在哪。建议 35 分钟，按顺序做，每步留证据：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先证明 provider 自己能跑</span>
+            <div>在目标主机安装并登录一个 provider，直接用它的 CLI 完成一次只读请求。记录版本号与登录账号；此时还不需要 connect。</div>
+          </li>
+          <li>
+            <span class="sh">连接并核对身份</span>
+            <div>执行 <code>agentscope connect URL --providers codex --capacity 1</code>，再跑 <code>status</code> 与 <code>probe</code>。记录 Host ID、Host key、Pool、配置路径；确认 <code>config.json</code> 是 0600。</div>
+          </li>
+          <li>
+            <span class="sh">创建一个只读 Agent</span>
+            <div>在 DESIGN → Agents 选择刚发现的 Runtime，Instructions 写明只读，Model 留空跟随 Profile / CLI。保存后检查 Runtime 就绪状态。</div>
+          </li>
+          <li>
+            <span class="sh">派一个小 Issue</span>
+            <div>创建「读取示例仓库 README，输出三条改进建议，不修改文件」的 Issue。检查 Execution 时间线、provider 事件与最终评论；如果产生文件，再上传为 Artifact 验证共享路径。</div>
+          </li>
+          <li>
+            <span class="sh">制造一次离线</span>
+            <div>停止 Host，观察控制面在 45 秒后把主机标为 offline；再启动，确认 Host key 不变、generation 变化。期间提交的 Issue 应保持 queued，而不是消失。</div>
+          </li>
+          <li>
+            <span class="sh">用容量和 drain 各挡一次</span>
+            <div>把容量降到 1 并同时提交两个任务，确认第二个排队；再 drain 主机，确认没有新任务被领取。resume 后恢复。记录 400 / 409 各触发一次的条件。</div>
+          </li>
+          <li>
+            <span class="sh">触发一次能力拒绝</span>
+            <div>给 Codex Agent 加一条 Managed 风格内置工具策略，或在 OpenClaw Agent 上请求 MCP，提交任务，确认在 provider 启动前就以能力错误结束。把 failure code 与证据写进排障笔记。</div>
+          </li>
+          <li>
+            <span class="sh">可选：验证恢复边界</span>
+            <div>如果有第二个 Host，把原 Host 停掉后重试同一会话，观察是 fresh fallback 还是路由到新 Host；对照 <code>runtime diagnose</code> 的输出确认判断。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          到这里，Hosted 的三层边界已经拆完：控制面负责记录与准入，Runtime Host 负责领取 / 准备 / 拉起 / 回传，provider 负责真正的模型与工具。
+          它和 External 最大的差别不是「谁更聪明」，而是<strong>工作怎么到达执行者</strong>：External 靠应用注册与会话合约，Hosted 靠主机 claim 与租约。
+        </p>
+        <p>
+          下一章看 <strong>Team 协作：Leader、成员与结果收敛</strong>。Hosted 已经能作为 Team 里的实施者：同一 Team 可以混用不同 provider，
+          但每个成员要先独立跑通，再检查 Leader 的委派、等待、重试与汇总。那会把本章的「单任务派发」扩展成「多任务收敛」。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方「Hosted Agent：概览与用法」</td><td>主机准备、创建 Agent、任务与恢复的总览<span class="src" data-src="docs/v2/zh/service/hosted-agent.md:21-55">hosted-agent.md:21-55</span></td></tr>
+              <tr><td>官方「连接 Runtime Host」</td><td>安装、连接、日常命令与配置目录<span class="src" data-src="docs/v2/zh/service/runtime-host.md:12-77">runtime-host.md:12-77</span></td></tr>
+              <tr><td>官方「Hosted 支持的 Provider 与能力差异」</td><td>五类适配器与能力矩阵<span class="src" data-src="docs/v2/zh/service/hosted-agent-providers.md:10-42">hosted-agent-providers.md:10-42</span></td></tr>
+              <tr><td><a href="22-external-agent.html">22 External Agent</a></td><td>对照「应用注册 + ASDP 推送」的另一条路径</td></tr>
+              <tr><td><a href="21-managed-agent-deep.html">21 Managed Agent 深入</a></td><td>对照 Service 自己托管时的定义与资源</td></tr>
+              <tr><td><a href="24-team-collaboration.html">24 Team 协作</a></td><td>把单任务派发扩展成多成员委派与结果收敛</td></tr>
+              <tr><td><a href="../appendix/errors.html">附录 B · 报错速查</a></td><td>401 / 403 / 409 的通用排查顺序</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的 Hosted / Runtime Host 文档在 2.0.4 仓库里仍带「预览」提示<span
+            class="src"
+            data-src="docs/v2/zh/service/hosted-agent.md:6-8"
+            >hosted-agent.md:6-8</span
+          >。凡文档与实现有出入的地方（例如 Qoder 的额外配置字段、claim 的默认租约、配置文件的完整字段），正文都以源码为准并标了出来。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="上一章结束时，Agent 已经能说话也能动手，但它每次 call 都像是失忆的。这一章回答一个问题：「记住上一轮」这件事到底存在哪——答案是 AgentState；而 Memory、LongTermMemory 这套 1.x 的东西在 2.0.4 里已经废弃甚至移除。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="07 记忆与上下文：AgentState、会话隔离、长期记忆 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="上一章结束时，Agent 已经能说话也能动手，但它每次 call 都像是失忆的。这一章回答一个问题：「记住上一轮」这件事到底存在哪——答案是 AgentState；而 Memory、LongTermMemory 这套 1.x 的东西在 2.0.4 里已经废弃甚至移除。" />
+    <title>07 记忆与上下文：AgentState、会话隔离、长期记忆 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="07-memory-context" data-root="..">
+    <main>
+      <article class="article">
+        <h1>07 · 记忆与上下文</h1>
+        <p class="lede">
+          上一章结束时，Agent 已经能说话也能动手，但它每次 <code>call</code> 都像是失忆的。这一章回答一个问题：
+          <strong>「记住上一轮」这件事到底存在哪</strong>。答案是 <code>AgentState</code> —— 而
+          <code>Memory</code>、<code>LongTermMemory</code> 这套 1.x 的东西在 2.0.4 里已经废弃甚至移除，这是本章最容易被带偏的地方。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清「无状态引擎」是什么意思，以及为什么一个 <code>ReActAgent</code> 实例能同时服务多个用户</li>
+          <li>背出 <code>AgentState</code> 的 11 个字段各装什么，知道哪些是框架写的、哪些是你能读的</li>
+          <li>配一次 <code>AgentStateStore</code>，让进程重启后对话还在，并知道三种内置实现的取舍</li>
+          <li>解释同一 <code>(userId, sessionId)</code> 为什么会被串行化，以及并发写冲突时 <code>ConflictPolicy</code> 怎么选</li>
+          <li>不再把「长期记忆」当成框架能力——核心已不提供实现、整包标了废弃，要用就自己接</li>
+        </ul>
+
+        <h2 id="why">先说为什么：无状态引擎 + 有状态槽位</h2>
+        <p>
+          新手最容易写出的架构是「每个会话 new 一个 agent，塞进 <code>Map&lt;sessionId, Agent&gt;</code>」。这在单机 Demo 里能跑，但它把<strong>配置</strong>和<strong>状态</strong>混在了同一个对象里：agent 一多，内存压不住；服务一重启，会话全丢；想扩到两台机器，Map 还不共享。
+        </p>
+        <p>2.0 的做法是把它拆开：</p>
+        <div class="compare">
+          <div class="col">
+            <h4>agent-per-session（1.x 风格）</h4>
+            <ul>
+              <li>agent 对象里既有 sysPrompt，也有对话历史</li>
+              <li>要自己维护 <code>Map&lt;sessionId, Agent&gt;</code> 并且管清理</li>
+              <li>扩容时状态跟着 JVM 走，没法跨节点</li>
+              <li>重启即失忆，除非再写一层导出/导入</li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4>无状态引擎 + AgentState（2.0）</h4>
+            <ul>
+              <li>agent 只持<strong>不可变配置</strong>：sysPrompt / model / toolkit / middlewares</li>
+              <li>可变状态全在 <code>AgentState</code> 里，按 <code>(userId, sessionId)</code> 寻址</li>
+              <li>一个实例服务所有人；不同槽位天然并行</li>
+              <li>状态存在哪由 <code>AgentStateStore</code> 决定，可以换成 Redis</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          官方文档把这件事叫「无状态 Agent 引擎」：<strong>实例无状态，槽位有状态</strong>。理解了这个区分，后面所有设计（并发门、CAS、分布式恢复）都只是它的推论。
+        </p>
+        <p class="src-line">
+          槽位来源：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:397">ReActAgent.java:397</span>；每次调用激活槽位：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:659">:659</span>
+        </p>
+
+        <h2 id="minimal">最小可跑：让第二次 call 记住第一次</h2>
+        <p>不需要 Memory，也不需要额外配置——只要两次调用用同一个 <code>sessionId</code>：</p>
+        <pre data-lang="java" data-file="RememberingAgent.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.state.JsonFileAgentStateStore;
+
+import java.nio.file.Path;
+
+ReActAgent agent =
+        ReActAgent.builder()
+                .name("Memo")
+                .sysPrompt("回答简短，不要复述系统提示。")
+                .model("dashscope:qwen-plus")
+                .stateStore(new JsonFileAgentStateStore(Path.of("state")))
+                .build();
+
+// 同一个槽位：alice / s-001
+RuntimeContext alice = RuntimeContext.builder()
+        .userId("alice")
+        .sessionId("s-001")
+        .build();
+
+agent.call("我叫 Alice，在做支付系统。", alice).block();
+Msg second = agent.call("我在做什么项目？", alice).block();
+System.out.println(second.getTextContent());   // 支付系统 ← 记得
+
+// 换个 sessionId：同一用户，另一段对话
+RuntimeContext aliceOther = RuntimeContext.builder()
+        .userId("alice")
+        .sessionId("s-002")
+        .build();
+Msg other = agent.call("我在做什么项目？", aliceOther).block();
+System.out.println(other.getTextContent());    // 不知道 ← 不共享</pre>
+        <p class="src-line">
+          <code>stateStore(...)</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5166">ReActAgent.java:5166</span>；<code>RuntimeContext.builder()</code> 的 <code>sessionId</code> / <code>userId</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RuntimeContext.java:360">RuntimeContext.java:360</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RuntimeContext.java:365">:365</span>
+        </p>
+        <div class="callout tip">
+          <span class="ct">连 store 都不配会怎样？</span>
+          <p>
+            也记得。框架内部有一个 <code>stateCache</code>（<code>Map&lt;slot, AgentState&gt;</code>），同一个 agent 实例、同一个槽位的第二次调用会拿到同一份状态<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:684"
+              >ReActAgent.java:684</span
+            >。区别是：<strong>进程一退出就没了，而且换一个 agent 实例也读不到</strong>。所以「调试时能记住、上线后失忆」几乎都是忘了配 store。
+          </p>
+        </div>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">agent 实例（不可变）</span>
+            <span class="ld">sysPrompt、model、toolkit、middlewares、stateStore —— 构造完就不再改，可以长期复用</span>
+          </div>
+          <div class="layer in2">
+            <span class="lt">槽位 <code>(userId, sessionId)</code></span>
+            <span class="ld">寻址单位。user 为空时归到 <code>__anon__</code> 桶；session 为空时回退到 <code>defaultSessionId</code></span>
+          </div>
+          <div class="layer in3">
+            <span class="lt">AgentState（可变）</span>
+            <span class="ld">对话历史 + 压缩摘要 + 权限/工具/任务/PlanMode 四个子上下文 + 迭代计数</span>
+          </div>
+        </div>
+
+        <h2 id="line-by-line">逐行解读：AgentState 里到底装了什么</h2>
+        <p>
+          <code>AgentState</code> 是 <code>final class</code>，字段全部通过 builder 或 setter 改，序列化后的 JSON key 是 snake_case（<code>session_id</code>、<code>cur_iter</code>……）。它有 11 个字段：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>类型</th><th>谁写</th><th>作用</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>sessionId</code></td><td>String</td><td>框架</td><td>本份状态属于哪个会话；不传就随机生成 UUID</td></tr>
+              <tr><td><code>userId</code></td><td>String</td><td>框架</td><td>归属用户；<code>null</code> = 匿名/单租户</td></tr>
+              <tr><td><code>context</code></td><td>List&lt;Msg&gt;</td><td>Agent 主循环</td><td><strong>就是对话历史</strong>。用户输入、assistant 回复、tool_calls、tool 结果全在这</td></tr>
+              <tr><td><code>summary</code></td><td>String</td><td>压缩中间件</td><td>历史被压缩后的摘要，默认空串</td></tr>
+              <tr><td><code>replyId</code></td><td>String</td><td>框架</td><td>当前这一轮回复的 id，用于把流式块归到同一条消息</td></tr>
+              <tr><td><code>curIter</code></td><td>int</td><td>框架</td><td>当前推理到第几轮，和 <code>maxIters</code> 对比</td></tr>
+              <tr><td><code>shutdownInterrupted</code></td><td>boolean</td><td>框架</td><td>上一次是否被优雅停机打断，下次可据此恢复</td></tr>
+              <tr><td><code>permissionContext</code></td><td>PermissionContextState</td><td>权限系统</td><td>模式与规则（第 08 章）</td></tr>
+              <tr><td><code>toolContext</code></td><td>ToolContextState</td><td>工具系统</td><td>已激活的工具组（第 06 章的 <code>reset_equipped_tools</code> 就写这里）</td></tr>
+              <tr><td><code>tasksContext</code></td><td>TaskContextState</td><td><code>todo_write</code></td><td>任务清单</td></tr>
+              <tr><td><code>planModeContext</code></td><td>PlanModeContextState</td><td>Plan Mode</td><td>是否处于计划模式、计划文件路径</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          字段与 JSON 顺序：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:44">AgentState.java:44</span>；序列化：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:250">:250</span>
+        </p>
+        <p>
+          有一个细节值得单独记：<code>getContext()</code> 返回的是<strong>不可变副本</strong>，想就地改必须用 <code>contextMutable()</code>。这不是为难你——中间件（压缩、Plan、todo）都是在主循环里就地改写同一个 list，副本会改丢。
+        </p>
+        <p class="src-line">
+          副本 vs 可写句柄：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:169">AgentState.java:169</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:175">:175</span>
+        </p>
+
+        <h3 id="runtime-vs-state">别把 RuntimeContext 和 AgentState 搞混</h3>
+        <p>这两个东西名字都像「上下文」，但一个是<strong>入参</strong>，一个是<strong>状态</strong>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th></th><th><code>RuntimeContext</code></th><th><code>AgentState</code></th></tr>
+            </thead>
+            <tbody>
+              <tr><td>生命周期</td><td>一次 <code>call</code>，用完即弃</td><td>跨 call，持久化</td></tr>
+              <tr><td>谁创建</td><td>调用方 new</td><td>框架按槽位加载</td></tr>
+              <tr><td>装什么</td><td><code>userId</code> / <code>sessionId</code> / 本次调用的工具配置 / 用户自定义 POJO</td><td>对话历史、权限、工具组、任务、迭代计数</td></tr>
+              <tr><td>怎么拿到</td><td>自己构造了就有</td><td><code>rc.getAgentState()</code>（call 期间由框架注入）</td></tr>
+              <tr><td>能改吗</td><td>能，但只影响本次调用</td><td>能改 <code>contextMutable()</code>，call 结束时落盘</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          最重要的那句：<code>RuntimeContext</code> 是<strong>寻址凭据 + 本次调用的旁路数据</strong>，它自己不存历史。你在里面 <code>put</code> 一个 POJO，只对这一次调用有效（第 06 章的参数注入用的就是它）。
+        </p>
+        <p class="src-line">
+          call 入口把 state 注入 RuntimeContext：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:754">ReActAgent.java:754</span>；<code>rc.getAgentState()</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RuntimeContext.java:115">RuntimeContext.java:115</span>
+        </p>
+
+        <h2 id="persistence">端到端：一次 call 从加载到落盘</h2>
+        <ul class="timeline">
+          <li><span class="who">调用方</span><div class="what">传入 <code>RuntimeContext(uid, sid)</code>；没传 sid 就用 <code>defaultSessionId</code>。</div></li>
+          <li><span class="who">寻址</span><div class="what">拼出槽位键 <code>(uid 或 "__anon__") + "/" + sid</code>，后续所有读写都围着它转<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:397">ReActAgent.java:397</span>。</div></li>
+          <li><span class="who">排队</span><div class="what">以槽位为 key 拿执行锁——<strong>同一槽位的 call 串行，不同槽位并行</strong>。</div></li>
+          <li><span class="who">加载</span><div class="what">先读 <code>agent_state</code>；读不到再试 1.x 老键 <code>memory_messages</code> + <code>toolkit_activeGroups</code>；都没有才新建一份空状态。</div></li>
+          <li><span class="who">注入</span><div class="what"><code>ctx.setAgentState(state)</code>——中间件和工具靠 <code>rc.getAgentState()</code> 拿到的就是它。</div></li>
+          <li><span class="who">推理</span><div class="what">主循环就地改写 <code>contextMutable()</code>：追加用户消息、tool_use、tool 结果、最终回复。</div></li>
+          <li><span class="who">落盘</span><div class="what">call 结束（或停机）时<strong>整份</strong>写回 <code>agent_state</code>。中途失败会先把已积累的安全状态存一次，再抛原错误。</div></li>
+        </ul>
+        <p class="src-line">
+          每次调用重新加载（分布式友好）：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:651">ReActAgent.java:651</span>；加载顺序：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:421">:421</span>；保存：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:475">:475</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">不是每条消息都落盘</span>
+          <p>
+            整份状态只在 <strong>call 结束 / 优雅停机</strong> 时写一次<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:359"
+              >ReActAgent.java:359</span
+            >。所以：对后端吞吐很友好，但进程被 <code>kill -9</code> 时这一轮对话会丢。要强一致就得自己在业务层做检查点，或者依赖优雅停机（第 10 章）。
+          </p>
+        </div>
+
+        <h3 id="store-kinds">三种内置 store：选错的代价</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>实现</th><th>模块</th><th>乐观并发（CAS）</th><th>什么时候用</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>InMemoryAgentStateStore</code></td><td><code>agentscope-core</code></td><td><strong>支持</strong></td><td>单元测试、单进程演示。JVM 退出全丢</td></tr>
+              <tr><td><code>JsonFileAgentStateStore</code></td><td><code>agentscope-core</code></td><td>不支持（走默认 <code>UNVERSIONED</code>）</td><td>单机开发、要求「重启还在」。<strong>不能跨节点共享</strong></td></tr>
+              <tr><td><code>RedisAgentStateStore</code></td><td><code>agentscope-extensions-redis</code></td><td>支持</td><td>生产多副本、故障转移、滚动发布</td></tr>
+              <tr><td><code>MysqlAgentStateStore</code></td><td><code>agentscope-extensions-mysql</code></td><td>—</td><td>状态要进关系库：审计、报表、离线分析</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          InMemory 支持 CAS：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/InMemoryAgentStateStore.java:61">InMemoryAgentStateStore.java:61</span>；JsonFile 默认根目录 <code>~/.agentscope/state</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:83">JsonFileAgentStateStore.java:83</span>
+        </p>
+        <p><code>JsonFileAgentStateStore</code> 的磁盘布局很好记，<strong>一个槽位一个目录</strong>：</p>
+        <pre data-lang="text" data-file="state/ 目录结构">state/
+  __anon__/                 ← userId 为 null 时归到这里
+    s-001/
+      agent_state.json      ← 整份 AgentState
+  alice/
+    s-001/
+      agent_state.json
+      memory_messages.jsonl ← 1.x 遗留的列表键，新代码不写
+      memory_messages.hash</pre>
+        <p>
+          目录名默认直接用原字符串，只有包含非 <code>[a-zA-Z0-9_\-.]</code> 字符时才做 Base64-URL 编码——所以 <code>alice/2026-06-02</code> 这种带斜杠的 sessionId 不会把目录穿透，而是变成一串看似乱码的名字。
+        </p>
+        <p class="src-line">
+          布局与 safe 规则：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:47">JsonFileAgentStateStore.java:47</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:62">:62</span>
+        </p>
+        <div class="callout danger">
+          <span class="ct">不传 <code>sessionId</code> 会怎样：回退到 <code>.name()</code></span>
+          <p>
+            <code>defaultSessionId</code> 的取值顺序是：builder 里的 <code>defaultSessionId</code> → 否则 <code>.name()</code> → 再否则 <code>"ReActAgent"</code><span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:349"
+              >ReActAgent.java:349</span
+            >。也就是说，两个都叫 <code>"Assistant"</code> 且都不传 sessionId 的 agent（userId 都是 null）会落到<strong>同一个槽位</strong>，互相看到对方的对话。这在 Demo 里是「怎么记得我的」，在多实例上就是串号事故。
+          </p>
+        </div>
+
+        <h2 id="isolation">并发与隔离：为什么同一会话会被排队</h2>
+        <p>
+          框架给每个槽位分配一把锁：<code>callSerializationKey</code> 返回的就是槽位键<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:727"
+            >ReActAgent.java:727</span
+          >。同一 <code>(uid, sid)</code> 的两次调用必须一个跑完再跑下一个，否则两个循环会同时往同一个 <code>context</code> 里追加消息，历史就乱了。<strong>不同槽位之间没有任何互斥</strong>，所以「一个 agent 服务一千人」在并发上是成立的。
+        </p>
+        <p>
+          跨进程/跨机器时锁是无效的，靠的是存储层的 CAS。框架推荐用「读版本 → 带版本写」：每个槽位缓存一个 <code>slotVersions</code>，保存时用 <code>saveIfVersion</code>；如果版本对不上，就交给 <code>ConflictPolicy</code> 处理：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>策略</th><th>行为</th><th>适合</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>OVERWRITE</code>（默认）</td><td>无条件覆盖，后写的赢</td><td>兼容 1.x 行为；单写者场景</td></tr>
+              <tr><td><code>FAIL</code></td><td>抛 <code>ConcurrentSessionModificationException</code> 并跳过写入</td><td>配了分布式会话门禁，宁可报错也不要脏写</td></tr>
+              <tr><td><code>APPEND_MERGE</code></td><td>重新读最新基线，把这轮新增的消息追上去再重试</td><td>普通聊天轮次；<strong>压缩/摘要轮次不能用</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          三种取值与取舍注释：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/ConflictPolicy.java:34">ConflictPolicy.java:34</span>；<code>conflictPolicy(...)</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5176">ReActAgent.java:5176</span>
+        </p>
+        <p>
+          注意一个容易误判的点：<code>JsonFileAgentStateStore</code> <strong>不支持版本化</strong>，所以哪怕你写了 <code>.conflictPolicy(FAIL)</code>，在单机文件存储上也永远不会触发冲突——<code>saveIfVersion</code> 退化成普通 <code>save</code>。想真正测到冲突，得用 <code>InMemoryAgentStateStore</code>（它支持 CAS）或 Redis。
+        </p>
+        <pre data-lang="java" data-file="CasWrite.java">import io.agentscope.core.state.AgentState;
+import io.agentscope.core.state.AgentStateStore;
+import io.agentscope.core.state.InMemoryAgentStateStore;
+import io.agentscope.core.state.VersionedState;
+
+AgentStateStore store = new InMemoryAgentStateStore();   // 支持 CAS
+
+// 1) 一次读出「值 + 版本号」；key 不存在时 version 为 0
+VersionedState&lt;AgentState&gt; snapshot =
+        store.getVersioned("alice", "s-001", "agent_state", AgentState.class);
+
+// 2) 带着版本写：版本对不上 → 返回 UNVERSIONED，且什么都没写
+long newVersion =
+        store.saveIfVersion(
+                "alice", "s-001", "agent_state", snapshot.value(), snapshot.version());
+
+if (newVersion == AgentStateStore.UNVERSIONED) {
+    System.out.println("别人先改了，这一轮放弃写入");
+}</pre>
+        <p class="src-line">
+          <code>getVersioned</code> 默认实现（不支持版本化的后端直接报 <code>UNVERSIONED</code>）：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:104">AgentStateStore.java:104</span>；<code>saveIfVersion</code> 的三种 <code>expectedVersion</code> 语义：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:134">:134</span>；<code>VersionedState</code> 是 record：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/VersionedState.java:26">VersionedState.java:26</span>
+        </p>
+
+        <h3 id="store-ops">五个操作，别用错</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>我想…</th><th>用这个</th><th>关键差别</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>读某个会话的状态</td><td><code>getAgentState(uid, sid)</code></td><td>拿的是<strong>本 JVM 缓存</strong>的实例；分布式下的权威刷新发生在 call 开始</td></tr>
+              <tr><td>在中间件/工具里读本次调用的状态</td><td><code>rc.getAgentState()</code></td><td>call 作用域，并发安全；这就是官方推荐写法</td></tr>
+              <tr><td>清空对话但保留权限/工具组/任务</td><td><code>clearContext(uid, sid)</code></td><td>只清 <code>context</code> + <code>summary</code>，并立即落盘</td></tr>
+              <tr><td>只释放本地缓存</td><td><code>clearStateCache(uid, sid)</code></td><td>不动 store，下次访问重新从 store 加载</td></tr>
+              <tr><td>彻底删会话</td><td><code>stateStore.delete(uid, sid)</code></td><td>连目录/记录一起删，不可恢复</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          <code>getAgentState(uid, sid)</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4447">ReActAgent.java:4447</span>；<code>clearContext</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4555">:4555</span>；<code>clearStateCache</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4505">:4505</span>
+        </p>
+        <h3 id="store-direct">旁路读写：不走 agent，直接用 store</h3>
+        <p>
+          写管理后台、做数据迁移、清理脏会话时不需要经过 agent。key 只有一个约定：整份状态叫
+          <code>"agent_state"</code>。
+        </p>
+        <pre data-lang="java" data-file="StateAdmin.java">import io.agentscope.core.state.AgentState;
+import io.agentscope.core.state.AgentStateStore;
+import io.agentscope.core.state.JsonFileAgentStateStore;
+
+import java.nio.file.Path;
+
+AgentStateStore store = new JsonFileAgentStateStore(Path.of("state"));
+
+// 读：key 固定是 "agent_state"，类型给 AgentState.class
+AgentState state =
+        store.get("alice", "s-001", "agent_state", AgentState.class).orElseThrow();
+
+System.out.println("消息条数: " + state.getContext().size());
+System.out.println("首条: " + state.getContext().get(0).getTextContent());
+
+// 列：只列 alice 这个命名空间下的 sessionId
+System.out.println(store.listSessionIds("alice"));
+
+// 删：uid + sid 整段会话一起没，不可恢复
+store.delete("alice", "s-001");</pre>
+        <p class="src-line">
+          store 的全部方法：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:61">AgentStateStore.java:61</span>；<code>listSessionIds</code> 只按用户列、没有跨用户 API：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:222">:222</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">读出来的是快照，改它不会自动同步</span>
+          <p>
+            <code>store.get(...)</code> 返回的是独立对象：改它不会进 agent 的 <code>stateCache</code>；而同一个 agent 实例下一次处理该槽位时，还会用自己那份覆盖回去。所以直接改 JSON 只适合离线维护（agent 停机期间），线上会话请走 <code>agent.getAgentState(uid, sid)</code> 或业务接口。
+          </p>
+        </div>
+
+        <h2 id="memory">「长期记忆」：还能跑，但整条路都标了废弃</h2>
+        <p>
+          这一段是本章最想省你两小时的地方。官方 1.x 的教程里满是 <code>memory.addMessage()</code>、<code>LongTermMemory</code>、<code>StaticLongTermMemoryHook</code> 的示例；到 2.0.4，这些类<strong>都还在、也还能跑</strong>，但 <code>io.agentscope.core.memory</code> 整包被标了 <code>@Deprecated(forRemoval = true, since = "2.0.0")</code>，连 builder 的注释都写着「will be removed in the next minor」。换句话说：能编译、能运行，但别在新项目里押注。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>类型</th><th>状态</th><th>注释里的原话</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>Memory</code></td><td><code>@Deprecated(forRemoval = true)</code></td><td>对话上下文已经在 <code>AgentState.getContext()</code>；这个接口只为 1.x 源码兼容保留，是只写镜像</td></tr>
+              <tr><td><code>InMemoryMemory</code></td><td>同上</td><td>用 <code>AgentState</code> 代替</td></tr>
+              <tr><td><code>AgentStateMemoryView</code></td><td>同上</td><td>只为废弃的 1.x hook / tool 而存在</td></tr>
+              <tr><td><code>StateBackedMemory</code></td><td>同上</td><td>直接用 <code>AgentState.getContext()</code></td></tr>
+              <tr><td><code>LongTermMemory</code> / <code>LongTermMemoryMode</code> / <code>LongTermMemoryTools</code> / <code>StaticLongTermMemoryHook</code></td><td>同上</td><td>注释写「Long-term memory is removed」，但<strong>类还在、builder 也还在接线</strong>：核心不提供实现，<code>extensions-mem</code>（mem0 / 百炼 / reme）仍实现这套接口</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/memory/Memory.java:30">Memory.java:30</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/memory/InMemoryMemory.java:32">InMemoryMemory.java:32</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/memory/AgentStateMemoryView.java:39">AgentStateMemoryView.java:39</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/memory/StateBackedMemory.java:33">StateBackedMemory.java:33</span>、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:66">LongTermMemory.java:66</span>
+        </p>
+        <h3 id="memory-layers">那「记忆」到底分几层</h3>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">第 1 层：对话历史（一定有）</span>
+            <span class="ld"><code>AgentState.context</code>。全量消息，每轮全部发给模型。长了就贵、就超窗口</span>
+          </div>
+          <div class="layer in2">
+            <span class="lt">第 2 层：压缩摘要（配了中间件就有）</span>
+            <span class="ld"><code>AgentState.summary</code>。由压缩中间件写入，把老消息换成一段摘要；官方 harness 叫 compaction</span>
+          </div>
+          <div class="layer in3">
+            <span class="lt">第 3 层：跨会话长期记忆（框架不管了）</span>
+            <span class="ld">核心不再提供实现。要么自己存一张表、按 userId 查出来拼进提示词；要么接外部记忆服务</span>
+          </div>
+        </div>
+        <p>想做第三层，现在有三条可走的路，都不需要碰废弃的 <code>Memory</code>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>做法</th><th>怎么做</th><th>适用</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>自己拼提示词</td><td>从你自己的库按 <code>userId</code> 查偏好，拼进 <code>sysPrompt</code>，或用 <code>RuntimeContext</code> 注入 POJO 给工具用</td><td>偏好、配置这类结构化数据，最可控</td></tr>
+              <tr><td>接记忆扩展</td><td><code>agentscope-extensions-mem</code> 里有 mem0 / 百炼 / reme 几个适配</td><td>想要「自动提取 + 语义检索」</td></tr>
+              <tr><td>当检索用</td><td><code>agentscope-extensions-rag</code>（bailian / dify / ragflow / haystack）把命中片段拼进消息</td><td>知识库类记忆</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">把「记忆」写成一个工具，比写成一个 hook 更 2.0</span>
+          <p>
+            1.x 靠 hook 在每轮偷偷改写记忆；<code>io.agentscope.core.hook</code> 整包在 2.0 被标成 <code>@Deprecated(forRemoval = true)</code>，官方推荐改用 <code>MiddlewareBase</code>（第 09 章）。现在更自然的做法：给模型一个 <code>recall_memory(query)</code> 工具，让它自己决定什么时候查——工具属于模型，时机也属于模型。
+          </p>
+        </div>
+        <h3 id="memory-as-tool">替代写法：把记忆做成一个工具</h3>
+        <p>
+          下面这段不碰任何废弃 API：事实存在你自己的表里（示例用 <code>Map</code> 顶替），<code>userId</code> 从
+          <code>RuntimeContext</code> 拿——同一个 agent 实例服务不同用户时，记忆天然按人隔离。
+        </p>
+        <pre data-lang="java" data-file="MemoryTools.java">import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.tool.Tool;
+import io.agentscope.core.tool.ToolParam;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class MemoryTools {
+
+    // 真实项目换成 DB / Redis / 向量库；这里只为演示
+    private final Map&lt;String, List&lt;String&gt;&gt; facts =
+            new ConcurrentHashMap&lt;&gt;();
+
+    @Tool(
+            name = "save_memory",
+            description = "记住一条关于当前用户的长期事实，例如偏好、身份、长期目标。")
+    public String saveMemory(
+            @ToolParam(name = "fact", description = "要记住的事实") String fact,
+            RuntimeContext ctx) {
+        facts.computeIfAbsent(bucket(ctx), k -> new ArrayList&lt;&gt;()).add(fact);
+        return "已记住：" + fact;
+    }
+
+    @Tool(
+            name = "recall_memory",
+            description = "回忆当前用户过去告诉过你的长期事实。")
+    public String recallMemory(
+            @ToolParam(name = "query", description = "想回忆的主题") String query,
+            RuntimeContext ctx) {
+        List&lt;String&gt; mine = facts.getOrDefault(bucket(ctx), List.of());
+        if (mine.isEmpty()) {
+            return "没有关于该用户的长期记忆";
+        }
+        return "关于「" + query + "」我回忆到：\n" + String.join("\n", mine);
+    }
+
+    // userId 可能为 null（匿名调用），直接拿去算 key 会 NPE
+    private static String bucket(RuntimeContext ctx) {
+        String uid = ctx == null ? null : ctx.getUserId();
+        return (uid == null || uid.isBlank()) ? "__anon__" : uid;
+    }
+}</pre>
+        <p class="src-line">
+          无注解的 <code>RuntimeContext</code> 参数由框架注入：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/tool/ToolMethodInvoker.java:182">ToolMethodInvoker.java:182</span>；<code>ctx.getUserId()</code>：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RuntimeContext.java:106">RuntimeContext.java:106</span>；userId 为空时按 <code>__anon__</code> 归桶，和框架自己的槽位规则一致：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:399">ReActAgent.java:399</span>
+        </p>
+        <div class="callout warn">
+          <span class="ct">模型不会自动调用它</span>
+          <p>
+            给了模型「什么时候查」的自由，也把责任交给了提示词。sysPrompt 里写清规则，例如「用户说『你还记得』『之前提过』时先调 <code>recall_memory</code>；拿到新的长期事实时调 <code>save_memory</code>」。否则模型往往宁可瞎猜。
+          </p>
+        </div>
+
+        <h2 id="cheatsheet">速查</h2>
+        <h3 id="three-concepts">1. 一句话记住三个概念</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>概念</th><th>一句话</th><th>关键 API</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>槽位</td><td><code>(userId, sessionId)</code> 决定「哪段对话」</td><td><code>RuntimeContext.builder().userId().sessionId()</code></td></tr>
+              <tr><td>AgentState</td><td>一个槽位的完整快照，共 11 个字段</td><td><code>getContext()</code> / <code>contextMutable()</code> / <code>toJson()</code></td></tr>
+              <tr><td>AgentStateStore</td><td>快照存哪里、怎么防并发覆盖</td><td><code>save</code> / <code>get</code> / <code>saveIfVersion</code> / <code>delete</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="want-table">2. 「我想…」对照表</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>做法</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>让对话在进程重启后还在</td><td><code>.stateStore(new JsonFileAgentStateStore(...))</code></td></tr>
+              <tr><td>多副本共享会话</td><td>换成 Redis store，并考虑 <code>conflictPolicy(FAIL)</code></td></tr>
+              <tr><td>同一 agent 服务多用户</td><td>每次 <code>call</code> 传不同 <code>RuntimeContext</code>，不要 new agent</td></tr>
+              <tr><td>用户点「新对话」</td><td>换一个 <code>sessionId</code>；想保留权限/工具组就改叫 <code>clearContext</code></td></tr>
+              <tr><td>管理台查看某会话历史</td><td><code>getAgentState(uid, sid).getContext()</code></td></tr>
+              <tr><td>实现跨会话偏好记忆</td><td>自己查库拼提示词 / 接 <code>extensions-mem</code> / 做成 <code>recall_memory</code> 工具</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="source-locations">3. 状态相关源码位置</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想确认的事</th><th>去哪看</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>槽位怎么拼</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:397">ReActAgent.java:397</span></td></tr>
+              <tr><td>加载顺序（含 1.x 兼容）</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:421">ReActAgent.java:421</span></td></tr>
+              <tr><td>CAS 保存与冲突处理</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:535">ReActAgent.java:535</span></td></tr>
+              <tr><td>状态接口全部方法</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:61">AgentStateStore.java:61</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. 不传 sessionId，以为「每个 agent 一份记忆」</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>两个毫不相关的用户互相看到对方的对话；或者明明写了多用户，却总能得到同一个人的上下文。</dd>
+            <dt>因为</dt>
+            <dd><code>sessionId</code> 缺省时回退到 <code>defaultSessionId</code>，而它默认就是 agent 的 <code>name</code>。所有不传 session 的调用共用一个槽位。</dd>
+            <dt>改成</dt>
+            <dd>把 <code>sessionId</code> 当成必传参数（业务会话 id / 对话 id）；确实需要单会话时，在 builder 里显式 <code>.defaultSessionId("chat")</code>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 在中间件/工具里用 <code>agent.getAgentState()</code></div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>压测时偶发「读到了别人的历史」；单线程一切正常。</dd>
+            <dt>因为</dt>
+            <dd>无参的 <code>getAgentState()</code> 读的是<strong>默认槽位</strong>，而且已经被标为 <code>@Deprecated</code>。并发下它不对应本次调用。</dd>
+            <dt>改成</dt>
+            <dd>在中间件、工具、回调里永远用 <code>rc.getAgentState()</code>；确实要读指定会话，用 <code>getAgentState(uid, sid)</code>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. 以为每条消息都会落盘</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>进程被强制杀掉后，用户说「刚才那条消息它没记住」；明明上一轮已经回复了。</dd>
+            <dt>因为</dt>
+            <dd>整份状态只在 call 结束 / 优雅停机时写一次，没有逐条消息的写盘。</dd>
+            <dt>改成</dt>
+            <dd>关键业务在 call 返回后自己做检查点；部署上确保滚动发布走优雅停机（第 10 章）。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 多副本挂 JsonFile 存储</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>同一个用户在 A 节点说完话，请求飘到 B 节点后 agent 失忆；或者两个 pod 同时写同一个 json 文件。</dd>
+            <dt>因为</dt>
+            <dd><code>JsonFileAgentStateStore</code> 是本地磁盘实现，既不跨节点也不带 CAS。</dd>
+            <dt>改成</dt>
+            <dd>多副本必须换 Redis/MySQL 这类共享 store；单机开发才用文件。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. 还在找 <code>LongTermMemory</code> / <code>Hook</code> 的写法</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>IDE 划掉一片，编译警告一堆；官方 1.x 例子改不动。</dd>
+            <dt>因为</dt>
+            <dd><code>io.agentscope.core.memory</code> 和 <code>io.agentscope.core.hook</code> 两个包整体标了 <code>@Deprecated(forRemoval = true)</code>：代码还能编、能跑，但下个小版本就可能删；官方指的方向是 <code>MiddlewareBase</code> + 自己存。</dd>
+            <dt>改成</dt>
+            <dd>历史用 <code>AgentState.context</code>，跨会话记忆自己接（拼提示词 / <code>extensions-mem</code> / 做成工具）。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">6. 用同一个 sessionId 做并发压测</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>单会话吞吐上不去，延迟约等于两次调用之和。</dd>
+            <dt>因为</dt>
+            <dd>同一槽位被设计成串行：两个循环同时写 <code>context</code> 会弄乱历史。</dd>
+            <dt>改成</dt>
+            <dd>压测时给每个虚拟用户一个独立 <code>sessionId</code>；旧代码要并发，就多建几个槽位。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>两次 <code>call</code> 只改 <code>sessionId</code>，第二次能看到第一次的对话吗？</summary>
+          <p>
+            不能。槽位是 <code>(userId, sessionId)</code>，换 sessionId 就是另一个槽位，状态互不可见。反过来，只要两个值都一致，<strong>哪怕换一个 agent 实例、换一台机器</strong>（共用同一个分布式 store），也能拿到同一段历史。
+          </p>
+        </details>
+        <details>
+          <summary>什么都没配（无 store），连续两次 <code>call</code> 会记得吗？配了 store 后进程重启还认得吗？</summary>
+          <p>
+            第一次「会记得」：内存里有 <code>stateCache</code>。第二次「看情况」：取决于 store 能不能活过进程——<code>InMemoryAgentStateStore</code> 不能，<code>JsonFileAgentStateStore</code> 能，Redis 能且能跨节点。所以「本地调试很顺、上线就失忆」通常是没配 store 或用了内存实现。
+          </p>
+        </details>
+        <details>
+          <summary>为什么框架要把同一 <code>(uid, sid)</code> 的调用串行化？</summary>
+          <p>
+            因为一次 call 是「读 state → 就地改 <code>context</code> → 整份写回」的读-改-写循环。两个循环并行跑同一槽位，后写的会盖掉先写的（或者历史里出现两条无头消息）。串行化是最便宜的保证；跨进程时锁失效，才需要 <code>saveIfVersion</code> + <code>ConflictPolicy</code> 兜底。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">把状态写成文件看一遍</span>
+            <div>
+              用 <code>new JsonFileAgentStateStore(Path.of("state"))</code> 跑一轮带工具调用的对话，然后打开 <code>state/&lt;uid&gt;/&lt;sid&gt;/agent_state.json</code>。对着 JSON 找 <code>context</code> 里的 <code>tool_use</code> / <code>tool_result</code> 块，以及 <code>tool_context</code> 里被你激活过的工具组。这比读文档快得多。
+            </div>
+          </li>
+          <li>
+            <span class="sh">亲手复现一次串号</span>
+            <div>
+              先不传 <code>sessionId</code>，只给 <code>userId</code>（alice / bob）各说一句「我是谁」。因为 userId 不同，两者在各自的槽位里，互不干扰。现在把 <code>userId</code> 也去掉，再问同样的问题——两个「会话」立刻变成同一个槽位，alice 的名字会被 bob 看到。这就是 <code>__anon__</code> 桶 + <code>defaultSessionId</code> 回退叠加出来的串号。
+            </div>
+          </li>
+          <li>
+            <span class="sh">对比 <code>clearContext</code> 与新建会话</span>
+            <div>
+              先激活一个工具组、存一条 todo，再调 <code>agent.clearContext(uid, sid)</code>，重跑一轮对话。检查两件事：对话是不是空的，工具组和 todo 是不是还在。再对比「换一个 sessionId」的做法，体会「同一会话清空」和「开新会话」的区别。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          状态里有一个字段我们一直没展开：<code>permissionContext</code>。它决定了模型能不能真的执行那些工具——哪些自动放行、哪些要问人、哪些直接拒绝，以及「要问人」的时候事件流里会发生什么。下一章 <a href="08-permission-hitl.html">08 权限与人机交互</a>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想确认的事</th><th>去哪看</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方上下文章节（本章主要对照对象）</td><td><span class="src" data-src="docs/v2/zh/docs/building-blocks/context.md:7">context.md:7</span></td></tr>
+              <tr><td><code>RuntimeContext</code> 字段与谁读得到</td><td><span class="src" data-src="docs/v2/zh/docs/building-blocks/context.md:279">context.md:279</span></td></tr>
+              <tr><td>权限子上下文里存什么</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:207">AgentState.java:207</span></td></tr>
+              <tr><td>运行时切换权限模式</td><td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4590">ReActAgent.java:4590</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

@@ -1,0 +1,1126 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 21 章拆的是 Service 自己托管的 Agent。这一章换一边：应用仍跑在你自己的进程里，Service 只拿走目录身份、会话视图和可选的派发权。内容包括 aistio 依赖、六个环境变量、注册事务与心跳、/agentscope/* 合约、SessionBridge 的五个定时器、AgentTaskStarter 与四种结果，以及「注册成功不等于能接 Issue」的完整边界。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="22 External Agent：把已有应用注册进目录 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 21 章拆的是 Service 自己托管的 Agent。这一章换一边：应用仍跑在你自己的进程里，Service 只拿走目录身份、会话视图和可选的派发权。内容包括 aistio 依赖、六个环境变量、注册事务与心跳、/agentscope/* 合约、SessionBridge 的五个定时器、AgentTaskStarter 与四种结果，以及「注册成功不等于能接 Issue」的完整边界。" />
+    <title>22 External Agent：把已有应用注册进目录 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="22-external-agent" data-root="..">
+    <main>
+      <article class="article">
+        <h1>22 · External Agent：把已有应用注册进目录</h1>
+        <p class="lede">
+          前两章都在讲「Service 怎么替你跑」：第 20 章把 Managed Agent 发布成 Endpoint，第 21 章拆开它的定义与四类资源。
+          这一章换一边——应用仍然跑在你自己的 JVM 里，模型、工具、部署方式都不变，Service 只拿走三样东西：
+          <strong>目录身份、会话视图、可选的派发权</strong>。难点不在注册那一行代码，而在分清这三样各自走哪条通道。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>判断一个应用该用 External、Managed 还是 Hosted，并说清三者各自「谁在运行」</li>
+          <li>用六个环境变量把 Java 应用注册进目录，知道每个值填错时会出现什么现象</li>
+          <li>解释 HTTP contract 与 ASDP 的分工：为什么注册成功、会话能读，却仍然接不到 Issue</li>
+          <li>读懂 <code>/agentscope/*</code> 的读写路由、401 / 409 / 501 的语义，以及 500 条会话截断</li>
+          <li>用 <code>AgentTaskStarter</code> 接一次派发，并按 <code>succeeded</code> / <code>waiting</code> / <code>blocked</code> / <code>failed</code> 回报</li>
+          <li>按「身份 → 会话 → 派发」三层顺序做验收，而不是看到目录里有卡片就宣布接入完成</li>
+        </ul>
+
+        <h2 id="why">先说边界：Service 托管，还是你的进程在跑</h2>
+        <p>
+          External 的定义只有一句，但每个短句都是约束：保留你的应用进程、框架和部署方式，同时接入统一目录、会话诊断与工作协作；
+          它<strong>不是由 Service 启动的 Managed Agent</strong>，也<strong>不要求改造成 Runtime Host provider</strong><span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent.md:10"
+            >external-agent.md:10</span
+          >。换句话说，Service 拿到的是「这个 Agent 存在、它能做什么、它的会话长什么样」，不是「这台机器归 Service 调度」。
+        </p>
+        <p>把三种运行方式并排放在一张表里，边界立刻清楚<span class="src" data-src="docs/v2/zh/service/AGENTS.md:30-36">AGENTS.md:30-36</span>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方式</th><th>谁运行 Agent</th><th>Service 负责什么</th><th>你要负责什么</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Managed</strong></td>
+                <td>Service 的 Harness 与 Dataplane</td>
+                <td>模型循环、会话、执行环境、资源装配</td>
+                <td>定义、Instructions、绑定的资源</td>
+              </tr>
+              <tr>
+                <td><strong>Hosted</strong></td>
+                <td>你电脑或服务器上的 Coding Agent provider</td>
+                <td>Runtime Host 注册、发现、派发与恢复</td>
+                <td>安装并登录 provider，保持主机在线</td>
+              </tr>
+              <tr>
+                <td><strong>External</strong></td>
+                <td><strong>你自己的应用进程</strong></td>
+                <td>目录身份、会话视图、可选的派发与租约</td>
+                <td>进程、框架、模型与工具凭据、任务实现</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          这里最容易被忽略的是最后一行：External 应用<strong>不会因为注册成功就被 Service 接管</strong><span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent-execution.md:10"
+            >external-agent-execution.md:10</span
+          >。模型额度、工具密钥、数据库连接仍然在你的应用里；Service 不会替你读 Managed Vault<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent-configuration.md:48"
+            >external-agent-configuration.md:48</span
+          >。所以「注册完还是 401」通常不是注册问题，而是应用自己的凭据问题。
+        </p>
+        <div class="callout tip">
+          <span class="ct">一句话分工</span>
+          <p>
+            Managed 是「把 Agent 交给 Service 跑」，Hosted 是「把一台已登录的主机交给 Service 调度」，
+            External 是「把身份和会话视图交给 Service，进程仍归你」。三者共享工作入口，但能力边界不同<span
+              class="src"
+              data-src="docs/v2/zh/service/AGENTS.md:36"
+              >AGENTS.md:36</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="paths">两条接入路径，三层验收</h2>
+        <p>
+          官方把 External 的接入拆成两条路径，差别不在语言，而在<strong>是否需要 ASDP 长连接</strong><span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent.md:22-27"
+            >external-agent.md:22-27</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>路径</th><th>网络前提</th><th>拿到的能力</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Java HTTP contract</strong></td>
+                <td>应用能访问注册 API；控制面能回连应用的合约地址</td>
+                <td>注册、合约查询、会话命令、以及适配器实现的命令</td>
+              </tr>
+              <tr>
+                <td><strong>ASDP 框架接入</strong></td>
+                <td>上述 HTTP 连通性，再加上可达的 ASDP gRPC listener</td>
+                <td>实时事件上报，以及适配器实现的 <code>ExecutionAttempt</code> 派发</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          标准 Service Compose / Helm 跑的是 <strong>standalone HTTP</strong>，不提供 ASDP listener；Python <code>instrument()</code> 的自动注册又和 ASDP 初始化绑定，
+          不能靠 <code>start_grpc=False</code> 把它变成完整的 HTTP 注册方案<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent.md:27"
+            >external-agent.md:27</span
+          >。这不是配置开关的问题，而是部署形态的问题：开关打开，不会让 Gateway 凭空长出一个 gRPC listener<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent-configuration.md:42"
+            >external-agent-configuration.md:42</span
+          >。
+        </p>
+        <p>选完路径，还要按三个层次分别验收，因为它们的证据完全不同<span class="src" data-src="docs/v2/zh/service/external-agent-execution.md:23-27">external-agent-execution.md:23-27</span>：</p>
+        <div class="timeline">
+          <li>
+            <span class="who">第一层 · 目录身份</span>
+            <span class="what">逻辑 Agent、运行绑定与实例注册成功；范围、副本身份、generation 正确。证据是目录里的卡片与实例列表。</span>
+          </li>
+          <li>
+            <span class="who">第二层 · 会话能力</span>
+            <span class="what">应用运行会话后，bridge 能提供它声明的上下文、消息与命令。证据是一次真实对话加一次历史读取。</span>
+          </li>
+          <li>
+            <span class="who">第三层 · 工作执行</span>
+            <span class="what">具备任务入口的适配器接受 <code>Attempt</code>，执行并回报状态。证据是一次成功、一次失败、一次取消。</span>
+          </li>
+        </div>
+        <p>
+          只有第二层的应用仍然有用：可以观察独立应用的运行情况。但平台会根据<strong>真实 capability</strong> 判断 Chat、命令和派发是否可用，
+          不会因为目录里有一张卡片就全部点亮<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent-execution.md:29"
+            >external-agent-execution.md:29</span
+          >。
+        </p>
+
+        <h2 id="dependency">依赖只有一条，入口只有一行</h2>
+        <p>
+          Java 侧不需要把应用改造成另一种框架，只加一个扩展依赖，版本跟你的 <code>agentscope.version</code> 保持一致<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent.md:33-41"
+            >external-agent.md:33-41</span
+          >：
+        </p>
+        <pre data-lang="xml" data-file="pom.xml：External 接入只需要这一条">&lt;dependency&gt;
+  &lt;groupId&gt;io.agentscope&lt;/groupId&gt;
+  &lt;artifactId&gt;agentscope-extensions-aistio&lt;/artifactId&gt;
+  &lt;version&gt;${agentscope.version}&lt;/version&gt;
+&lt;/dependency&gt;</pre>
+        <p>
+          入口是 <code>Aistio.instrument(agent, config)</code>：它内部做三件事——<code>new SessionBridge(config)</code>、
+          <code>attach(target, adapter)</code>、<code>start()</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/Aistio.java:56-65"
+            >Aistio.java:56-65</span
+          >。如果你的 Agent 还没创建、但需要先拿到 adapter 挂 middleware，可以用 <code>Aistio.newBridge(config)</code> 分两步走<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/Aistio.java:68-74"
+            >Aistio.java:68-74</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">两个入口的差别，比名字大</span>
+          <p>
+            <code>instrument</code> 对<strong>已经 build 完</strong>的 Agent 也能用：会话快照、有效上下文、历史与命令都能读到，
+            但它<strong>不会产生 Level-2 事件</strong>，因为 <code>ReActAgent</code> 的 middleware 列表在构造时就固定了，事后加不进去<span
+              class="src"
+              data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/Aistio.java:46-48"
+              >Aistio.java:46-48</span
+            >。要事件流，必须在 build 时把 <code>adapter.middleware()</code> 挂上。
+          </p>
+        </div>
+        <p>
+          Java 内置适配器的识别条件很窄：<code>target instanceof Agent</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/adapter/AgentScopeAdapter.java:158-160"
+            >AgentScopeAdapter.java:158-160</span
+          >。包了一层自定义对象、或者传进去的是框架的 Session 而不是 Agent，都会在 <code>attach</code> 阶段直接抛
+          <code>IllegalArgumentException</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:148-157"
+            >SessionBridge.java:148-157</span
+          >，不会「注册到一半」。
+        </p>
+
+        <h2 id="env">六个环境变量，逐条对号</h2>
+        <p>
+          官方最小示例只用了六个变量，刚好覆盖「注册到哪、以谁的身份、哪个副本、控制面怎么回连」四件事<span
+            class="src"
+            data-src="docs/v2/zh/service/first-session.md:107-115"
+            >first-session.md:107-115</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>变量</th><th>填什么</th><th>填错时的典型现象</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>AISTIO_CONTROL_HTTP</code></td>
+                <td>应用可访问的 Service HTTP 注册地址，带 scheme，例如 <code>http://aistio:8081</code></td>
+                <td>启动日志反复出现 <code>register failed (will retry)</code>，目录里始终没有卡片</td>
+              </tr>
+              <tr>
+                <td><code>AISTIO_BOOTSTRAP_TOKEN</code></td>
+                <td>管理员交付的受信任 workload / bootstrap 凭据</td>
+                <td>401 或注册被拒；换成 Endpoint 的 <code>asep_</code> key 也不会通</td>
+              </tr>
+              <tr>
+                <td><code>AISTIO_TENANT</code></td>
+                <td>目标租户；未设置时 SDK 按 <code>default</code> 处理</td>
+                <td>卡片出现在错误的租户下，控制台当前范围看不到</td>
+              </tr>
+              <tr>
+                <td><code>AISTIO_NAMESPACE</code></td>
+                <td>目标命名空间；未设置时 SDK 按 <code>default</code> 处理</td>
+                <td>同租户但跨 namespace，目录与权限都对不上</td>
+              </tr>
+              <tr>
+                <td><code>AISTIO_INSTANCE_KEY</code></td>
+                <td>当前副本的稳定标识；不同副本必须不同，同一副本重启保持不变</td>
+                <td>多副本互相顶掉；或每次重启都变成新实例，历史会话找不到原实例</td>
+              </tr>
+              <tr>
+                <td><code>AGENT_CONTRACT_URL</code></td>
+                <td>控制面可回连的应用地址，带 scheme 与端口，例如 <code>http://report-agent:18090</code></td>
+                <td>注册成功但会话读不到；容器里填 <code>localhost</code> 时最典型</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          租户与命名空间的默认值不是文档约定，而是构造器里写死的：<code>null</code> 或空白一律回落 <code>default</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/AistioConfig.java:80-81"
+            >AistioConfig.java:80-81</span
+          >。实例标识则先读环境变量 <code>HOSTNAME</code>，再退回本机 hostname，最后才是 <code>unknown</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/AistioConfig.java:116-124"
+            >AistioConfig.java:116-124</span
+          >。这解释了为什么本地不设 <code>AISTIO_INSTANCE_KEY</code> 也能跑：容器里通常已经有 <code>HOSTNAME</code>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">localhost 只指它自己</span>
+          <p>
+            如果 <code>publicBaseUrl</code> 留空，bridge 会推导出 <code>http://localhost:&lt;实际端口&gt;</code><span
+              class="src"
+              data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:317-327"
+              >SessionBridge.java:317-327</span
+            >。这在控制面与应用同机时能用；一旦应用进了容器，<code>localhost</code> 只指容器自己，控制面永远回连不到。官方把这条列为常见接入问题<span
+              class="src"
+              data-src="docs/v2/zh/service/external-agent-configuration.md:39"
+              >external-agent-configuration.md:39</span
+            >。
+          </p>
+        </div>
+        <p>
+          还有两个变量不在「六个」里，但排障时经常遇到：<code>AISTIO_CONTROL_GRPC</code> 是 ASDP 的 <code>host:port</code>，
+          不带 HTTP scheme，也不是 Gateway URL<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent.md:97"
+            >external-agent.md:97</span
+          >；<code>BUILDER_INTERNAL_TOKEN</code> 则是示例代码里另一种写法，语义与 <code>AISTIO_BOOTSTRAP_TOKEN</code> 相同，别同时填两套互相矛盾的值。
+        </p>
+
+        <h2 id="config">Builder 参数与默认值</h2>
+        <p>
+          环境变量只是输入，真正决定行为的是 <code>AistioConfig</code>。下表只列会影响接入结果的字段，默认值都来自 Builder 的字段初始化<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/AistioConfig.java:128-149"
+            >AistioConfig.java:128-149</span
+          >：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>默认值</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>agentKey</code></td><td>必填</td><td>逻辑 Agent 身份；同一应用副本共享，不能为空</td></tr>
+              <tr><td><code>tenant</code> / <code>namespace</code></td><td><code>default</code></td><td>注册范围，空白按默认值处理</td></tr>
+              <tr><td><code>instanceKey</code></td><td><code>HOSTNAME</code> → 本机 hostname → <code>unknown</code></td><td>副本身份，必须稳定且副本间唯一</td></tr>
+              <tr><td><code>contractHttpPort</code></td><td><code>18090</code></td><td>Java 默认；Python 默认 <code>8080</code></td></tr>
+              <tr><td><code>contractHttpHost</code></td><td>空（所有网卡）</td><td>只想本机访问时再收窄</td></tr>
+              <tr><td><code>publicBaseUrl</code></td><td>空 → <code>http://localhost:&lt;port&gt;</code></td><td>控制面回连地址，生产必须显式填</td></tr>
+              <tr><td><code>startHttp</code></td><td><code>true</code></td><td>是否启动 <code>/agentscope/*</code> 合约服务</td></tr>
+              <tr><td><code>startGrpc</code></td><td><code>false</code></td><td>是否打开 ASDP 上游通道</td></tr>
+              <tr><td><code>enableEvents</code></td><td>未指定时跟随 <code>startGrpc</code></td><td>只开事件但不开 gRPC 不会生效</td></tr>
+              <tr><td><code>startHttpRegister</code></td><td>未指定时看 <code>controlPlaneHttp</code></td><td>配了 HTTP 地址就默认注册</td></tr>
+              <tr><td><code>eventJournalDir</code></td><td>空 → <code>~/.agentscope/aistio/event-journal</code></td><td>事件 outbox 的持久目录</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          两个 <code>controlPlane</code> 极易混淆：<code>controlPlaneHttp</code> 是 <strong>REST base URL</strong>，要带 <code>http://</code>；
+          <code>controlPlane</code> 是 <strong>ASDP 的 <code>host:port</code></strong>，不带 scheme<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent-configuration.md:19-20"
+            >external-agent-configuration.md:19-20</span
+          >。把 Gateway 地址直接塞给 <code>controlPlane</code>，最常见的报错是连接超时，而不是「配置不合法」。
+        </p>
+        <p>构造器里还有三条硬校验，启动时就会抛 <code>IllegalArgumentException</code>，不会带病运行<span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/AistioConfig.java:95-108">AistioConfig.java:95-108</span>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>条件</th><th>要求</th><th>怎么触发</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>startGrpc=true</code></td>
+                <td><code>controlPlane</code> 不能为空</td>
+                <td>只填了 <code>controlPlaneHttp</code>，却把 gRPC 打开</td>
+              </tr>
+              <tr>
+                <td><code>startGrpc=true</code> 且 <code>startHttpRegister=false</code></td>
+                <td><code>agentId</code>、<code>bindingId</code>、<code>generation &gt; 0</code> 都要有</td>
+                <td>想复用已注册身份，但只填了其中两个</td>
+              </tr>
+              <tr>
+                <td><code>startHttpRegister=true</code></td>
+                <td><code>controlPlaneHttp</code> 不能为空</td>
+                <td>显式开了注册，却没给注册地址</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          另外，<code>startHttpRegister</code> 是 <code>Boolean</code> 而不是 <code>boolean</code>，所以能区分「没传」与「传了 false」：
+          没传时由 <code>controlPlaneHttp</code> 是否为空推导，传了就以你为准<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/AistioConfig.java:243-247"
+            >AistioConfig.java:243-247</span
+          >。这也意味着「配了地址但显式关掉注册」是合法组合，适合由外部系统代注册、应用只提供合约的场景。
+        </p>
+
+        <h2 id="register">注册是一次事务，不是一次心跳</h2>
+        <p>
+          第一次注册不是「往目录里插一行」，而是一次事务：用受信任的 bootstrap / workload 身份声明
+          <code>(tenant, namespace, agentKey)</code>，控制面创建<strong>一个 active Agent、一个 External binding、一条默认 runtime policy、一个实例、一份注册凭据</strong>；
+          明文凭据只返回一次，库里只存哈希。后续副本必须用这份凭据或匹配的 workload 身份，<strong>bootstrap token 本身不能重新认领已有 key</strong><span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/adr-0002-service-v5-agent-identity.md:29"
+            >adr-0002-service-v5-agent-identity.md:29</span
+          >。官方契约同样写明「plaintext registration credential exactly once」<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/service-v5-api-contract.md:18"
+            >service-v5-api-contract.md:18</span
+          >。
+        </p>
+        <p>
+          入口是 <code>POST /api/v1/agent-registrations</code>，它不在控制台 JWT 路由组里，而是自带机器身份信任边界：首次收 bootstrap，后续收 registration credential<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/server.go:377-381"
+            >server.go:377-381</span
+          >。请求体字段如下<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_catalog_handler.go:62-79"
+            >agent_catalog_handler.go:62-79</span>：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>必填</th><th>作用</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>tenant</code> / <code>namespace</code></td><td>否</td><td>注册范围；空则分别回落 <code>default</code> 与默认 namespace</td></tr>
+              <tr><td><code>agentKey</code></td><td><strong>是</strong></td><td>逻辑 Agent 身份</td></tr>
+              <tr><td><code>instanceKey</code></td><td><strong>是</strong></td><td>副本身份</td></tr>
+              <tr><td><code>displayName</code> / <code>description</code></td><td>否</td><td>目录展示信息</td></tr>
+              <tr><td><code>framework</code> / <code>frameworkVersion</code></td><td>否</td><td>框架与版本，用于目录展示</td></tr>
+              <tr><td><code>sdkVersion</code></td><td>否</td><td>SDK 版本标识</td></tr>
+              <tr><td><code>capabilities</code></td><td>否</td><td>能力列表，决定控制台按钮与派发资格</td></tr>
+              <tr><td><code>routingKey</code></td><td>否</td><td>应用合约地址；SDK 把 <code>publicBaseUrl</code> 放在这里</td></tr>
+              <tr><td><code>capacity</code></td><td>否</td><td>容量提示</td></tr>
+              <tr><td><code>credentialTtlSeconds</code></td><td>否</td><td>注册凭据有效期；不填则不过期</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          SDK 实际发出的 body 比表更窄：<code>tenant</code>、<code>agentKey</code>、<code>namespace</code>、<code>instanceKey</code>、<code>routingKey</code>、
+          <code>framework</code>、<code>sdkVersion</code>、<code>capacity=1</code>、<code>capabilities</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/HttpSelfRegistration.java:195-205"
+            >HttpSelfRegistration.java:195-205</span
+          >。bootstrap token 走 <code>X-Builder-Internal-Token</code>，registration credential 走 <code>X-Agent-Registration-Credential</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/HttpSelfRegistration.java:207-214"
+            >HttpSelfRegistration.java:207-214</span
+          >。
+        </p>
+        <p>
+          成功响应固定包含 <code>agent</code>、<code>binding</code>、<code>instance</code> 三段身份，外加明文 <code>registrationCredential</code> 与脱敏的 <code>credential</code>，HTTP 状态是 <strong>201</strong><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_catalog_handler.go:160-165"
+            >agent_catalog_handler.go:160-165</span
+          >。SDK 会再校验一遍：<code>agent.id</code>、<code>binding.id</code>、<code>instance.id</code> 都不能空，<code>generation</code> 必须大于 0，凭据不能空；
+          缺任何一项都当作注册失败并重试<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/HttpSelfRegistration.java:219-233"
+            >HttpSelfRegistration.java:219-233</span
+          >。这条校验很实用：它保证「目录里出现卡片」时，三件套身份一定齐全。
+        </p>
+        <p>
+          注册成功后，bridge 每 <strong>15 秒</strong>发一次心跳：<code>POST /api/v1/dataplanes/{instanceId}/heartbeat</code>，body 带当前 <code>generation</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/HttpSelfRegistration.java:105"
+            >HttpSelfRegistration.java:105</span
+          >。心跳返回 404 时不会「继续等」，而是把状态置回未注册并重新走注册<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/HttpSelfRegistration.java:180-183"
+            >HttpSelfRegistration.java:180-183</span
+          >；网络异常同样触发重注册<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/HttpSelfRegistration.java:184-193"
+            >HttpSelfRegistration.java:184-193</span
+          >。所以日志里偶尔出现一次失败并不可怕，连续失败才是。
+        </p>
+        <p>
+          退出时走另一条路径：<code>DELETE /api/v1/dataplanes/{instanceId}</code>，body 仍带 <code>generation</code>，成功后实例被标记为 unhealthy，服务端返回 <strong>204 No Content</strong><span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/dataplane_handler.go:75-95"
+            >dataplane_handler.go:75-95</span
+          >。SDK 在 <code>close()</code> 里执行这一步，失败只记 FINE 日志，不影响进程退出<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/HttpSelfRegistration.java:137-161"
+            >HttpSelfRegistration.java:137-161</span
+          >。
+        </p>
+        <div class="callout">
+          <span class="ct">一个容易忽略的字段</span>
+          <p>
+            HTTP 注册路径里，<code>sdkVersion</code> 实际填的是 <code>frameworkName()</code>，也就是 <code>agentscope-java</code>，不是常量 <code>SDK_VERSION</code> 的 <code>0.1.0</code><span
+              class="src"
+              data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:213-226"
+              >SessionBridge.java:213-226</span
+            >。目录里看到这个值时别拿它判断 SDK 版本；真正的常量只用于 ASDP 握手<span
+              class="src"
+              data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:72"
+              >SessionBridge.java:72</span
+            >。
+          </p>
+        </div>
+
+        <h2 id="contract">应用合约：<code>/agentscope/*</code> 能查到什么</h2>
+        <p>
+          注册只是让控制面「知道你在哪」，真正读会话靠的是应用自己起的 HTTP 合约服务。它用 JDK 自带的 <code>com.sun.net.httpserver</code> 实现，
+          不引入 Web 框架，也不和你的应用端口冲突<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/ContractHttpServer.java:54-56"
+            >ContractHttpServer.java:54-56</span
+          >。<code>info</code> 里的 <code>contractLevel</code> 固定为 <strong>3</strong>，也就是「查询 + 会话控制」的全功能协调级别<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:75"
+            >SessionBridge.java:75</span
+          >；Level-3 在契约设计里对应的正是压缩、终止这类主动控制<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/contract.md:308-315"
+            >contract.md:308-315</span
+          >。源码里的路由表比 Javadoc 更全，读的时候以 <code>route()</code> 为准：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法与路径</th><th>返回什么</th><th>备注</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>GET /agentscope/info</code></td><td>Agent 配置、合约级别、能力列表</td><td>排障第一站</td></tr>
+              <tr><td><code>GET /agentscope/health</code></td><td><code>{"status":"ok"}</code></td><td>只证明 HTTP 服务活着</td></tr>
+              <tr><td><code>GET /agentscope/sessions</code></td><td>活跃会话列表</td><td>最多 500 条，超出时带 <code>truncated</code> / <code>hasMore</code></td></tr>
+              <tr><td><code>GET /agentscope/sessions/{id}/state</code></td><td>phase、上下文压力、任务摘要</td><td>诊断单条会话</td></tr>
+              <tr><td><code>GET /agentscope/sessions/{id}/context</code></td><td>下一次模型调用实际看到的上下文</td><td>不是完整历史</td></tr>
+              <tr><td><code>GET /agentscope/sessions/{id}/messages</code></td><td>历史消息分页</td><td><code>offset</code> 默认 0，<code>limit</code> 默认 100</td></tr>
+              <tr><td><code>GET /agentscope/sessions/{id}/tasks</code></td><td>会话任务列表</td><td>需要 <code>task-query</code></td></tr>
+              <tr><td><code>GET /agentscope/sessions/{id}/subagent-tasks</code></td><td>后台子任务</td><td>需要 <code>subagent-task-query</code></td></tr>
+              <tr><td><code>GET /agentscope/sessions/{id}/export-transcript</code></td><td>完整会话导出</td><td>需要 <code>export-transcript</code></td></tr>
+              <tr><td><code>GET /agentscope/subagents</code> · <code>/workspaces</code></td><td>子 Agent 与 Workspace 目录</td><td>需要 runtime source 提供数据</td></tr>
+              <tr><td><code>POST .../compress</code> · <code>/terminate</code> · <code>/abort</code></td><td>命令已接受</td><td>返回 200 与 <code>accepted/commandId/phase/result</code></td></tr>
+              <tr><td><code>POST .../plan-mode</code></td><td>切换计划模式</td><td>需要 <code>plan-mode</code></td></tr>
+              <tr><td><code>POST .../messages</code></td><td>注入一条用户消息</td><td>返回 <strong>202</strong>，不代表已产生回复</td></tr>
+              <tr><td><code>DELETE .../subagent-tasks/{taskId}</code></td><td>取消后台子任务</td><td>需要 <code>subagent-task-command</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          只读接口没有 token 校验；写接口在配置了 <code>internalToken</code> 时要求 <code>X-Builder-Internal-Token</code>，
+          不一致直接 401<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/ContractHttpServer.java:136-139"
+            >ContractHttpServer.java:136-139</span
+          >。而 <code>tokenOk</code> 在 token 为空时<strong>直接放行</strong><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/ContractHttpServer.java:262-268"
+            >ContractHttpServer.java:262-268</span
+          >——本地图省事可以，把 18090 暴露到网络上就不要再留空。
+        </p>
+        <p>错误语义是固定的，排障时先看 <code>code</code> 再看消息<span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/ContractHttpServer.java:108-123">ContractHttpServer.java:108-123</span>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>状态</th><th><code>code</code></th><th>含义 / 下一步</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><strong>401</strong></td><td><code>unauthorized</code></td><td>写请求缺少或带错 <code>X-Builder-Internal-Token</code></td></tr>
+              <tr><td><strong>404</strong></td><td><code>not_found</code></td><td>路径或会话不存在；先确认 sessionId</td></tr>
+              <tr><td><strong>409</strong></td><td><code>busy</code></td><td>会话正忙，<code>hint=wait_idle</code>；等这一轮结束再发命令</td></tr>
+              <tr><td><strong>501</strong></td><td><code>unsupported</code></td><td>适配器没声明这个 capability，别改请求，改适配器</td></tr>
+              <tr><td><strong>500</strong></td><td><code>failed</code></td><td>适配器执行失败或内部异常；看应用日志</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          两个容易忽略的上限：会话列表最多返回 <strong>500</strong> 条，被截断时同时置 <code>truncated</code> 与 <code>hasMore</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/ContractHttpServer.java:152-160"
+            >ContractHttpServer.java:152-160</span
+          >；消息分页默认 <strong>100</strong> 条<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/ContractHttpServer.java:61"
+            >ContractHttpServer.java:61</span
+          >。控制台只显示第一页时，不要据此判断「历史丢了」。
+        </p>
+        <div class="callout tip">
+          <span class="ct">Javadoc 与实现不完全同步</span>
+          <p>
+            类注释列了 12 条路由，到 <code>abort</code> 为止<span
+              class="src"
+              data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/ContractHttpServer.java:40-52"
+              >ContractHttpServer.java:40-52</span
+            >；实现里还多了 <code>subagent-tasks</code>、<code>export-transcript</code>、<code>plan-mode</code> 与 <code>POST messages</code><span
+              class="src"
+              data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/ContractHttpServer.java:177-257"
+              >ContractHttpServer.java:177-257</span
+            >。写适配器时按实现走；只按注释实现，会少掉一半可观测性。
+          </p>
+        </div>
+
+        <h2 id="bridge">SessionBridge：启动顺序与五个定时器</h2>
+        <p>
+          <code>start()</code> 的顺序是固定的：先起合约 HTTP 服务，再发注册，再开 ASDP，最后才排定周期性任务<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:183-229"
+            >SessionBridge.java:183-229</span
+          >。顺序有意义：启用合约服务时，先监听再注册，注册上报的 <code>routingKey</code> 才指向一个已经能接受连接的端口；反过来，控制面可能刚拿到地址就来拉，拿到的是连接拒绝。
+        </p>
+        <p>
+          注册本身还有一道「静默跳过」：<code>startHttpRegister=true</code> 但 bootstrap token 与 registration credential 都为空时，
+          bridge 只打一条 warning，然后跳过注册<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:203-210"
+            >SessionBridge.java:203-210</span
+          >。应用照常启动、<code>/agentscope/health</code> 也照常 200，只是目录里永远没有它——这是「本地看着一切正常，控制台就是看不到」的头号原因。
+        </p>
+        <p>五个定时器决定了「多久能看到变化」，它们都写在类常量里<span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:88-95">SessionBridge.java:88-95</span>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>周期</th><th>做什么</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><strong>10 s</strong></td><td>上报 Level-1 会话快照</td><td>控制台会话列表的刷新粒度</td></tr>
+              <tr><td><strong>5 s</strong></td><td>刷事件 outbox，每批最多 20 条，等 ACK 最多 15 s</td><td>事件流延迟与重发窗口</td></tr>
+              <tr><td><strong>30 s</strong></td><td>上下文推送冷却</td><td>同一会话不会每轮都重推上下文</td></tr>
+              <tr><td><strong>30 s</strong></td><td>刷新 Subagent / Workspace 目录</td><td>首次连接立即推一次，之后变慢</td></tr>
+              <tr><td><strong>15 s</strong></td><td>Attempt 租约心跳</td><td>任务执行期间保活，超时会被控制面重试</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          适配器调用另有 <strong>10 秒</strong>超时：<code>handleCommand</code>、<code>extractContext</code>、<code>listMessages</code>、<code>listTasks</code> 等都在 <code>block(Duration.ofSeconds(10))</code> 上等<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:95"
+            >SessionBridge.java:95</span
+          >。你的适配器如果做远程查询，要自己控制在这之内，否则控制台看到的是 500，而不是「慢」。
+        </p>
+        <p>
+          会话有五个 phase，不是「运行/停止」两态：<code>active</code>、<code>idle</code>、<code>compressing</code>、<code>archived</code>、<code>terminated</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:81-86"
+            >SessionBridge.java:81-86</span
+          >。控制面的运维语义更细：<code>active</code> 时禁止压缩、新 turn 进行中；<code>idle</code> 才允许压缩与新 turn；<code>archived</code> 需要 restore 回 <code>idle</code>；<code>terminated</code> 只用于显式硬销毁，数据面失踪不等于终止<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/contract.md:221-227"
+            >contract.md:221-227</span
+          >。所以「会话不见了」和「会话被终止了」是两种完全不同的结论。
+        </p>
+        <p>
+          能力列表由三部分拼成：bridge 固定提供 <code>session-reporting</code> 与 <code>context-reporting</code>；
+          只有事件 journal 真的建起来时才加 <code>event-reporting</code>；其余全部来自 adapter 的 <code>capabilities()</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:366-375"
+            >SessionBridge.java:366-375</span
+          >。journal 的创建条件是 <code>enableEvents && startGrpc</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:128-143"
+            >SessionBridge.java:128-143</span
+          >，所以「只开 HTTP、却期待事件上报」在源码层就不成立。
+        </p>
+        <p>
+          <code>close()</code> 的顺序也值得记：先停调度器，再关 gRPC，再注销实例，再关合约 HTTP，最后 detach adapter<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:330-362"
+            >SessionBridge.java:330-362</span
+          >。先注销再关 HTTP，是为了让控制面在实例消失前还能完成最后一次状态确认。
+        </p>
+
+        <h2 id="middleware">事件流：为什么 middleware 必须在 build 时挂</h2>
+        <p>
+          Level-2 事件不是「读出来的」，是应用主动推的。Java 的做法是在构建 Agent 时把 <code>AgentScopeAdapter</code> 的 middleware 放进链里，
+          再把同一个 adapter 传给 <code>Aistio.instrument</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/Aistio.java:23-44"
+            >Aistio.java:23-44</span
+          >。源码注释说得很直白：<code>ReActAgent</code> 的 middleware 列表在构造时固定，事后没有入口再加<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/Aistio.java:46-48"
+            >Aistio.java:46-48</span
+          >。
+        </p>
+        <p>
+          middleware 采集的粒度也比「一轮问答」细：tool call 的参数在 <code>onActing</code> 里读，因为 <code>ToolCallEndEvent</code> 只带名字和 id；
+          tool 输出则从 delta 事件重新拼起来，因为框架只在那里增量暴露输出<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/adapter/AistioObserverMiddleware.java:49-52"
+            >AistioObserverMiddleware.java:49-52</span
+          >。这解释了为什么「事件里有工具名但没有参数」通常不是采集器坏了，而是挂错了阶段。
+        </p>
+        <p>
+          事件先写本地 journal，再按批推给控制面。journal 是一个 crash-safe 的 outbox：每条记录带长度前缀、追加后 <code>force(true)</code> 落盘，
+          确认后再从 pending 里移除<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/EventJournal.java:86-103"
+            >EventJournal.java:86-103</span
+          >。目录默认在 <code>~/.agentscope/aistio/event-journal</code>，文件名由 <code>tenant + namespace + agentKey + instanceKey</code> 的 SHA-256 决定<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/EventJournal.java:60-79"
+            >EventJournal.java:60-79</span
+          >。容器里不挂持久卷，重启就会换一份空 journal；这不是「事件丢了」，而是 outbox 本来就没保住。
+        </p>
+        <div class="callout warn">
+          <span class="ct">journal 不是业务状态库</span>
+          <p>
+            官方明确区分：事件 journal 帮助断线恢复，但不保存所有业务状态，也不代替框架自己的 Session store<span
+              class="src"
+              data-src="docs/v2/zh/service/external-agent-execution.md:37"
+              >external-agent-execution.md:37</span
+            >。应用仍需保留自己的数据、工具连接和任务幂等处理。把 journal 当数据库用，恢复出来的只会是「说过什么」，不是「做到哪」。
+          </p>
+        </div>
+
+        <h2 id="task">任务派发：信封、Starter 与四种结尾</h2>
+        <p>
+          这是整章最硬的一条边界：<strong>任务派发不走 HTTP 合约</strong>。合约服务里没有任何一条「提交任务」的路由；
+          <code>ExecutionAttempt</code> 只从 ASDP 的 <code>onExecutionAttempt</code> 进来<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:702-747"
+            >SessionBridge.java:702-747</span
+          >。所以 <code>startGrpc(false)</code> 的应用可以注册、可以被读会话、可以接命令，但<strong>永远不会收到 Issue/Team 的派发</strong>。
+        </p>
+        <p>派发信封一共 12 个字段，都是不可变值<span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/model/AgentTaskAssignment.java:24-36">AgentTaskAssignment.java:24-36</span>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>用途</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>attemptId</code> / <code>agentTaskId</code></td><td>这一次执行与它所属的持久任务</td></tr>
+              <tr><td><code>runId</code> / <code>nodeId</code></td><td>所属 Run 与编排节点</td></tr>
+              <tr><td><code>generation</code></td><td>派发时的实例代次，用于拒绝过期执行</td></tr>
+              <tr><td><code>command</code></td><td>执行或取消</td></tr>
+              <tr><td><code>contextUrl</code></td><td>任务范围上下文的读取地址</td></tr>
+              <tr><td><code>taskToken</code> / <code>attemptToken</code></td><td>任务范围与执行范围凭据</td></tr>
+              <tr><td><code>sessionId</code></td><td>从 runtime binding 里解析出的会话；没有则为空</td></tr>
+              <tr><td><code>payload</code></td><td>任务输入，防御性拷贝</td></tr>
+              <tr><td><code>timestamp</code></td><td>派发时间</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          bridge 收到后的动作顺序是固定的：先 <code>ack</code>，如果是 <code>cancel</code> 就直接回报 <code>cancelled</code> 并返回，不进入业务；
+          否则回报 <code>start</code>，启动 15 秒心跳，再交给 <code>adapter.handleAgentTask(assignment)</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:704-747"
+            >SessionBridge.java:704-747</span
+          >。适配器返回的 <code>Mono</code> 结束时，心跳才被取消。这个顺序保证了「取消」不会先跑一半业务再停。
+        </p>
+        <p>
+          Java 侧的任务入口只有一个方法：<code>AgentTaskStarter.start(AgentTaskAssignment)</code>，返回 <code>Mono&lt;Void&gt;</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/adapter/AgentTaskStarter.java:26-30"
+            >AgentTaskStarter.java:26-30</span
+          >。但「有这个接口」不等于「声明了能力」：<code>AgentScopeAdapter</code> 只有在 <code>agentTaskStarter != null</code> 时才把 <code>agent-task</code> 加进 capability；
+          如果用的是 <code>HarnessAgentTaskStarter</code> 并且配了 Workspace 工厂，还会额外声明 <code>workspace-definition-v1</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/adapter/AgentScopeAdapter.java:163-185"
+            >AgentScopeAdapter.java:163-185</span
+          >。
+        </p>
+        <p>
+          反过来，基类 <code>FrameworkAdapter</code> 的默认实现是直接抛 <code>UnsupportedOperationException</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/FrameworkAdapter.java:165-168"
+            >FrameworkAdapter.java:165-168</span
+          >，默认能力也只有 <code>context-query</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/FrameworkAdapter.java:174-176"
+            >FrameworkAdapter.java:174-176</span
+          >。这就是「不要用空实现换 capability 标志」的源码依据：控制台会按 capability 点亮按钮，点了就 501<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/FrameworkAdapter.java:37-39"
+            >FrameworkAdapter.java:37-39</span
+          >。
+        </p>
+        <p>
+          Python 的情况要单独记一笔：当前内置适配器<strong>没有实现 <code>handle_agent_task</code></strong>，它们可以接入观测与各自实现的会话能力，
+          但不会自动获得 Issue/Team 派发能力<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent-frameworks.md:31"
+            >external-agent-frameworks.md:31</span
+          >。框架名相同也不代表 External 与 Hosted 能力相同，例如 Claude Agent SDK 集成和 Runtime Host 启动 Claude Code CLI 是两条路径。
+        </p>
+        <p>业务结果只有四种，而且每种都有校验条件，不是随便填个字符串<span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/adapter/AgentTaskOutcome.java:27-46">AgentTaskOutcome.java:27-46</span>：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Outcome</th><th>必须满足</th><th>含义</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>succeeded</code></td><td><code>result</code> 不能为空，必须是真实交付物</td><td>有明确交付且执行可完成</td></tr>
+              <tr><td><code>waiting</code></td><td><code>reason</code> 不能为空，<code>pendingTaskIds</code> 不能为空</td><td>等待真实存在的后台任务或委派任务</td></tr>
+              <tr><td><code>blocked</code></td><td><code>reason</code> 不能为空</td><td>缺少信息或能力，保留已完成部分</td></tr>
+              <tr><td><code>failed</code></td><td><code>reason</code> 不能为空</td><td>执行失败，需要读错误后决定是否重试</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Harness 场景里，模型通过 <code>task.submit_result</code> 工具提交意图，工具描述里写得很清楚：提交这个工具<strong>本身不会把任务标记为成功</strong>，
+          只有适配器才能提交物理生命周期<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/adapter/AgentTaskOutcomeTool.java:31-39"
+            >AgentTaskOutcomeTool.java:31-39</span
+          >。工具只负责把四项参数写进本次派发的 <code>State</code>，由适配器校验后再提交<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/adapter/AgentTaskOutcomeTool.java:61-68"
+            >AgentTaskOutcomeTool.java:61-68</span
+          >。
+        </p>
+        <p>
+          最后是 generation。控制面在派发时冻结 <code>agentId</code>、<code>bindingId</code>、选中的 <code>instanceId</code>、generation、capabilities 与约束，
+          之后的目录变更不会改写这次 Attempt<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/adr-0002-service-v5-agent-identity.md:27"
+            >adr-0002-service-v5-agent-identity.md:27</span
+          >。旧执行返回时必须接受控制面的过期身份检查，不能把旧结果重新贴成另一任务的成功<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent-execution.md:43"
+            >external-agent-execution.md:43</span
+          >。收到取消也要向框架传播并观察最终状态——HTTP 响应成功不证明业务执行已经停止。
+        </p>
+
+        <h2 id="first-session">最小可跑：从 0 到控制台可见</h2>
+        <p>下面这条路径只做「目录 + 会话」，不接任务。先把它跑通，再决定是否加 ASDP。</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">准备四项输入</span>
+            <div>向管理员拿注册范围、Service HTTP 地址与 bootstrap 凭据；为当前副本定一个稳定的 <code>instanceKey</code>；确认控制面能访问应用的 <code>host:port</code><span class="src" data-src="docs/v2/zh/service/register-agentscope-agent.md:14-21">register-agentscope-agent.md:14-21</span>。</div>
+          </li>
+          <li>
+            <span class="sh">加依赖</span>
+            <div>只加 <code>agentscope-extensions-aistio</code>，版本与应用使用的 <code>agentscope.version</code> 对齐。</div>
+          </li>
+          <li>
+            <span class="sh">在 build 时挂 middleware</span>
+            <div>要让事件流可用，先把 <code>adapter.middleware()</code> 放进 Agent 的构建链；只想读会话，可以跳过这一步，但别事后期待事件。</div>
+          </li>
+          <li>
+            <span class="sh">启动并自查合约</span>
+            <div>先访问 <code>/agentscope/health</code>，再访问 <code>/agentscope/info</code>。前者只证明端口通了，后者才告诉你 contractLevel 与 capabilities。</div>
+          </li>
+          <li>
+            <span class="sh">注册并在目录确认</span>
+            <div>启动日志出现 <code>aistio: registered ...</code> 后，在控制台按 tenant / namespace 找到 <code>agentKey</code>，核对实例与合约地址。</div>
+          </li>
+          <li>
+            <span class="sh">跑一轮对话，再读历史</span>
+            <div>从应用自身发起一轮对话，然后 <code>GET /agentscope/sessions</code> 与 <code>.../messages</code>。读不到先查合约 URL 与控制面回连，不要先怀疑适配器。</div>
+          </li>
+        </ol>
+        <p>完整的 Java 接入片段如下，和官方示例等价，只是把 adapter 显式传了进去：</p>
+        <pre data-lang="java" data-file="External 最小接入：HTTP 注册 + 合约">AgentScopeAdapter adapter = new AgentScopeAdapter();
+
+ReActAgent agent = ReActAgent.builder()
+        .name("report-service")
+        .model(model)
+        .middleware(adapter.middleware())   // 要事件流就必须在这里挂
+        .build();
+
+SessionBridge bridge = Aistio.instrument(agent,
+        AistioConfig.builder("report-service")
+                .controlPlaneHttp(System.getenv("AISTIO_CONTROL_HTTP"))
+                .internalToken(System.getenv("AISTIO_BOOTSTRAP_TOKEN"))
+                .tenant(System.getenv("AISTIO_TENANT"))
+                .namespace(System.getenv("AISTIO_NAMESPACE"))
+                .instanceKey(System.getenv("AISTIO_INSTANCE_KEY"))
+                .contractHttpPort(18090)
+                .publicBaseUrl(System.getenv("AGENT_CONTRACT_URL"))
+                .startHttpRegister(true)
+                .startGrpc(false)          // 只注册与会话，不接任务
+                .build(),
+        adapter);
+
+Runtime.getRuntime().addShutdownHook(new Thread(bridge::close));</pre>
+        <p>
+          如果不想在构建时挂 middleware，也可以直接用官方的两参数版本 <code>Aistio.instrument(agent, config)</code>，
+          它会内部 new 一个 <code>AgentScopeAdapter</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/Aistio.java:56-59"
+            >Aistio.java:56-59</span
+          >。代价是第二条路注释里写的那句：没有 Level-2 事件。
+        </p>
+        <p>合约自查用两条 <code>curl</code> 就够，不需要控制台：</p>
+        <pre data-lang="bash" data-file="先证明端口和合约都活着">curl --fail-with-body "$AGENT_CONTRACT_URL/agentscope/health"
+# {"status":"ok"}
+
+curl --fail-with-body "$AGENT_CONTRACT_URL/agentscope/info"
+# 重点看 contractLevel、capabilities、framework
+</pre>
+        <p>
+          只有 <code>health</code> 通、<code>info</code> 不通，说明 HTTP 服务起来了但 provider 还没接上 adapter；两个都通但目录没卡片，才轮到注册参数。
+          这条排查顺序能省掉大量「反复换 token」的时间。
+        </p>
+        <p>
+          要接 Issue / Team，再单独走第二步：把 <code>startGrpc(true)</code>、<code>controlPlane(host:port)</code> 配上，
+          并给 adapter 设置真实的 <code>AgentTaskStarter</code>。官方把这件事写成独立能力，而不是注册的附赠品<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent-frameworks.md:16"
+            >external-agent-frameworks.md:16</span
+          >；接入教程也明确「仅注册目录和暴露会话信息不会自动获得任务执行能力」<span
+            class="src"
+            data-src="docs/v2/zh/service/register-agentscope-agent.md:35"
+            >register-agentscope-agent.md:35</span
+          >。
+        </p>
+
+        <h2 id="line">端到端：一条 Issue 怎么落到你的进程</h2>
+        <p>把前面的零件按时间顺序排起来，一条派发的完整路径是这样：</p>
+        <ul class="timeline">
+          <li>
+            <span class="who">应用启动</span>
+            <span class="what">构建 Agent 时挂 middleware；<code>instrument</code> 绑定 adapter，计算 capabilities（bridge 固定两项 + adapter 声明项）<span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:366-375">SessionBridge.java:366-375</span>。</span>
+          </li>
+          <li>
+            <span class="who">合约监听</span>
+            <span class="what">在 18090 起 <code>/agentscope/*</code>；如果配置了 internal token，写请求开始要求 <code>X-Builder-Internal-Token</code><span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:189-201">SessionBridge.java:189-201</span>。</span>
+          </li>
+          <li>
+            <span class="who">注册</span>
+            <span class="what">POST <code>/api/v1/agent-registrations</code>，带 bootstrap 或 registration credential；拿到 Agent / Binding / Instance / generation 与控制面签发的新凭据<span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/HttpSelfRegistration.java:195-233">HttpSelfRegistration.java:195-233</span>。</span>
+          </li>
+          <li>
+            <span class="who">保活</span>
+            <span class="what">每 15 秒心跳；404 或网络失败就重新注册。控制面同时按 <code>routingKey</code> 回连合约，拉会话与能力<span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/HttpSelfRegistration.java:163-193">HttpSelfRegistration.java:163-193</span>。</span>
+          </li>
+          <li>
+            <span class="who">控制面选实例</span>
+            <span class="what">Issue → Run → AgentTask → Attempt；按 binding 能力、实例健康和 generation 选一个实例，冻结这次 Attempt 的身份<span class="src" data-src="agentscope-service/docs/controlplane/adr-0002-service-v5-agent-identity.md:27">adr-0002-service-v5-agent-identity.md:27</span>。</span>
+          </li>
+          <li>
+            <span class="who">ASDP 下行</span>
+            <span class="what">bridge 收到 <code>ExecutionAttempt</code>：先 ack，取消就直接 cancelled；否则 start、开 15 秒租约心跳，再进业务<span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:704-747">SessionBridge.java:704-747</span>。</span>
+          </li>
+          <li>
+            <span class="who">你的 Starter 执行</span>
+            <span class="what">用任务范围凭据读上下文、建隔离执行、发评论与 Artifact，最后提交四种 outcome 之一<span class="src" data-src="docs/v2/zh/service/external-agent.md:101">external-agent.md:101</span>。</span>
+          </li>
+          <li>
+            <span class="who">回报与收尾</span>
+            <span class="what">bridge 上报成功/失败/取消，Run node 收敛；应用退出时注销实例，服务端返回 204<span class="src" data-src="agentscope-service/aistio/internal/httpapi/dataplane_handler.go:75-95">dataplane_handler.go:75-95</span>。</span>
+          </li>
+        </ul>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方向</th><th>走哪条通道</th><th>典型失败现象</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>应用 → 控制面</td><td>HTTP 注册与心跳</td><td>目录无卡片；日志反复 retry</td></tr>
+              <tr><td>控制面 → 应用</td><td>HTTP <code>/agentscope/*</code></td><td>有卡片但会话读不到；401 / 连接拒绝</td></tr>
+              <tr><td>应用 ↔ 控制面</td><td>ASDP 长连接</td><td>能聊天但不能接 Issue；事件流为空</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          这三条通道是独立的。任何一条断了，都只影响对应的能力，不会让另外两条「一起坏」；反过来，一条通了也不代表另外两条通。
+          排障时先问「现在缺的是哪一层的能力」，再去看对应的通道。
+        </p>
+
+        <h2 id="cheatsheet">速查：默认值、状态码、故障对照</h2>
+        <p>先看「什么都不填会怎样」：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>默认值</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>contractHttpPort</code></td><td>18090（Python 8080）</td><td><span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/AistioConfig.java:142">AistioConfig.java:142</span></td></tr>
+              <tr><td><code>startHttp</code> / <code>startGrpc</code></td><td>true / false</td><td><span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/AistioConfig.java:146-147">AistioConfig.java:146-147</span></td></tr>
+              <tr><td><code>enableEvents</code></td><td>跟随 <code>startGrpc</code></td><td><span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/AistioConfig.java:260">AistioConfig.java:260</span></td></tr>
+              <tr><td><code>publicBaseUrl</code></td><td><code>http://localhost:&lt;port&gt;</code></td><td><span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:317-327">SessionBridge.java:317-327</span></td></tr>
+              <tr><td>事件 journal</td><td><code>~/.agentscope/aistio/event-journal</code></td><td><span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/EventJournal.java:60-68">EventJournal.java:60-68</span></td></tr>
+              <tr><td>消息分页</td><td><code>limit=100</code>，<code>offset=0</code></td><td><span class="src" data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/transport/ContractHttpServer.java:61">ContractHttpServer.java:61</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>再看「现象 → 先查什么」，按命中率排序：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>现象</th><th>先查</th><th>不要再做什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>目录里没有卡片</td><td>注册日志、<code>AISTIO_CONTROL_HTTP</code>、token 是否为空</td><td>不要先改 agentKey</td></tr>
+              <tr><td>有卡片但会话读不到</td><td><code>AGENT_CONTRACT_URL</code> 是否控制面可达、端口是否一致</td><td>不要反复换 bootstrap token</td></tr>
+              <tr><td>能聊天但不能接 Issue</td><td><code>startGrpc</code>、<code>controlPlane</code>、是否设置了 Starter</td><td>不要只加 capability 字符串</td></tr>
+              <tr><td>事件流为空</td><td>middleware 是否在 build 时挂、<code>enableEvents</code> 与 <code>startGrpc</code></td><td>不要指望事后 <code>instrument</code> 补事件</td></tr>
+              <tr><td>多副本互相顶掉</td><td><code>instanceKey</code> 是否每个副本唯一</td><td>不要把 <code>agentKey</code> 当副本身份</td></tr>
+              <tr><td>命令 409</td><td>会话是否还在 <code>active</code></td><td>不要重试同一命令；等 <code>idle</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          这张表里的「HTTP 只读、ASDP 派发」不是文档措辞的推论，而是源码结构：<code>ContractHttpServer</code> 没有任何任务提交路由，
+          <code>ExecutionAttempt</code> 只由 <code>SessionBridge.onExecutionAttempt</code> 处理。
+        </p>
+
+        <h2 id="pitfalls">六个坑，先看方向再看代码</h2>
+        <p>
+          <strong>坑一：<code>startGrpc(false)</code>，却期待 Issue 派发。</strong>注册和会话都正常，控制台也能看到 Agent，
+          但任务永远不来。原因不是 Starter 没写，而是派发通道根本没开——<code>ExecutionAttempt</code> 只走 ASDP<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:702-718"
+            >SessionBridge.java:702-718</span
+          >。先确认部署是否提供 ASDP listener，再谈代码。
+        </p>
+        <p>
+          <strong>坑二：<code>AGENT_CONTRACT_URL</code> 留空或填 <code>localhost</code>。</strong>注册请求是应用「向外打」，能成功；
+          控制面回连是「向内打」，打不进来。bridge 的兜底是 <code>http://localhost:&lt;port&gt;</code><span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:317-327"
+            >SessionBridge.java:317-327</span
+          >，在容器里等于指向容器自己。现象是「目录有卡片，点进去没有会话」。
+        </p>
+        <p>
+          <strong>坑三：所有副本共用一个 <code>instanceKey</code>，或者每次重启换一个。</strong>前者会让多个进程争同一份副本身份，
+          心跳与 generation 互相覆盖；后者会让「普通重启复用身份」失效，历史会话找不到原实例。官方要求不同副本不同值、同一副本重启保持稳定<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent-configuration.md:46"
+            >external-agent-configuration.md:46</span
+          >。
+        </p>
+        <p>
+          <strong>坑四：只验证了应用 → Service 一个方向。</strong>注册成功只证明这个方向通；控制面 → 应用的合约、应用 → ASDP listener 是另外两条链路<span
+            class="src"
+            data-src="docs/v2/zh/service/external-agent-configuration.md:36-40"
+            >external-agent-configuration.md:36-40</span
+          >。只开单向网络，最常见的结果就是「注册成功但什么都读不到」。
+        </p>
+        <p>
+          <strong>坑五：Agent 已经 build 完，再 <code>instrument</code>，然后等事件。</strong>会话查询、上下文、历史、命令都能用，
+          但 Level-2 事件不会出现，因为 middleware 列表已经固定<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/Aistio.java:46-48"
+            >Aistio.java:46-48</span
+          >。要事件就回到构建处挂 <code>adapter.middleware()</code>。
+        </p>
+        <p>
+          <strong>坑六：把 bootstrap token 当 Endpoint API key，或反过来。</strong>两者都是平台凭据，但用途完全不同：
+          bootstrap 只用于首次注册，<code>asep_</code> 才是调用 Endpoint 的凭据；注册凭据是 <code>asreg_</code> 前缀，由控制面签发<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/httpapi/agent_catalog_handler.go:89-96"
+            >agent_catalog_handler.go:89-96</span
+          >。Endpoint key 能在授权范围内再次 reveal<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/service-v5-api-contract.md:76"
+            >service-v5-api-contract.md:76</span
+          >，注册凭据的明文只在签发时返回一次<span
+            class="src"
+            data-src="agentscope-service/docs/controlplane/service-v5-api-contract.md:18"
+            >service-v5-api-contract.md:18</span
+          >；拿错了只会得到 401，换多少次都没用。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>只做 HTTP 注册（<code>startGrpc(false)</code>），能接 Issue 吗？</summary>
+          <p>
+            不能。HTTP 合约只提供查询与会话命令，没有任务提交路由；<code>ExecutionAttempt</code> 只从 ASDP 的
+            <code>onExecutionAttempt</code> 进入<span
+              class="src"
+              data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:702-718"
+              >SessionBridge.java:702-718</span
+            >。要接 Issue/Team，必须同时具备 ASDP 通道与真实的 <code>AgentTaskStarter</code>。
+          </p>
+        </details>
+        <details>
+          <summary>注册返回 201，控制台也能看到卡片，但会话列表是空的，先查什么？</summary>
+          <p>
+            先查控制面能不能回连 <code>AGENT_CONTRACT_URL</code>。注册成功证明「应用 → Service」通，不证明「控制面 → 应用」通；
+            <code>localhost</code>、错误端口、DNS 不可达都会让合约拉取失败<span
+              class="src"
+              data-src="docs/v2/zh/service/external-agent-configuration.md:36-40"
+              >external-agent-configuration.md:36-40</span
+            >。token 在这条链路上不是第一嫌疑。
+          </p>
+        </details>
+        <details>
+          <summary>两个副本用同一个 <code>agentKey</code>、不同 <code>instanceKey</code>，会创建两个 Agent 吗？</summary>
+          <p>
+            不会。逻辑身份是 <code>(tenant, namespace, agentKey)</code>，扩容只创建新的 <code>AgentInstance</code>，不会创建第二个逻辑 Agent<span
+              class="src"
+              data-src="agentscope-service/docs/controlplane/adr-0002-service-v5-agent-identity.md:25"
+              >adr-0002-service-v5-agent-identity.md:25</span
+            >。反过来说，<code>instanceKey</code> 相同才是问题：那不是扩容，是身份冲突。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：注册一个只读 Agent，再做一次故障演练</h2>
+        <p>目标不是「跑通」，而是能独立判断每一层坏在哪。建议 25 分钟，按顺序做，每步都留证据：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先验合约，不注册</span>
+            <div>只起 HTTP 合约（<code>startHttpRegister(false)</code>），访问 <code>/agentscope/health</code> 与 <code>/agentscope/info</code>，记录 contractLevel 与 capabilities。此时目录里应该<strong>没有</strong>卡片。</div>
+          </li>
+          <li>
+            <span class="sh">打开注册，核对三件套身份</span>
+            <div>打开注册，日志出现 registered 后，记录 agentId、bindingId、instanceId 与 generation。刷新目录，确认范围与 <code>agentKey</code> 一致。</div>
+          </li>
+          <li>
+            <span class="sh">重启一次，只改 generation</span>
+            <div>保持 <code>instanceKey</code> 不变重启，确认 agentId / bindingId 不变、generation 变化。如果 agentId 变了，说明身份没有复用。</div>
+          </li>
+          <li>
+            <span class="sh">扩一个副本，只改 instanceKey</span>
+            <div>再起一个进程，<code>agentKey</code> 相同、<code>instanceKey</code> 不同，确认目录里是同一个 Agent 下的两个实例，而不是两个 Agent。</div>
+          </li>
+          <li>
+            <span class="sh">跑一轮对话，读三层数据</span>
+            <div>依次读 <code>/sessions</code>、<code>/sessions/{id}/state</code>、<code>/sessions/{id}/messages?limit=5</code>，记录 phase 与消息条数。读不到就按「合约 URL → 端口 → token」顺序查。</div>
+          </li>
+          <li>
+            <span class="sh">故意打断回连</span>
+            <div>把 <code>AGENT_CONTRACT_URL</code> 改成一个控制面不可达的地址重启，观察目录与日志的差异；再改回来。把两次现象写进自己的排障笔记。</div>
+          </li>
+          <li>
+            <span class="sh">可选：接一次任务</span>
+            <div>如果部署有 ASDP，打开 <code>startGrpc(true)</code>、配 <code>controlPlane</code> 与 <code>AgentTaskStarter</code>，提交一个最小 Issue，分别验证成功与取消。没有 ASDP 就停在上一步，不要用 HTTP 路径硬凑。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          到这里，External 的三层边界已经拆完：目录身份靠注册事务，会话视图靠 HTTP 合约，任务派发靠 ASDP + Starter。
+          它和 Managed 最大的差别不是「谁更聪明」，而是<strong>责任落在谁身上</strong>：模型循环、工具凭据、任务幂等都在你的进程里。
+        </p>
+        <p>
+          下一章看 <strong>Hosted Agent 与 Runtime Host</strong>：同样是「不把 Agent 交给 Dataplane」，Hosted 换了一种做法——
+          不注册一个应用，而是把一台已经安装并登录 Coding Agent provider 的主机接进来，由 Service 发现、调度和恢复。
+          它和 External 的边界，正好是「应用」与「主机」的差别。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="23-hosted-agent.html">23 Hosted Agent 与 Runtime Host</a></td><td>把「注册一个应用」换成「接入一台主机」：claim 主循环、provider 能力与恢复条件</td></tr>
+              <tr><td>官方「External Agent：概览与接入用法」</td><td>两条路径、Java/Python 片段与验收顺序<span class="src" data-src="docs/v2/zh/service/external-agent.md:20-29">external-agent.md:20-29</span></td></tr>
+              <tr><td>官方「External 注册与连接参数」</td><td>SDK 参数对照、网络方向与身份生命周期<span class="src" data-src="docs/v2/zh/service/external-agent-configuration.md:12-48">external-agent-configuration.md:12-48</span></td></tr>
+              <tr><td>官方「External 工作原理与任务派发」</td><td>三层验收与一次 Attempt 的执行过程<span class="src" data-src="docs/v2/zh/service/external-agent-execution.md:23-43">external-agent-execution.md:23-43</span></td></tr>
+              <tr><td><a href="21-managed-agent-deep.html">21 Managed Agent 深入</a></td><td>对照「Service 托管」那一侧的职责与资源</td></tr>
+              <tr><td><a href="20-endpoints-sse.html">20 Endpoint 与 SSE</a></td><td>External 应用也可以被发布成 Endpoint，调用侧协议在这一章</td></tr>
+              <tr><td><a href="../appendix/errors.html">附录 B · 报错速查</a></td><td>401 / 403 / 409 的通用排查顺序</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的 External 文档在 2.0.4 仓库里仍带「预览」提示<span class="src" data-src="docs/v2/zh/service/external-agent.md:6-8">external-agent.md:6-8</span>。
+          凡文档与实现有出入的地方（例如 Javadoc 路由表、HTTP 注册的 <code>sdkVersion</code>），正文都以源码为准并标了出来。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

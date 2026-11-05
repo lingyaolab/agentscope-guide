@@ -1,0 +1,914 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 01 章我们只验证了「&quot;dashscope:qwen-plus&quot; 能不能被解析」，第 02 章直接把它塞进了 builder。这一章回答的是剩下的一半问题：这个字符串凭什么变成一个模型对象、参数在哪里调、挂了怎么重试、怎么降级、怎么让它输出一个 Java 对象而不是一段散文。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="05 模型层：字符串 id、重试降级与结构化输出 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 01 章我们只验证了「&quot;dashscope:qwen-plus&quot; 能不能被解析」，第 02 章直接把它塞进了 builder。这一章回答的是剩下的一半问题：这个字符串凭什么变成一个模型对象、参数在哪里调、挂了怎么重试、怎么降级、怎么让它输出一个 Java 对象而不是一段散文。" />
+    <title>05 模型层：字符串 id、重试降级与结构化输出 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="05-model" data-root="..">
+    <main>
+      <article class="article">
+        <h1>05 · 模型层</h1>
+        <p class="lede">
+          第 01 章我们只验证了「<code>"dashscope:qwen-plus"</code> 能不能被解析」，第 02 章直接把它塞进了 builder。这一章回答的是剩下的一半问题：
+          这个字符串<strong>凭什么</strong>变成一个模型对象、参数在哪里调、挂了怎么重试、怎么降级、怎么让它输出一个 Java 对象而不是一段散文。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>判断一个场景该用字符串 id 还是显式 builder，并说出各自的代价</li>
+          <li>解释 <code>maxRetries(3)</code> 到底是「重试 3 次」还是「一共 3 次」，以及重试间隔从哪来</li>
+          <li>配出一个「主模型 + 备用模型」的降级链路，并知道它在<strong>什么时刻不会生效</strong></li>
+          <li>让 <code>agent.call(...)</code> 直接返回一个 POJO，而不是让模型自由发挥</li>
+        </ul>
+
+        <h2 id="why">先说为什么：两种建模型的方式，不是「新旧」而是「场景」</h2>
+        <p>
+          框架给了两条路建模型，很多人以为显式 builder 是「高级用法」、字符串 id 是「简陋用法」，其实它们解决的是两个不同问题：
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h4>字符串 id：<code>.model("dashscope:qwen-plus")</code></h4>
+            <ul>
+              <li><strong>编译期只依赖 core</strong>，代码里不出现任何厂商类</li>
+              <li>换厂商 = 改一行字符串 + 换一个 Maven 依赖</li>
+              <li>代价：key 只能来自环境变量，参数只能用默认值</li>
+              <li>适合：教学、CLI 工具、配置驱动的多租户场景</li>
+            </ul>
+          </div>
+          <div class="col pick">
+            <h4>显式 builder：<code>.model(dashScopeModel)</code></h4>
+            <ul>
+              <li>能设 <code>baseUrl</code>（反代 / 私有化端点）、<code>formatter</code>、<code>defaultOptions</code></li>
+              <li>key 可以从配置中心、数据库、Vault 里取</li>
+              <li>代价：编译期就要依赖具体厂商模块，换厂商要改代码</li>
+              <li>适合：生产服务、需要精细控参的场景</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          官方文档给的判断标准很干脆：简单场景用 <code>provider:model</code> 格式 + 标准环境变量；需要精细控制时，优先用显式 builder<span
+            class="src"
+            data-src="docs/v2/zh/docs/building-blocks/model.md:163"
+            >model.md:163</span
+          >。换句话说，字符串 id 不是「简化版 builder」，而是<strong>一套运行时发现机制</strong>（下一节就拆它）。
+        </p>
+
+        <h2 id="minimal">最小可跑：把字符串换成完全可控的模型</h2>
+        <p>
+          第 02 章的写法是 <code>.model("dashscope:qwen-plus")</code>。下面这段做同一件事，但把 key、参数、formatter 全部摊开：
+        </p>
+        <pre data-lang="java" data-file="ExplicitModel.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.model.GenerateOptions;
+import io.agentscope.core.tool.Toolkit;
+import io.agentscope.extensions.model.dashscope.DashScopeChatModel;
+import io.agentscope.extensions.model.dashscope.formatter.DashScopeChatFormatter;
+
+DashScopeChatModel model =
+        DashScopeChatModel.builder()
+                .apiKey(System.getenv("DASHSCOPE_API_KEY"))
+                .modelName("qwen-plus")
+                .stream(true)
+                .formatter(new DashScopeChatFormatter())
+                .defaultOptions(
+                        GenerateOptions.builder()
+                                .temperature(0.3)
+                                .maxTokens(1024)
+                                .build())
+                .build();
+
+ReActAgent agent =
+        ReActAgent.builder()
+                .name("Assistant")
+                .sysPrompt("你是一个简洁的助手，回答不超过三句话。")
+                .model(model)
+                .toolkit(new Toolkit())
+                .build();</pre>
+        <p class="src-line">
+          builder 三个典型场景（流式 / 工具 / 推理）：<span
+            class="src"
+            data-src="docs/v2/zh/docs/building-blocks/model.md:226"
+            >model.md:226</span
+          >；<code>defaultOptions</code> 加载：<span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeChatModel.java:538"
+            >DashScopeChatModel.java:538</span
+          >；<code>agent.model(Model)</code>：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4921"
+            >ReActAgent.java:4921</span
+          >
+        </p>
+        <div class="callout tip">
+          <span class="ct">这两段代码有个隐藏差异：谁来管生命周期</span>
+          <p>
+            用字符串 id 时，模型实例由 <code>ModelRegistry</code> 创建并<strong>缓存复用</strong>——同一个 id 解析两次拿到的是同一个对象；
+            用显式 builder 时，对象是你 <code>new</code> 出来的，你想复用就自己持有，想每次都新建也随你。
+          </p>
+        </div>
+
+        <h2 id="line-by-line">逐行解读：builder 字段与 <code>Model</code> 接口</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>字段</th>
+                <th>类型</th>
+                <th>说明与常见坑</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>apiKey</code></td>
+                <td><code>String</code></td>
+                <td>直接给 key。部分提供商还支持 <code>credential(...)</code> 方式注入，适合要做 key 轮换的场景。</td>
+              </tr>
+              <tr>
+                <td><code>modelName</code></td>
+                <td><code>String</code></td>
+                <td>注意这里是<strong>裸模型名</strong>（<code>"qwen-plus"</code>），不要带 <code>dashscope:</code> 前缀。</td>
+              </tr>
+              <tr>
+                <td><code>stream</code></td>
+                <td><code>boolean</code></td>
+                <td>是否流式。字符串 id 解析出来的 DashScope 模型默认就是 <code>true</code>。</td>
+              </tr>
+              <tr>
+                <td><code>defaultOptions</code></td>
+                <td><code>GenerateOptions</code></td>
+                <td>每次调用都带的默认生成参数；单次调用还可以再覆盖。</td>
+              </tr>
+              <tr>
+                <td><code>formatter</code></td>
+                <td><code>Formatter</code></td>
+                <td>决定 <code>Msg</code> 怎么被翻译成厂商的请求体。只有多 agent 场景才需要换成 MultiAgent 版本。</td>
+              </tr>
+              <tr>
+                <td><code>baseUrl</code></td>
+                <td><code>String</code></td>
+                <td>改端点。反代、私有化部署、OpenAI 兼容网关都靠它。</td>
+              </tr>
+              <tr>
+                <td><code>enableThinking</code></td>
+                <td><code>Boolean</code></td>
+                <td>只对支持「思考模式」的模型有意义（如 qwen3 thinking 系列）。开了之后结构化输出会强制走 fallback，见后文。</td>
+              </tr>
+              <tr>
+                <td><code>nativeStructuredOutput</code></td>
+                <td><code>boolean</code></td>
+                <td>强制开启 native 结构化输出路径。<strong>只有你确认端点支持 <code>json_schema</code> 时才开</strong>。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          这些 builder 方法在 <code>DashScopeChatModel</code> 里的位置：<code>apiKey</code> <span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeChatModel.java:464"
+            >:464</span
+          >、<code>modelName</code> <span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeChatModel.java:478"
+            >:478</span
+          >、<code>stream</code> <span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeChatModel.java:489"
+            >:489</span
+          >、<code>enableThinking</code> <span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeChatModel.java:500"
+            >:500</span
+          >、<code>formatter</code> <span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeChatModel.java:560"
+            >:560</span
+          >、<code>nativeStructuredOutput</code> <span
+            class="src"
+            data-src="agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeChatModel.java:695"
+            >:695</span
+          >
+        </p>
+        <h3 id="model-interface">所有模型都实现同一个接口</h3>
+        <p>
+          不管你用哪个厂商，最后交给 agent 的都是 <code>Model</code>。它只有 5 个方法，其中只有第一个是必须实现的：
+        </p>
+        <pre data-lang="java" data-file="io.agentscope.core.model.Model">Flux&lt;ChatResponse&gt; stream(List&lt;Msg&gt; messages, List&lt;ToolSchema&gt; tools, GenerateOptions options);
+String getModelName();
+default boolean supportsNativeStructuredOutput() { ... }
+default boolean supportsNativeStructuredOutputWithTools() { ... }
+default int getContextWindowSize() { ... }</pre>
+        <p class="src-line">
+          <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/Model.java:33">Model.java:33</span>、<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/Model.java:51"
+            >:51</span
+          >、<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/Model.java:82">:82</span>
+        </p>
+        <p>
+          注意 <code>stream()</code> 返回的是 <code>Flux&lt;ChatResponse&gt;</code>——<strong>模型层也是响应式的</strong>，和 03 章讲的是同一套规矩：不订阅就不会发请求。一个
+          <code>ChatResponse</code> 里装的是若干内容块 + token 用量 + 结束原因<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/ChatResponse.java:31"
+            >ChatResponse.java:31</span
+          >，它会被 agent 转成 <code>AgentEvent</code>（04 章那 31 个类型）。
+        </p>
+        <p>
+          如果你要自己实现一个厂商适配，只需要继承 <code>ChatModelBase</code> 并实现 <code>doStream(...)</code>——基类已经把
+          <code>stream(...)</code> 做成 <code>final</code>，帮你统一处理了流式协议差异<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/ChatModelBase.java:78"
+            >ChatModelBase.java:78</span
+          >。
+        </p>
+
+        <h2 id="resolve">端到端：一个字符串怎么变成模型对象</h2>
+        <p>
+          <code>ModelRegistry.resolve()</code> 的查找顺序是写死在代码里的四步，顺序不能变<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:99"
+            >ModelRegistry.java:99</span
+          >：
+        </p>
+        <ul class="timeline">
+          <li>
+            <div class="who">① 具名注册</div>
+            <div class="what">先查 <code>register(name, model)</code> 直接放进去的现成实例。这一层优先级最高，可以覆盖任何厂商解析<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:61">ModelRegistry.java:61</span></div>
+          </li>
+          <li>
+            <div class="who">② 缓存</div>
+            <div class="what">同样的 id 且上下文允许缓存，就直接返回上次创建的对象，不再走后面的步骤<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:131">ModelRegistry.java:131</span></div>
+          </li>
+          <li>
+            <div class="who">③ 用户工厂</div>
+            <div class="what">按正则匹配你自己 <code>registerFactory("myprov:.*", ...)</code> 注册的工厂。这一层优先于 SPI，所以你可以「用假模型顶替真模型」做测试<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:139">ModelRegistry.java:139</span></div>
+          </li>
+          <li>
+            <div class="who">④ SPI 发现</div>
+            <div class="what">扫描 classpath 上所有 <code>META-INF/services/io.agentscope.core.model.spi.ModelProvider</code>，逐个问 <code>supports(id)</code>，第一个说「支持」的负责创建<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:239">ModelRegistry.java:239</span></div>
+          </li>
+        </ul>
+        <div class="callout warn">
+          <span class="ct">两个 provider 同时说「我支持」，会悄悄用第一个</span>
+          <p>
+            如果你同时引了两个厂商模块，而它们的 <code>supports()</code> 正则都覆盖了同一个 id（比如某家的短写规则很宽），注册表会打一条
+            <code>Multiple ModelProvider implementations support model id ... Using the first discovered
+            provider.</code> 的 warn，然后<strong>继续用第一个</strong>，不报错<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:256"
+              >ModelRegistry.java:256</span
+            >。所以看到「模型行为不对、像是别家的」时，先去日志里搜这条 warn。
+          </p>
+        </div>
+        <p>
+          失败也是分层的，这也是 01 章留下的问题在这里收口：找不到任何 provider →
+          <code>Cannot resolve model</code>；找到了但创建过程抛异常 → <strong>包一层</strong>
+          <code>Failed to create model for id: ...</code><span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:163"
+            >ModelRegistry.java:163</span
+          >。两者都抛 <code>IllegalArgumentException</code>，但含义完全不同。
+        </p>
+
+        <h3 id="cache-policy">缓存策略：为什么带 context 就不缓存了</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>策略</th>
+                <th>行为</th>
+                <th>什么时候用</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>DEFAULT</code></td>
+                <td><code>resolve(id)</code> 按 id 缓存；<code>resolve(id, 非空context)</code> 不缓存</td>
+                <td>默认。单租户 / 单配置时最省事</td>
+              </tr>
+              <tr>
+                <td><code>DISABLED</code></td>
+                <td>永不缓存，每次都是新实例</td>
+                <td>每次调用要用不同的 key 或 endpoint</td>
+              </tr>
+              <tr>
+                <td><code>ENABLED</code></td>
+                <td>显式开启；建议用 <code>cacheId(...)</code> 表达「租户 + 配置」这一层身份</td>
+                <td>多租户网关，但每个租户内部可以复用</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          这条规则背后的理由很朴素：不同租户的 apiKey / baseUrl / stream 配置不一样，<strong>复用同一个模型实例等于把 A 的凭证给了 B</strong>。所以带上下文的解析默认不缓存；如果你确实要缓存，必须显式给一个 <code>cacheId</code>，否则遇到
+          <code>option(...)</code> / <code>component(...)</code> 时会直接抛
+          <code>ModelCreationContext cachePolicy(ENABLED) with options or components requires an explicit cacheId</code
+          ><span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:296"
+            >ModelRegistry.java:296</span
+          >。
+        </p>
+        <p class="src-line">
+          缓存 key 里 apiKey 不是明文，而是 SHA-256 摘要，避免堆转储和日志里泄露<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:307"
+            >ModelRegistry.java:307</span
+          >
+        </p>
+
+        <h2 id="failure">重试与降级：<code>maxRetries</code> 和 <code>fallbackModel</code> 的真实语义</h2>
+        <p>这是本章最值得逐字读源码的一段，因为两个参数的直觉理解<strong>都是错的</strong>。</p>
+        <h3 id="max-retries">第一件事：<code>maxRetries(3)</code> 不是「重试 3 次」</h3>
+        <p>
+          <code>ModelConfig</code> 的注释写得很清楚：<code>maxRetries</code> 是「单次模型调用的重试预算」，而默认值
+          <code>DEFAULT_MAX_RETRIES = 3</code><span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/agent/config/ModelConfig.java:36"
+            >ModelConfig.java:36</span
+          >。它被传给 <code>ExecutionConfig.maxAttempts</code>，而 <code>maxAttempts</code>
+          的语义是<strong>「包含第一次在内的总尝试次数」</strong>——<code>maxAttempts=3</code> 意思是 1 次初始 + 2 次重试<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/ExecutionConfig.java:316"
+            >ExecutionConfig.java:316</span
+          >。
+        </p>
+        <p>重试并不只是「再试一次」这么简单，<code>ModelConfig</code> 只决定次数，其余参数来自 <code>ExecutionConfig</code> 的模型默认值：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>参数</th>
+                <th>默认值</th>
+                <th>含义</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>timeout</td>
+                <td>5 分钟</td>
+                <td>单次尝试的超时上限</td>
+              </tr>
+              <tr>
+                <td>maxAttempts</td>
+                <td>3</td>
+                <td>总共最多试 3 次</td>
+              </tr>
+              <tr>
+                <td>initialBackoff</td>
+                <td>2 秒</td>
+                <td>第一次重试前等多久</td>
+              </tr>
+              <tr>
+                <td>maxBackoff</td>
+                <td>30 秒</td>
+                <td>退避上限（指数增长封顶）</td>
+              </tr>
+              <tr>
+                <td>backoffMultiplier</td>
+                <td>2.0</td>
+                <td>每次退避时长翻倍：2s → 4s → 8s …</td>
+              </tr>
+              <tr>
+                <td>retryOn</td>
+                <td><code>RETRYABLE_ERRORS</code></td>
+                <td>只重试 429、5xx、超时、网络错误；<strong>400 这类参数错误不重试</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          全部默认值：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/ExecutionConfig.java:145"
+            >ExecutionConfig.java:145</span
+          >；重试谓词的实现：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/model/ExecutionConfig.java:94"
+            >ExecutionConfig.java:94</span
+          >
+        </p>
+
+        <h3 id="fallback-model">第二件事：<code>fallbackModel</code> 只兜「第一次就失败」</h3>
+        <pre data-lang="java" data-file="ResilientAgent.java">import io.agentscope.core.ReActAgent;
+import io.agentscope.core.tool.Toolkit;
+
+ReActAgent agent =
+        ReActAgent.builder()
+                .name("Resilient")
+                .sysPrompt("你是一个简洁的助手。")
+                .model("dashscope:qwen-plus")
+                .maxRetries(4)
+                .fallbackModel("openai:gpt-5.5")
+                .failoverListener(
+                        (primary, error) -&gt;
+                                System.err.println(
+                                        "主模型 " + primary.getModelName() + " 失败：" + error.getMessage()))
+                .toolkit(new Toolkit())
+                .build();</pre>
+        <p class="src-line">
+          <code>maxRetries</code>：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5196"
+            >ReActAgent.java:5196</span
+          >；<code>fallbackModel(Model)</code> 与 <code>fallbackModel(String)</code>：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5208"
+            >:5208</span
+          >、<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5220"
+            >:5220</span
+          >；<code>FailoverListener</code> 签名：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/agent/config/FailoverListener.java:50"
+            >FailoverListener.java:50</span
+          >
+        </p>
+        <p>降级的实现只有一个算子：<code>switchOnFirst</code>。</p>
+        <pre data-lang="java" data-file="ReActAgent.java（节选，:4286-4302）">Flux&lt;ChatResponse&gt; primaryFlux =
+        Flux.defer(() -&gt; model.stream(messages, tools, options));
+return primaryFlux.switchOnFirst(
+        (signal, flux) -&gt; {
+            if (signal.isOnError()) {
+                // 只有「第一个信号就是 error」时才切
+                notifyFailover(failoverListener, model, error);
+                return fallbackModel.stream(messages, tools, options);
+            }
+            return flux;
+        });</pre>
+        <p class="src-line">
+          完整实现：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4273"
+            >ReActAgent.java:4273</span
+          >
+        </p>
+        <div class="callout danger">
+          <span class="ct">三个反直觉的结论</span>
+          <p>
+            ① <strong>流到一半才断，不会切备用模型。</strong>只要主模型已经吐出过任何一条数据，<code>switchOnFirst</code>
+            就走 <code>return flux</code> 分支，后面的错误原样往上传。<br />
+            ② <strong>备用模型共享同一份重试预算。</strong><code>ModelConfig</code> 的注释写明 fallback 与主模型共用
+            <code>maxRetries</code><span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/agent/config/ModelConfig.java:22"
+              >ModelConfig.java:22</span
+            >，不是「主模型用完 3 次、备用再给 3 次」。<br />
+            ③ <strong>监听器自己抛异常不会影响降级。</strong><code>notifyFailover</code> 会把异常吞掉只打 warn<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4327"
+              >ReActAgent.java:4327</span
+            >，所以别在监听器里做「必须成功」的业务。
+          </p>
+        </div>
+        <p>
+          还有一点容易忽略：<code>fallbackModel</code> 是 <code>@JsonIgnore</code> 的<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/agent/config/ModelConfig.java:33"
+            >ModelConfig.java:33</span
+          >。它持有连接和凭证，不会随 <code>AgentState</code> 一起序列化，所以<strong>恢复会话时它不会自动回来</strong>——降级链是你代码里的配置，不是会话状态的一部分。
+        </p>
+
+        <h2 id="structured">结构化输出：让模型交一个对象出来</h2>
+        <p>
+          只要最终文本、不要自由发挥时，用带 <code>Class</code> 的 <code>call</code> 重载。先定义一个普通 POJO（字段用 <code>public</code> 最省事）：
+        </p>
+        <pre data-lang="java" data-file="WeatherInfo.java">public class WeatherInfo {
+    public String city;
+    public double temperature;
+    public String unit;
+}</pre>
+        <pre data-lang="java" data-file="StructuredCall.java">import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.UserMessage;
+import java.util.List;
+
+Msg msg =
+        agent.call(
+                        List.of(new UserMessage("上海现在天气怎么样？")),
+                        WeatherInfo.class,
+                        RuntimeContext.empty())
+                .block();
+
+WeatherInfo info = msg.getStructuredData(WeatherInfo.class);
+System.out.println(info.city + " " + info.temperature + info.unit);</pre>
+        <p class="src-line">
+          <code>call(List, Class, RuntimeContext)</code>：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:853"
+            >ReActAgent.java:853</span
+          >；取结果：<span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:431"
+            >Msg.java:431</span
+          >。结果最终挂在 <code>metadata</code> 的 <code>_structured_output</code> 上
+        </p>
+        <p>框架内部有两条路径，你不用选，但要知道自己走在哪条上：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>路径</th>
+                <th>条件</th>
+                <th>机制</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Native</strong></td>
+                <td><code>supportsNativeStructuredOutput() = true</code></td>
+                <td>用 <code>response_format</code> + <code>json_schema</code> 让模型直接吐合规 JSON</td>
+              </tr>
+              <tr>
+                <td><strong>Fallback</strong>（默认）</td>
+                <td>返回 <code>false</code></td>
+                <td>注入一个叫 <code>generate_response</code> 的合成工具，模型「调工具」来交答卷</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>各厂商的默认行为不一样，这是接入时最容易踩的坑：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>提供商</th>
+                <th>native 支持</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>OpenAI（GPT-4o 等）</td>
+                <td>是</td>
+                <td>原生支持 <code>json_schema</code></td>
+              </tr>
+              <tr>
+                <td>OpenAI Official（Responses API）</td>
+                <td>是</td>
+                <td>原生支持</td>
+              </tr>
+              <tr>
+                <td>OpenAI 兼容（DeepSeek / GLM formatter）</td>
+                <td>否</td>
+                <td>自动走 fallback</td>
+              </tr>
+              <tr>
+                <td>DashScope</td>
+                <td>否</td>
+                <td>原生端点只支持 <code>json_object</code>，不支持 <code>json_schema</code>，默认 fallback</td>
+              </tr>
+              <tr>
+                <td>Anthropic</td>
+                <td>否（默认）</td>
+                <td>—</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          native 路径失败时（比如端点返回 400），框架会<strong>自动降级</strong>到 fallback，不需要你写 try-catch。但有一个例外要记住：
+          <strong>DashScope 开了 <code>enableThinking(true)</code> 就不支持结构化输出</strong>，框架会强制走 fallback<span
+            class="src"
+            data-src="docs/v2/zh/docs/building-blocks/model.md:394"
+            >model.md:394</span
+          >。
+        </p>
+        <div class="callout tip">
+          <span class="ct">同时用工具 + 结构化输出，有兼容问题</span>
+          <p>
+            部分 OpenAI 兼容 API（Kimi、DeepSeek 等）看到 <code>response_format</code> 后就不调工具了。解法是把
+            <code>nativeStructuredOutputWithTools(false)</code> 打开<span
+              class="src"
+              data-src="docs/v2/zh/docs/building-blocks/model.md:410"
+              >model.md:410</span
+            >；OpenAI 原生模型（GPT-4o 等）不需要设。
+          </p>
+        </div>
+
+        <h2 id="formatter">Formatter：多 agent 场景唯一需要改的一行</h2>
+        <p>
+          <code>Formatter</code> 负责把 <code>List&lt;Msg&gt;</code> 翻译成厂商要的请求载荷。每个厂商内置两种：
+          <code>ChatFormatter</code>（默认，一条 <code>Msg</code> 对一条 API 消息，保留原始角色）和
+          <code>MultiAgentFormatter</code>（把连续的 agent 消息聚合，并在文本里标注发言人）。
+        </p>
+        <pre data-lang="java" data-file="MultiAgentFormatter.java">import io.agentscope.extensions.model.dashscope.DashScopeChatModel;
+import io.agentscope.extensions.model.dashscope.formatter.DashScopeMultiAgentFormatter;
+
+DashScopeChatModel model =
+        DashScopeChatModel.builder()
+                .apiKey(System.getenv("DASHSCOPE_API_KEY"))
+                .modelName("qwen-plus")
+                .stream(true)
+                .formatter(new DashScopeMultiAgentFormatter())   // 只改这一行
+                .build();</pre>
+        <p class="src-line">
+          两种 formatter 的职责对比：<span
+            class="src"
+            data-src="docs/v2/zh/docs/building-blocks/model.md:427"
+            >model.md:427</span
+          >；六家厂商的 formatter 类名对照表：<span
+            class="src"
+            data-src="docs/v2/zh/docs/building-blocks/model.md:449"
+            >model.md:449</span
+          >
+        </p>
+        <p>
+          为什么需要它：大多数厂商的 API 只认 <code>user</code> / <code>assistant</code> / <code>system</code>
+          三种角色，而多 agent 场景下可能有五个「assistant」互相说话。不聚合的话，模型根本分不清哪句是同事说的、哪句是自己之前说的。
+        </p>
+
+        <h2 id="cheatsheet">速查</h2>
+        <h3 id="model-classes">六家厂商的模型类</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>提供商</th>
+                <th>模型类</th>
+                <th>特点</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>OpenAI</td>
+                <td><code>OpenAIChatModel</code></td>
+                <td>Chat Completions，兼容 vLLM 与 OpenAI 兼容端点（含 DeepSeek、Kimi）</td>
+              </tr>
+              <tr>
+                <td>OpenAI Official</td>
+                <td><code>OpenAIResponsesChatModel</code></td>
+                <td>Responses API（官方 SDK），推理与结构化输出</td>
+              </tr>
+              <tr>
+                <td>Anthropic</td>
+                <td><code>AnthropicChatModel</code></td>
+                <td>Claude，支持 prompt 缓存与 thinking</td>
+              </tr>
+              <tr>
+                <td>DashScope</td>
+                <td><code>DashScopeChatModel</code></td>
+                <td>Qwen，多模态（视觉/音频/视频）与推理</td>
+              </tr>
+              <tr>
+                <td>Gemini</td>
+                <td><code>GeminiChatModel</code></td>
+                <td>Google Gemini，多模态</td>
+              </tr>
+              <tr>
+                <td>Ollama</td>
+                <td><code>OllamaChatModel</code></td>
+                <td>本地托管，凭证可选（唯一不需要 key 的）</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-line">
+          表格来源：<span class="src" data-src="docs/v2/zh/docs/building-blocks/model.md:213">model.md:213</span>
+        </p>
+
+        <h3 id="want-table">「我想…」对照表</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>我想</th>
+                <th>怎么写</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>快速起步，不写厂商代码</td>
+                <td><code>.model("dashscope:qwen-plus")</code> + 环境变量</td>
+              </tr>
+              <tr>
+                <td>改端点 / key 来源 / 温度</td>
+                <td><code>DashScopeChatModel.builder()...</code> 后 <code>.model(model)</code></td>
+              </tr>
+              <tr>
+                <td>多加几次重试</td>
+                <td><code>.maxRetries(5)</code>（总尝试次数，不是重试次数）</td>
+              </tr>
+              <tr>
+                <td>主模型挂了换一家</td>
+                <td><code>.fallbackModel("openai:gpt-5.5")</code> + <code>.failoverListener(...)</code></td>
+              </tr>
+              <tr>
+                <td>用测试假模型顶替真模型</td>
+                <td><code>ModelRegistry.registerFactory("test:.*", id -&gt; fakeModel)</code></td>
+              </tr>
+              <tr>
+                <td>让模型交一个 POJO</td>
+                <td><code>agent.call(msgs, MyPojo.class, ctx).block().getStructuredData(MyPojo.class)</code></td>
+              </tr>
+              <tr>
+                <td>多 agent 共用一套历史</td>
+                <td>换 <code>XxxMultiAgentFormatter</code></td>
+              </tr>
+              <tr>
+                <td>自定义厂商</td>
+                <td>继承 <code>CredentialBase</code> + <code>ChatModelBase</code>，再 <code>registerFactory</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+
+        <div class="pitfall">
+          <div class="pf-h">1. 以为 <code>maxRetries(3)</code> 会打 4 次请求</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>算成本、算超时的时候对不上，日志里只看到 3 次。</dd>
+            <dt>因为</dt>
+            <dd>它是总尝试次数（<code>maxAttempts</code>），不是「重试次数」。3 = 1 次初始 + 2 次重试。</dd>
+            <dt>改成</dt>
+            <dd>想放宽到「最多重试 3 次」就写 <code>.maxRetries(4)</code>。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">2. 以为配了 <code>fallbackModel</code> 就万无一失</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>流式输出到一半断了，报错直接冒到用户那里，备用模型完全没动。</dd>
+            <dt>因为</dt>
+            <dd><code>switchOnFirst</code> 只检查<strong>第一个信号</strong>。已经吐过数据就不再切。</dd>
+            <dt>改成</dt>
+            <dd>这类场景要在<strong>调用层</strong>兜底：整条流加 <code>.onErrorResume(e -&gt; 重试或降级)</code>；或者用更小的超时与更严格的熔断，让失败尽早发生。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">3. 用字符串 id 却想改温度</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>不知道在哪传 <code>temperature</code>；或者改了「模型」却发现别的请求也变了。</dd>
+            <dt>因为</dt>
+            <dd>字符串 id 只带 <code>provider:model</code>，参数只能用默认值；而且默认按 id 缓存同一个实例，改它等于改全局。</dd>
+            <dt>改成</dt>
+            <dd>要控参就用显式 builder；实在要用字符串，就在 agent 层用 <code>.generateOptions(...)</code> 覆盖单次调用。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">4. 开了 thinking 还指望 native 结构化输出</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>结构化输出能跑，但日志里没有 <code>response_format</code>，或者行为和你预期的不一样。</dd>
+            <dt>因为</dt>
+            <dd>DashScope 的思考模式不支持结构化输出，框架会强制走 fallback（合成工具）路径。</dd>
+            <dt>改成</dt>
+            <dd>要么关掉 thinking，要么接受 fallback；不要把「必须走 native」当成硬需求。</dd>
+          </dl>
+        </div>
+
+        <div class="pitfall">
+          <div class="pf-h">5. 单 agent 也套 MultiAgentFormatter</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>消息角色边界变得模糊，模型偶尔「把系统提示当成用户说的」。</dd>
+            <dt>因为</dt>
+            <dd>MultiAgentFormatter 会把连续的同角色消息<strong>聚合成一条</strong>并加发言人标注，这本来是为多 agent 设计的。</dd>
+            <dt>改成</dt>
+            <dd>只有真的有两个以上 agent 在同一段历史里说话时才用它；单 agent 保持 <code>ChatFormatter</code>。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary><code>maxRetries(4)</code> 最多会发出几次模型请求？</summary>
+          <p>
+            最多 4 次（1 次初始 + 3 次重试）。而且只有 429 / 5xx / 超时 / 网络错误才会重试，400 这类参数错误一次就结束<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/model/ExecutionConfig.java:139"
+              >ExecutionConfig.java:139</span
+            >。
+          </p>
+        </details>
+        <details>
+          <summary>哪些情况下 <code>fallbackModel</code> 不会生效？</summary>
+          <p>下面四种都不会切：</p>
+          <ul>
+            <li>
+              ① <strong>主模型已经吐出过至少一条数据，之后才失败</strong>——<code>switchOnFirst</code>
+              已经走了正常分支，错误原样往上传<span
+                class="src"
+                data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4288"
+                >ReActAgent.java:4288</span
+              >；
+            </li>
+            <li>② 主模型正常结束，只是回答不满意——没有 error 就没有降级；</li>
+            <li>
+              ③ 主模型在<strong>构造阶段</strong>就解析失败——<code>.fallbackModel("openai:gpt-5.5")</code> 在 builder
+              里就调用 <code>ModelRegistry.resolve</code><span
+                class="src"
+                data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5220"
+                >ReActAgent.java:5220</span
+              >，解析不出来直接抛 <code>IllegalArgumentException</code>，根本进不到运行时；
+            </li>
+            <li>④ <strong>备用模型自己失败</strong>——降级链只有一层，fallback 没有「再 fallback」。</li>
+          </ul>
+          <p>
+            另外别把 <code>retryOn</code> 和「降级」混为一谈：重试发生在模型内部（<code>Retry.backoff(maxAttempts - 1)</code> +
+            <code>filter(retryOn)</code>，<span
+              class="src"
+              data-src="agentscope-core/src/main/java/io/agentscope/core/model/ModelUtils.java:117"
+              >ModelUtils.java:117</span
+            >），整段重试序列对 <code>switchOnFirst</code> 只暴露<strong>一个终态 error</strong>。所以不可重试的错误（比如 400）会
+            <strong>立刻</strong>以首个信号 error 触发降级——「不重试」恰恰意味着「更快切 fallback」。
+          </p>
+        </details>
+        <details>
+          <summary>为什么 DashScope 的结构化输出默认走 fallback？</summary>
+          <p>
+            因为 DashScope 原生端点只支持 <code>json_object</code>，不支持 <code>json_schema</code>，
+            <code>supportsNativeStructuredOutput()</code> 返回 <code>false</code>，于是框架注入一个
+            <code>generate_response</code> 合成工具让模型通过 tool call 交结构化数据。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">把两条路都跑一遍，对比对象</span>
+            <div>
+              分别打印 <code>ModelRegistry.resolve("dashscope:qwen-plus").getClass().getName()</code> 和你自己
+              <code>builder()</code> 出来的对象，再连续 <code>resolve</code> 两次比较 <code>==</code> 是否为 <code>true</code>。你会亲眼确认「字符串 id 走缓存」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">数一次真实的重试</span>
+            <div>
+              把 <code>apiKey</code> 设成一个格式正确但无效的值，配 <code>.maxRetries(2)</code>，用 <code>doOnError</code>
+              打印总耗时。观察它是「立刻失败」还是「等了 2 秒才失败」——这能帮你区分「不可重试」和「重试后仍失败」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">让模型交一个带嵌套结构的对象</span>
+            <div>
+              把 <code>WeatherInfo</code> 改成含 <code>List&lt;String&gt; alerts</code> 和内部类
+              <code>Wind</code> 的结构，跑一次 <code>getStructuredData</code>。这是 11 章综合案例里「解析模型决策」的基础。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          模型只是「会说话」，真正让它能干活的是工具。下一章 <a href="06-tool.html">06 工具系统</a>：<code>@Tool</code>
+          注解怎么变成 JSON Schema、四种注册路径怎么选、MCP 怎么接、以及为什么工具返回值也会变成事件流。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>想确认的事</th>
+                <th>去哪看</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>官方模型层总览（两层结构 Credential / ChatModel）</td>
+                <td><span class="src" data-src="docs/v2/zh/docs/building-blocks/model.md:7">model.md:7</span></td>
+              </tr>
+              <tr>
+                <td>自定义提供商的三个步骤</td>
+                <td><span class="src" data-src="docs/v2/zh/docs/building-blocks/model.md:460">model.md:460</span></td>
+              </tr>
+              <tr>
+                <td>ModelCard 与模型发现</td>
+                <td><span class="src" data-src="docs/v2/zh/docs/building-blocks/model.md:549">model.md:549</span></td>
+              </tr>
+              <tr>
+                <td>降级链的真实实现</td>
+                <td>
+                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4273">ReActAgent.java:4273</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

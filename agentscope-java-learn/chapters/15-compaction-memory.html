@@ -1,0 +1,1261 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 14 章解决「谁去做」，这一章解决「装不下怎么办、记住了放哪」。框架里有四件经常被混为一谈的事：压缩（把前缀换成一条摘要）、结果逐出（单条工具输出太大就落盘）、记忆（把事实写进 MEMORY.md 与日流水账）、转写（每一轮都追加到会话 JSONL）。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="15 压缩、记忆与逐出 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 14 章解决「谁去做」，这一章解决「装不下怎么办、记住了放哪」。框架里有四件经常被混为一谈的事：压缩（把前缀换成一条摘要）、结果逐出（单条工具输出太大就落盘）、记忆（把事实写进 MEMORY.md 与日流水账）、转写（每一轮都追加到会话 JSONL）。" />
+    <title>15 压缩、记忆与逐出 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="15-compaction-memory" data-root="..">
+    <main>
+      <article class="article">
+        <h1>15 · 压缩、记忆与逐出：让上下文不爆，让事实不丢</h1>
+        <p class="lede">
+          第 14 章解决「谁去做」，这一章解决「装不下怎么办、记住了放哪」。框架里有四件经常被混为一谈的事：<strong>压缩</strong>（把前缀换成一条摘要）、<strong>结果逐出</strong>（单条工具输出太大就落盘）、<strong>记忆</strong>（把事实写进
+          <code>MEMORY.md</code> 与日流水账）、<strong>转写</strong>（每一轮都追加到会话 JSONL）。它们各自由一个中间件负责，在
+          <code>HarnessAgent.build()</code> 里按固定顺序装进同一条洋葱链；而且——这是与官方文档差得最远的一点——<strong>压缩和逐出默认就是开着的</strong>。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>背下 <code>CompactionConfig</code> / <code>PruneConfig</code> / <code>TruncateArgsConfig</code> / <code>ToolResultEvictionConfig</code> 的全部默认值，并知道哪几个是「动态」</li>
+          <li>给定模型上下文窗口，算出实际的 <code>triggerTokens</code> 与 <code>keepTokens</code>，以及 <code>reserved</code> 过大时会发生什么</li>
+          <li>说出压缩管线的九个步骤，以及「先 prune 后判断」这个顺序带来的后果</li>
+          <li>解释三处 flush 为什么<strong>不是</strong>同一份 prompt，以及 <code>memory_save</code> 与 <code>MemoryFlushManager</code> 的写入差别</li>
+          <li>画出两层记忆的写者/读者关系，说清 <code>.consolidation_state</code> 水位线怎么控制合并范围</li>
+          <li>从 <code>build()</code> 行号推出 <code>onReasoning</code> 与完成回调的真实执行顺序，并指出 <code>MemoryMaintenanceMiddleware</code> javadoc 与装配顺序矛盾在哪</li>
+        </ul>
+
+        <h2 id="why">先说为什么：三件不同的事，默认都开着</h2>
+        <p>
+          「上下文会满」是工程问题，「跨会话记住」是产品问题。官方文档把两者放进同一篇 <code>memory.md</code>，读起来像一个开关控制的整体；源码里它们是四条互不依赖的链路，各自有开关、各自有默认值：
+        </p>
+        <div class="stack">
+          <div class="layer accent">
+            <span class="lt">压缩：改「整段上下文」</span>
+            <div class="ld">
+              <code>CompactionMiddleware</code> 在每次 reasoning 前把前缀切成「摘要 + 尾巴」，用一次 LLM 调用换掉几千 token。默认 <code>triggerMessages=50</code>、<code>triggerTokens</code> 动态<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/CompactionConfig.java:273-286"
+                >CompactionConfig.java:273-286</span
+              >。
+            </div>
+          </div>
+          <div class="layer in2">
+            <span class="lt">逐出：改「单条结果」</span>
+            <div class="ld">
+              <code>ToolResultEvictionMiddleware</code> 只看单个 <code>ToolResultBlock</code> 的文本长度：超过 80 000 字符就整段写盘，上下文里换成「首尾预览 + 路径」<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ToolResultEvictionConfig.java:45-52"
+                >ToolResultEvictionConfig.java:45-52</span
+              >。它不调用 LLM。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">记忆：改「磁盘上的文件」</span>
+            <div class="ld">
+              <code>MemoryFlushMiddleware</code> 在每次调用结束后抽事实、追加到 <code>memory/YYYY-MM-DD.md</code>；<code>MemoryConsolidator</code> 周期性把它合并进 <code>MEMORY.md</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryFlushManager.java:218-235"
+                >MemoryFlushManager.java:218-235</span
+              >。上下文里只注入 <code>MEMORY.md</code>。
+            </div>
+          </div>
+        </div>
+        <div class="callout warn">
+          <span class="ct">最容易踩的认知差：默认不是「全关」</span>
+          <p>
+            <code>HarnessAgent.Builder</code> 的字段初始值直接写死为 <code>CompactionConfig.builder().build()</code>、<code>MemoryConfig.defaults()</code>、<code>ToolResultEvictionConfig.defaults()</code>，两个 <code>disable*</code> 都是 <code>false</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1227-1231"
+              >HarnessAgent.java:1227-1231</span
+            >。builder 的 javadoc 也明写 “Compaction is enabled by default”“Tool result eviction is enabled by default”<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1867-1908"
+              >:1867-1908</span
+            >。所以「什么都不配」不等于「什么都没发生」：一个长会话跑到第 50 条消息就会自动出现一条 <code>__compaction_summary__</code>。
+          </p>
+        </div>
+
+        <h2 id="minimal">最小可跑：一行都不配</h2>
+        <p>
+          先建立一个可验证的最小场景：本地临时工作区、一个真模型、同一个会话连续问五个问题。不写任何 <code>compaction(...)</code> / <code>memory(...)</code> / <code>toolResultEviction(...)</code>。
+        </p>
+        <pre data-lang="java" data-file="CompactionDefaults（自包含，可直接跑）">Path workspace = Files.createTempDirectory("agentscope-compaction-demo");
+
+HarnessAgent agent =
+        HarnessAgent.builder()
+                .name("demo")
+                .sysPrompt("你是简洁的助手，每次回答不超过两行。")
+                .model("dashscope:qwen-plus")
+                .workspace(workspace)
+                .build();
+
+RuntimeContext ctx = RuntimeContext.builder().userId("alice").sessionId("s-1").build();
+for (int i = 0; i &lt; 30; i++) {
+    agent.call(new UserMessage("第 " + i + " 个问题：随便说一句。"), ctx).block();
+}
+agent.close();</pre>
+        <p>跑完先看三处，三处都能证明「默认是开的」：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">工作区里出现了这四个东西</span>
+            <div>
+              <code>MEMORY.md</code>、<code>memory/&lt;今天&gt;.md</code>、<code>agents/demo/sessions/s-1.jsonl</code>、<code>agents/demo/sessions/s-1.log.jsonl</code>。前两个来自记忆链路，后两个来自转写链路<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/session/SessionTree.java:326-347"
+                >SessionTree.java:326-347</span
+              >。
+            </div>
+          </li>
+          <li>
+            <span class="sh">日账里有 <code>## Memory Flush — &lt;Instant&gt;</code> 段</span>
+            <div>
+              每轮 <code>call()</code> 结束后都会 fire-and-forget 一次 flush；模型没啥可记时会输出 <code>NO_REPLY</code>，此时<strong>不写文件</strong><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryFlushManager.java:174-183"
+                >MemoryFlushManager.java:174-183</span
+              >。所以「文件存在但没有段」也是正常结果。
+            </div>
+          </li>
+          <li>
+            <span class="sh">消息条数到 50 出现摘要</span>
+            <div>
+              <code>shouldCompact</code> 是「条数或 token 二者之一达标即触发」<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:217-234"
+                >ConversationCompactor.java:217-234</span
+              >。30 轮对话通常会超过 50 条（一问一答就 2 条），所以你会看到上下文被折叠成一条 USER 消息，<code>name</code> 是 <code>__compaction_summary__</code>。
+            </div>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <span class="ct">先用 <code>close()</code> 再去看文件</span>
+          <p>
+            flush、maintenance、session 镜像都是后台任务。<code>HarnessAgent.close()</code> 会分别等 <code>SessionTree</code> 镜像与 <code>MemoryBackgroundTasks</code> 静止，各 5 秒上限<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:453-475"
+              >HarnessAgent.java:453-475</span
+            >。测试里不等 <code>close()</code> 就读盘，很容易读到半份文件。
+          </p>
+        </div>
+
+        <h2 id="pipeline">一条链路：onReasoning 上的九个步骤</h2>
+        <p>
+          <code>CompactionMiddleware.onReasoning</code> 只对 <code>ReActAgent</code> 生效；其他 <code>Agent</code> 实现直接放行<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:81-83"
+            >CompactionMiddleware.java:81-83</span
+          >。进入之后先把首条 SYSTEM 消息摘出来——它<strong>不参与</strong>压缩，压缩完再原样拼回去<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:88-98"
+            >:88-98</span
+          >。然后才是 <code>ConversationCompactor.compactIfNeeded</code>：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">① truncateArgs（非 LLM，默认关闭）</span>
+            <div>
+              只改「保留窗口之前」的 ASSISTANT 消息里的 <code>ToolUseBlock</code> 参数值；<code>config.getTruncateArgsConfig()</code> 为 <code>null</code> 时原样返回<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:612-620"
+                >ConversationCompactor.java:612-620</span
+              >。默认就是 <code>null</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">② pruneToolResults（非 LLM，默认开启）</span>
+            <div>
+              从后往前扫 TOOL 结果，先保护最近 <code>protectTokens=40 000</code> 的输出，再把更早、且单条超过 <code>maxOutputChars=2 000</code> 的结果换成头尾预览；<strong>可剪总量不足 <code>minimumTokens=20 000</code> 就整体放弃</strong><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:544-557"
+                >:544-557</span
+              >。
+            </div>
+          </li>
+          <li>
+            <span class="sh">③ 估算 token 并判断要不要压缩</span>
+            <div>
+              <code>TokenCounterUtil</code> 用 <code>字符数 / 2.5</code> 向上取整，再加结构开销（消息 5、tool_call 10、tool_result 8、其他块 5）<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/TokenCounterUtil.java:49-58"
+                >TokenCounterUtil.java:49-58</span
+              >。注意它是<strong>估算</strong>，不是 tokenizer。
+            </div>
+          </li>
+          <li>
+            <span class="sh">④ 算切点：按 token 二分，或按条数</span>
+            <div>
+              <code>keepTokens &gt; 0</code> 时二分找「尾部刚好装得下」的最早下标，并强制至少留 1 条<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:257-278"
+                >:257-278</span
+              >；否则按 <code>keepMessages</code> 直接 <code>size - keep</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">⑤ 修正切点：不拆 ASSISTANT / TOOL 对</span>
+            <div>
+              如果切点落在 TOOL 上，就往前找发出这些 tool_call 的 ASSISTANT，把切点移到它<strong>之前</strong>；找不到就跳过整段 TOOL<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:296-338"
+                >:296-338</span
+              >。这一步是「压缩后模型还能看懂工具调用」的关键。
+            </div>
+          </li>
+          <li>
+            <span class="sh">⑥ 压缩前 flush（LLM）</span>
+            <div>
+              从待压缩前缀里<strong>剔除</strong>旧摘要消息后再 flush，避免把已经沉淀过的事实重复抽取<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:121-125"
+                >:121-125</span
+              >。这一步用的 <code>MemoryFlushManager</code> 是 <strong>2 参构造</strong>——也就是默认 prompt，不读 <code>MemoryConfig.flushPrompt</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">⑦ offload（同步写盘）</span>
+            <div>
+              把<strong>整段</strong>待压缩消息（含旧摘要）经 <code>SessionTranscriptWriter</code> 追加到会话 JSONL，再解析出相对路径；失败只 warn，返回空串继续<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:155-183"
+                >:155-183</span
+              >。
+            </div>
+          </li>
+          <li>
+            <span class="sh">⑧ LLM 摘要</span>
+            <div>
+              输入是「旧摘要 + 新前缀」拼成的文本，套进 <code>DEFAULT_SUMMARY_PROMPT</code> 的四段式模板（SESSION INTENT / SUMMARY / ARTIFACTS / NEXT STEPS）<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:344-383"
+                >:344-383</span
+              >。失败文案是 <code>(Summarization failed: …)</code>，空输出是 <code>(Summary unavailable)</code>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">⑨ 双写 + 重建输入</span>
+            <div>
+              新列表 = <code>[摘要消息] + tail</code>。它同时写进 <code>AgentState.contextMutable()</code> 和新的 <code>ReasoningInput</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:126-148"
+                >CompactionMiddleware.java:126-148</span
+              >——只改其中一个，后续轮次就会看到两种不同的历史。
+            </div>
+          </li>
+        </ol>
+        <div class="callout">
+          <span class="ct">顺序带来的两个「免费优化」</span>
+          <p>
+            因为 prune 在判断之前跑，<strong>一次纯本地剪枝就可能把 token 压到阈值以下</strong>，于是这一轮根本不会调用摘要 LLM。同理，<code>truncateArgs</code> 若开启，也会先削一轮参数体量。这两步都不花钱，所以默认把 prune 打开、把 truncateArgs 留给你按需开，是很务实的选择。
+          </p>
+        </div>
+
+        <h2 id="compact">压缩：触发、切点、摘要、双写</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>配置</th><th>默认</th><th>语义 / 边界</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>triggerMessages</code></td><td><code>50</code></td><td>条数达到就触发；<code>0</code> 表示这一路关闭</td></tr>
+              <tr><td><code>triggerTokens</code></td><td><code>0</code></td><td><code>0</code> = 动态：<code>contextWindow - reserved</code></td></tr>
+              <tr><td><code>reserved</code></td><td><code>20 000</code></td><td>留给「摘要 prompt + 输出」的缓冲，只影响动态模式</td></tr>
+              <tr><td><code>keepMessages</code></td><td><code>20</code></td><td><code>keepTokens == 0</code> 时用它</td></tr>
+              <tr><td><code>keepTokens</code></td><td><code>-1</code></td><td><code>-1</code> 动态、<code>0</code> 回落到条数、<code>&gt;0</code> 固定预算</td></tr>
+              <tr><td><code>flushBeforeCompact</code></td><td><code>true</code></td><td>压缩前先从被丢弃的前缀里抽记忆</td></tr>
+              <tr><td><code>offloadBeforeCompact</code></td><td><code>true</code></td><td>压缩前先把原文追加进会话 JSONL</td></tr>
+              <tr><td><code>summaryPrompt</code></td><td><code>DEFAULT_SUMMARY_PROMPT</code></td><td>必须含 <code>{messages}</code> 占位符，否则替换不生效</td></tr>
+              <tr><td><code>pruneConfig</code></td><td><code>PruneConfig.defaults()</code></td><td><code>null</code> 才关闭剪枝</td></tr>
+              <tr><td><code>truncateArgsConfig</code></td><td><code>null</code></td><td>默认<strong>关闭</strong>参数截断</td></tr>
+              <tr><td><code>model</code></td><td><code>null</code></td><td>用 agent 主模型；可换成小模型</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          产出的摘要消息有两个可识别特征，写断言或做后处理时很有用：<code>name</code> 恒为 <code>__compaction_summary__</code>；<code>id</code> 是 <code>__compaction_summary__:</code> 加上「内容字节的 UUIDv3」，因此<strong>同样内容得到同样 id</strong>，重复 offload 不会产生两条不同记录<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:454-480"
+            >:454-480</span
+          >。角色是 <code>USER</code>，不是 SYSTEM——它要参与后续对话，而不是当系统指令。
+        </p>
+        <p>
+          有 offload 路径时，摘要正文是这段固定文案：告诉模型「对话被摘要了、原文存到 <code>&lt;path&gt;</code>、下面是压缩摘要」<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:456-465"
+            >:456-465</span
+          >。而 <code>&lt;path&gt;</code> 的解析走 <code>SessionTranscriptWriter.resolveContextPath</code>，返回的是 <strong><code>.jsonl</code></strong>（面向 LLM 的上下文文件），<strong>不是</strong> <code>.log.jsonl</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/session/SessionTranscriptWriter.java:166-182"
+            >SessionTranscriptWriter.java:166-182</span
+          >。这一点官方文档写错了，见后面的 gap 表。
+        </p>
+        <div class="callout warn">
+          <span class="ct">压缩失败不会中断对话</span>
+          <p>
+            <code>compactIfNeeded</code> 外面套了 <code>onErrorResume</code>：非 <code>InterruptedException</code> 的异常只 warn，然后 <code>Optional.empty()</code>，本轮按原上下文继续<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:112-125"
+              >CompactionMiddleware.java:112-125</span
+            >。只有中断会向上抛。所以「摘要模型挂了」的表现是<strong>上下文继续增长</strong>，而不是报错。
+          </p>
+        </div>
+
+        <h2 id="threshold">阈值：动态算法与三个边界</h2>
+        <p>
+          <code>resolveEffectiveConfig()</code> 只在 <code>triggerTokens == 0</code> 或 <code>keepTokens == -1</code> 时才做解析；两个都写死了就原样返回<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:155-162"
+            >CompactionMiddleware.java:155-162</span
+          >。解析规则如下：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>情况</th><th>trigger</th><th>keep</th><th>结果</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>模型报窗口 <code>W</code>，且 <code>W &gt; reserved</code></td>
+                <td><code>W - 20 000</code></td>
+                <td><code>min(8 000, max(2 000, (W-20 000) × 0.25))</code></td>
+                <td>常规路径</td>
+              </tr>
+              <tr>
+                <td><code>W &lt;= reserved</code></td>
+                <td><code>max(1, W / 2)</code> + warn</td>
+                <td><code>2 000</code>（usable 为负，被下限兜住）</td>
+                <td>见下方说明</td>
+              </tr>
+              <tr>
+                <td>模型<strong>不报</strong>窗口（<code>W &lt;= 0</code>）</td>
+                <td><code>160 000</code></td>
+                <td><code>0</code></td>
+                <td>keep 回落 <code>keepMessages=20</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          逐字看两段代码更稳。trigger 的 clamp 只在 <code>contextWindow &gt; 0</code> 分支里发生：<code>effectiveTrigger &lt;= 0</code> 时取 <code>Math.max(1, contextWindow / 2)</code> 并打 warn<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:167-194"
+            >:167-194</span
+          >。keep 的 <code>-1</code> 分支在无窗口时直接给 <code>0</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:199-215"
+            >:199-215</span
+          >，而 <code>determineCutoffIndex</code> 里 <code>keepTokens &gt; 0</code> 不成立就走 <code>keepMessages</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:245-254"
+            >ConversationCompactor.java:245-254</span
+          >。所以「动态 keep」在无窗口模型上等价于「保留最近 20 条」，不是「保留 8 000 token」。
+        </p>
+        <pre data-lang="java" data-file="手算一遍，比读三遍有用">// 假设 W = 32 000（很多小模型），默认配置：
+//   trigger = 32 000 - 20 000 = 12 000
+//   keep    = min(8 000, max(2 000, 12 000 * 0.25 = 3 000)) = 3 000
+// 于是：涨到 12 000 token 触发，保留约 3 000 token 的尾巴。
+
+// 假设 W = 16 000：
+//   trigger = -4 000 → clamp 到 max(1, 8 000) = 8 000，并 warn
+//   keep    = min(8 000, max(2 000, -4 000 * 0.25 = -1 000)) = min(8 000, 2 000) = 2 000
+// 注意：每轮都可能在 8 000 附近反复触发，官方建议是调小 reserved。</pre>
+        <div class="callout warn">
+          <span class="ct">小窗口模型上，默认 <code>reserved=20 000</code> 是危险的</span>
+          <p>
+            它不会让程序崩，但会让「触发点」被 clamp 到窗口的一半，压缩变得很频繁；而 keep 会被压到下限 2 000。这段代码旁边的注释就写了 “would fire compaction on every call”，clamp 的作用是避免每轮都压<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:170-181"
+              >:170-181</span
+            >。真要跑 8K/16K 窗口，请显式写 <code>reserved(2_000)</code> 与 <code>triggerTokens(...)</code>。
+          </p>
+        </div>
+
+        <h2 id="eviction">逐出：单条结果太大</h2>
+        <p>
+          逐出与压缩完全独立：它不做摘要、不看对话条数，只对<strong>单个</strong> <code>ToolResultBlock</code> 的文本长度做判断。默认值四项：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>常量</th><th>默认</th><th>含义</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>DEFAULT_MAX_RESULT_CHARS</code></td><td><code>80 000</code></td><td>约 20K token × 4 字符/token；严格是「大于」才触发</td></tr>
+              <tr><td><code>DEFAULT_PREVIEW_CHARS</code></td><td><code>2 000</code></td><td>占位符里首尾各保留的上限（实际取 <code>min(2 000, len/2)</code>）</td></tr>
+              <tr><td><code>DEFAULT_EVICTION_PATH</code></td><td><code>large_tool_results</code></td><td>相对工作区；末尾斜杠会被去掉</td></tr>
+              <tr><td><code>DEFAULT_EXCLUDED_TOOLS</code></td><td><code>read_file</code>、<code>write_file</code>、<code>edit_file</code>、<code>memory_search</code>、<code>memory_get</code>、<code>session_search</code></td><td>这些工具的结果永不逐出</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>execute</code>（shell）被<strong>故意</strong>排除在豁免名单之外——源码注释直说 “command output can be very large”<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ToolResultEvictionConfig.java:54-73"
+            >ToolResultEvictionConfig.java:54-73</span
+          >。这解释了一个常见现象：<code>read_file</code> 读大文件不会逐出，<code>execute</code> 跑 <code>find /</code> 会。
+        </p>
+        <p>落盘路径与占位符都是固定格式，可以直接拿去写断言：</p>
+        <pre data-lang="text" data-file="真实路径与占位符格式"># 路径：{evictionPath}/{safeAgent}/{safeId}-{sha256 前 8 字节 hex}
+large_tool_results/demo/call_abc123-3f9a1c07
+
+# 占位符正文（%n 为平台换行）
+Tool output was too large (123,456 chars) and has been saved to `large_tool_results/demo/call_abc123-3f9a1c07`.
+To read the full output, use `read_file` with path `large_tool_results/demo/call_abc123-3f9a1c07`.
+
+Preview (first 2,000 chars):
+...
+... and last 2,000 chars:
+...</pre>
+        <p>
+          路径里 <code>safeAgent</code> 与 <code>safeId</code> 是把非 <code>[a-zA-Z0-9_-]</code> 字符替换成下划线；哈希取 SHA-256 摘要的前 8 个字节<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/ToolResultEvictionMiddleware.java:258-298"
+            >ToolResultEvictionMiddleware.java:258-298</span
+          >。同样的内容会得到同样的文件名，所以重复逐出是幂等的。
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先在 canonical state 上做，再改 hook 视图</span>
+            <div>
+              源码注释写得很清楚：PreReasoning hook 可能删改消息，所以要先改 <code>state.contextMutable()</code>，再对 <code>input.messages()</code> 做一遍；两遍共用一张 <code>replacements</code> 表，避免同一个结果被写两次盘<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/ToolResultEvictionMiddleware.java:88-111"
+                >:88-111</span
+              >。
+            </div>
+          </li>
+          <li>
+            <span class="sh">已逐出的块靠 metadata 防递归</span>
+            <div>
+              替换后的 <code>ToolResultBlock</code> 会带上 <code>agentscope.tool_result_evicted=true</code>，下一轮看到这个标记就直接跳过<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/ToolResultEvictionMiddleware.java:230-243"
+                >:230-243</span
+              >。否则占位符自己也可能被当成大结果。
+            </div>
+          </li>
+          <li>
+            <span class="sh">写盘失败只 warn，不阻断</span>
+            <div>
+              <code>write</code> 不成功或抛异常时返回 <code>null</code>，调用方保留原始结果继续<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/ToolResultEvictionMiddleware.java:198-228"
+                >:198-228</span
+              >。宁可这次上下文变大，也不要因为磁盘问题把这一轮弄挂。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="prune">预处理：prune 默认开、truncateArgs 默认关</h2>
+        <p>
+          这两个常被当成一个东西，实际上触发条件、作用对象、默认值都不同：
+        </p>
+        <div class="compare">
+          <div class="col pick">
+            <h4>pruneToolResults：默认开</h4>
+            <ul>
+              <li>作用对象：<code>ToolResultBlock</code>（工具返回）</li>
+              <li>保护窗口：最近 <code>protectTokens=40 000</code> 的 TOOL 输出不动</li>
+              <li>只剪「单条超过 <code>maxOutputChars=2 000</code>」的结果</li>
+              <li>可剪总量 <code>&lt; minimumTokens=20 000</code> 时<strong>整体不动手</strong>，避免为了省一点反而破坏可读性</li>
+              <li>豁免：<code>read_file</code>、<code>memory_search</code>、<code>memory_get</code>、<code>session_search</code></li>
+              <li>预览格式：<code>head + "\n\n...(N chars pruned)...\n\n" + tail</code></li>
+              <li>出处：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/CompactionConfig.java:574-580">CompactionConfig.java:574-580</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:591-601">ConversationCompactor.java:591-601</span></li>
+            </ul>
+          </div>
+          <div class="col">
+            <h4>truncateArgs：默认关</h4>
+            <ul>
+              <li>作用对象：<code>ToolUseBlock</code>（工具<strong>参数</strong>）</li>
+              <li>默认值 <code>null</code>，必须显式配 <code>truncateArgs(...)</code> 才生效</li>
+              <li>开启后的默认：<code>triggerMessages=25</code>、<code>triggerTokens=40 000</code>、<code>keepMessages=20</code>、<code>keepTokens=0</code>、<code>maxArgLength=2 000</code></li>
+              <li>只改保留窗口之前的 ASSISTANT；保留前 20 个字符 + <code>...(argument truncated)</code></li>
+              <li>典型收益：<code>write_file</code> 这种一次几万字符的入参</li>
+              <li>出处：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/CompactionConfig.java:472-479">CompactionConfig.java:472-479</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:629-646">:629-646</span></li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          prune 与 truncateArgs 的开关判断都在方法第一行：<code>pruneConfig == null</code> 或 <code>truncateConfig == null</code> 就原样返回<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:510-513"
+            >:510-513</span
+          >。所以「关掉 prune」= <code>pruneConfig(null)</code>，不是把阈值设成 0。
+        </p>
+
+        <h2 id="overflow">溢出兜底：只重试一次</h2>
+        <p>
+          前面都是「提前预防」，这一条是「已经报错了怎么办」。它在 <code>HarnessAgent</code> 的调用包装层，不在中间件里：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">前提：<code>compactionHook != null</code></span>
+            <div>
+              只有装上了 <code>CompactionMiddleware</code> 才挂 <code>onErrorResume</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:958-968"
+                >HarnessAgent.java:958-968</span
+              >。如果你用 <code>compaction(null)</code> 关掉压缩，溢出错误会原样抛给调用方。
+            </div>
+          </li>
+          <li>
+            <span class="sh">识别：7 个关键词</span>
+            <div>
+              <code>context_length_exceeded</code>、<code>context length</code>、<code>maximum context</code>、<code>token limit</code>、<code>too many tokens</code>、<code>exceeds the model's maximum</code>、<code>reduce the length</code>，全部对 <code>message.toLowerCase()</code> 做包含判断<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1103-1116"
+                >:1103-1116</span
+              >。所以自定义模型的报错文案要能被这七个之一覆盖。
+            </div>
+          </li>
+          <li>
+            <span class="sh">强制配置：<code>triggerMessages(1)</code></span>
+            <div>
+              现场 new 一个 <code>CompactionConfig.builder().triggerMessages(1).build()</code>，其余全是默认<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1071-1071"
+                >:1071</span
+              >——<strong>你在 <code>.compaction(...)</code> 里写的 trigger/keep/prompt 全部不参与这一次</strong>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">用主模型、读 memoryConfig 的 flushPrompt</span>
+            <div>
+              <code>new MemoryFlushManager(workspaceManager, getModel(), effectiveFlushPrompt)</code>，其中 prompt 优先取 <code>memoryConfig.flushPrompt()</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1072-1078"
+                >:1072-1078</span
+              >。注意这里是 <code>getModel()</code>，不是 <code>compactionConfig.getModel()</code>——配了压缩小模型也会用主模型。
+            </div>
+          </li>
+          <li>
+            <span class="sh">压缩成功才重试，且只重试一次</span>
+            <div>
+              压缩结果为空 → 抛 <code>Context overflow: emergency compaction yielded no result</code>；成功 → <code>delegate.call(...)</code> 再来一次<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1087-1100"
+                >:1087-1100</span
+              >。第二次再溢出，错误直接冒泡（没有循环）。
+            </div>
+          </li>
+        </ol>
+        <div class="callout warn">
+          <span class="ct">紧急压缩的 keep 是「未解析」的 <code>-1</code></span>
+          <p>
+            <code>forceConfig</code> 没有经过 <code>resolveEffectiveConfig()</code>，所以 <code>keepTokens</code> 仍是 <code>-1</code>。<code>determineCutoffIndex</code> 里只有 <code>&gt;0</code> 才走 token 路径，于是这次实际按 <code>keepMessages=20</code> 保留尾巴<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:245-254"
+              >ConversationCompactor.java:245-254</span
+            >。如果你的会话是 20 条超长消息，这一刀可能<strong>还是装不下</strong>——第二次就真的失败了。
+          </p>
+        </div>
+
+        <h2 id="memory">记忆：两层文件、两个写者、一条水位线</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>文件</th><th>谁写</th><th>怎么写</th><th>谁读</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>memory/YYYY-MM-DD.md</code></td>
+                <td><code>MemoryFlushManager</code>（每轮 / 压缩前 / 兜底）、<code>memory_save</code></td>
+                <td><strong>只追加</strong>，段落头 <code>## Memory Flush — &lt;Instant&gt;</code> 或 <code>## Memory Save — &lt;Instant&gt;</code></td>
+                <td><code>MemoryConsolidator</code>、<code>memory_search</code></td>
+              </tr>
+              <tr>
+                <td><code>MEMORY.md</code></td>
+                <td><code>MemoryConsolidator</code>（整体重写）、<code>memory_save</code>（追加）</td>
+                <td>LLM 输出全文覆盖；<code>memory_save</code> 是例外地追加</td>
+                <td>注入 system prompt；<code>memory_search</code></td>
+              </tr>
+              <tr>
+                <td><code>memory/.consolidation_state</code></td>
+                <td><code>MemoryConsolidator</code></td>
+                <td>记录上次成功合并的 <code>Instant</code></td>
+                <td>下一轮 consolidation</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>MemoryFlushManager.writeMemoryFiles</code> 的 javadoc 明确写了「MEMORY.md is intentionally NOT touched here」<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryFlushManager.java:218-235"
+            >MemoryFlushManager.java:218-235</span
+          >——MEMORY.md 由 consolidator 独占。但 <code>memory_save</code> 是<strong>两处都写</strong>：先 append 到 <code>MEMORY.md</code>，再 append 一条带时间戳的日账，返回值是 <code>Saved N memories to MEMORY.md</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/MemorySaveTool.java:71-86"
+            >MemorySaveTool.java:71-86</span
+          >。这就留下一个真实副作用：下一轮 consolidation 会把这条日账当成「新条目」，可能再合并一次。
+        </p>
+        <p>
+          水位线是 consolidation 的「增量游标」。它默认存在 <code>memory/.consolidation_state</code>；如果配了分布式 store，读写优先走 store（命名空间 <code>["memory","consolidation"]</code>、key <code>watermark</code>），写入用 CAS，最多重试 5 次<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryConsolidator.java:65-66"
+            >MemoryConsolidator.java:65-66</span
+          >、
+          <span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryConsolidator.java:100-102">:100-102</span>。
+          <code>readDailyEntries</code> 会跳过 <code>.consolidation_state</code>、<code>archive</code> 与非 <code>.md</code> 文件，只取 mtime 严格晚于水位线的日账<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryConsolidator.java:240-252"
+            >:240-252</span
+          >。
+        </p>
+        <div class="callout tip">
+          <span class="ct">为什么日账是「流」、MEMORY.md 是「文件」</span>
+          <p>
+            默认 flush prompt 里写了两条硬规则：输出只写<strong>今天的日账</strong>，MEMORY.md 只是只读上下文、不要复述<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryFlushManager.java:80-88"
+              >MemoryFlushManager.java:80-88</span
+            >。这样 flush 可以无状态、无锁地 append；去重和压缩交给 consolidation 一次性做。代价是同一事实可能在日账里出现多次——这是设计，不是 bug。
+          </p>
+        </div>
+
+        <h2 id="flush">Flush：三个触发点，两份 prompt</h2>
+        <p>先看三个触发点分别是谁在调、用哪份 prompt、失败怎么办：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>触发点</th><th>调用者</th><th>prompt 来源</th><th>同步性</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>每次 <code>call()</code> 结束</td>
+                <td><code>MemoryFlushMiddleware.onAgent</code> → <code>doOnComplete</code></td>
+                <td><code>memoryConfig.flushPrompt()</code>，为空则 <code>DEFAULT_FLUSH_PROMPT</code>（build 时已解析）</td>
+                <td>fire-and-forget，走 <code>boundedElastic</code></td>
+              </tr>
+              <tr>
+                <td>压缩前</td>
+                <td><code>ConversationCompactor</code> 内部</td>
+                <td><strong><code>DEFAULT_FLUSH_PROMPT</code> 硬编码</strong>（2 参构造）</td>
+                <td>在压缩链路里同步等待</td>
+              </tr>
+              <tr>
+                <td>溢出兜底</td>
+                <td><code>HarnessAgent.forceCompactAndRetry</code></td>
+                <td><code>memoryConfig.flushPrompt()</code>，否则 DEFAULT</td>
+                <td>同步</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          第 2 行是本章最值得记住的细节：<code>CompactionMiddleware.onReasoning</code> 里写的是 <code>new MemoryFlushManager(workspaceManager, model)</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:106-109"
+            >CompactionMiddleware.java:106-109</span
+          >，而 2 参构造固定传 <code>DEFAULT_FLUSH_PROMPT</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryFlushManager.java:95-97"
+            >MemoryFlushManager.java:95-97</span
+          >。官方文档说「三处用同一份 <code>flushPrompt</code>」，与源码不符。
+        </p>
+        <p>
+          per-call flush 的调度有三个容易忽略的机制，全在 <code>MemoryFlushMiddleware</code>：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">配额在派发时就占，不在任务里占</span>
+            <div>
+              <code>MemoryBackgroundTasks.begin()</code> 在 <code>scheduleFlush</code> 第一行调用。注释解释得很清楚：排队中的 flush 也必须被算作 in-flight，否则 <code>close()</code> 的静止检查会看到「空队列」而提前返回<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryFlushMiddleware.java:162-166"
+                >:162-166</span
+              >。
+            </div>
+          </li>
+          <li>
+            <span class="sh">同一 key 串行，同会话新任务顶掉旧任务</span>
+            <div>
+              队列 key 是 <code>memory-flush:&lt;scope&gt;:&lt;id&gt;</code>；合并 key 是 <code>ConversationKey(agent, userId, sessionId)</code>。运行中若有新任务进来，就 <code>put</code> 到 pending 覆盖旧任务，并立刻释放被顶掉那次的配额<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryFlushMiddleware.java:167-201"
+                >:167-201</span
+              >。注释给出的正确性理由是：队列任务<strong>执行时</strong>才读 state，所以最新任务天然包含被顶掉任务会读到的一切<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryFlushMiddleware.java:256-262"
+                >:256-262</span
+              >。
+            </div>
+          </li>
+          <li>
+            <span class="sh">三种 trigger 的判定在「任务执行时」</span>
+            <div>
+              <code>shouldFlushNow</code> 在 <code>doFlush</code> 里调用：<code>ALWAYS</code> 恒真、<code>NEVER</code> 恒假、<code>THROTTLED</code> 用 <code>PeriodicGate.tryClaim(key, minGap)</code> 抢窗口<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryFlushMiddleware.java:291-302"
+                >:291-302</span
+              >。所以排队久的任务不会因为「派发时间早」而绕过节流。
+            </div>
+          </li>
+        </ol>
+        <pre data-lang="java" data-file="常用的两种调法">// ① 只关 per-call flush：压缩前与兜底仍然会 flush
+.memory(MemoryConfig.builder().flushTrigger(MemoryConfig.FlushTrigger.never()).build())
+
+// ② 节流到 10 分钟一次（首次立即放行，之后按 minGap）
+.memory(MemoryConfig.builder()
+        .flushTrigger(MemoryConfig.FlushTrigger.throttled(Duration.ofMinutes(10)))
+        .build())</pre>
+        <p>
+          <code>throttled(Duration.ZERO)</code> 会被归一化成 <code>ALWAYS</code>；负值抛 <code>IllegalArgumentException</code>，null 也抛<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryConfig.java:109-120"
+            >MemoryConfig.java:109-120</span
+          >。两个节流窗口是<strong>分开</strong>的：flush 用 <code>memory-flush:</code> 前缀，维护用 <code>memory-maintenance:</code> 前缀，互不占用窗口<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryMaintenanceMiddleware.java:180-182"
+            >MemoryMaintenanceMiddleware.java:180-182</span
+          >。
+        </p>
+
+        <h2 id="maintenance">后台维护：三步、两个节流窗口</h2>
+        <p>
+          <code>MemoryMaintenanceMiddleware.onAgent</code> 同样挂在 <code>doOnComplete</code> 上，但内容是三件事，顺序固定：<code>expireDailyFiles</code> → <code>consolidateMemory</code> → <code>pruneOldSessions</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryMaintenanceMiddleware.java:199-205"
+            >:199-205</span
+          >。
+        </p>
+        <div class="compare">
+          <div class="col">
+            <h4>expireDailyFiles：按「文件名日期」</h4>
+            <ul>
+              <li><code>glob("*.md", "memory")</code> 列出日账，跳过目录和以 <code>.</code> 开头的文件</li>
+              <li>取文件名（去掉 <code>.md</code>）直接 <code>LocalDate.parse</code>，解析失败就跳过——所以 <code>MEMORY.md</code> 这类文件天然不受影响</li>
+              <li>日期早于 <code>now - dailyFileRetentionDays(90)</code> 就 <code>move</code> 到 <code>memory/archive/</code></li>
+              <li>出处：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryMaintenanceMiddleware.java:207-242">MemoryMaintenanceMiddleware.java:207-242</span></li>
+            </ul>
+          </div>
+          <div class="col">
+            <h4>pruneOldSessions：按 mtime</h4>
+            <ul>
+              <li><code>glob("*.log.jsonl", "agents")</code>，<strong>只删日志</strong>，不动 <code>.jsonl</code></li>
+              <li>读 <code>fi.modifiedAt()</code> 解析成 <code>Instant</code>，早于 <code>now - sessionRetentionDays(180)</code> 就 <code>delete</code></li>
+              <li>mtime 缺失或解析失败只 warn</li>
+              <li>出处：<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryMaintenanceMiddleware.java:255-284">:255-284</span></li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          consolidation 的省钱逻辑值得单独记一句：<code>readDailyEntries</code> 返回空就直接 <code>Mono.empty()</code>，<strong>不调用 LLM</strong><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryConsolidator.java:156-166"
+            >MemoryConsolidator.java:156-166</span
+          >。真正调用时，<code>maxChars = maxMemoryTokens × 4</code>（默认 4 000 → 16 000 字符），提示词要求输出<strong>完整的新 MEMORY.md</strong> 而不是 diff<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryConsolidator.java:168-169"
+            >:168-169</span
+          >。输出为空则 warn 并跳过，<strong>不推进水位线</strong>；写入成功后才把水位线设成 <code>runStart</code>（调用开始时间，不是结束时间）<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryConsolidator.java:205-219"
+            >:205-219</span
+          >。
+        </p>
+        <div class="callout warn">
+          <span class="ct">自定义 <code>consolidationPrompt</code> 必须恰好两个 <code>%d</code></span>
+          <p>
+            顺序是 max-tokens、max-chars，Builder 构造期就校验，不满足直接抛<span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryConfig.java:186-195"
+              >MemoryConfig.java:186-195</span
+            >。这是「让错误尽早暴露」的典型做法——否则要等到运行时 <code>String.format</code> 才抛 <code>MissingFormatArgumentException</code>。
+          </p>
+        </div>
+
+        <h2 id="transcript">转写：两份 jsonl 与一次阻塞</h2>
+        <p>
+          转写不属于记忆链路，注释明确写「Transcript is independent of memory hooks — always persist session history」<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2543-2544"
+            >HarnessAgent.java:2543-2544</span
+          >。所以 <code>disableMemoryHooks()</code> 不会关掉它，只有 <code>disableTranscript()</code> 会。
+        </p>
+        <ul>
+          <li><code>SessionTree.flush()</code> <strong>同时</strong>写两份文件：<code>appendToFile(contextFile)</code>（<code>.jsonl</code>，LLM 面向）与 <code>appendToFile(logFile)</code>（<code>.log.jsonl</code>，全量）<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/session/SessionTree.java:326-347">SessionTree.java:326-347</span>。</li>
+          <li>工具入参 JSON 截 500 字符、工具输出截 1 000 字符<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/session/SessionTranscriptWriter.java:61-65">SessionTranscriptWriter.java:61-65</span>；这是「软上限」，宁可截断也不让转写文件失控。</li>
+          <li>幂等靠 entry id：<code>existingIds</code> 去重，同一条消息重复 append 不会写第二遍<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/session/SessionTranscriptWriter.java:115-140">:115-140</span>。</li>
+          <li>跳过 <code>&lt;session_context&gt;</code> 这类内部上下文消息；<code>MessageEntry</code> / <code>ToolUseEntry</code> / <code>ToolResultEntry</code> 三类由一条 <code>Msg</code> 拆出来<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/session/SessionTranscriptWriter.java:195-249">:195-249</span>。</li>
+        </ul>
+        <div class="callout warn">
+          <span class="ct">它不是纯 fire-and-forget</span>
+          <p>
+            <code>TranscriptMiddleware.onAgent</code> 用的是 <code>next.apply(input).concatWith(appendTranscript(...).then(Mono.empty()))</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/TranscriptMiddleware.java:61-79"
+              >TranscriptMiddleware.java:61-79</span
+            >：<code>concatWith</code> 会等 append 完成才让流 complete。写盘本身在 <code>boundedElastic</code> 上，但<strong>调用方拿到完成信号时，文件已经写完</strong>。这和 flush 的 fire-and-forget 完全是两种语义。
+          </p>
+        </div>
+
+        <h2 id="tools">工具面：四个对象、六个工具名</h2>
+        <p>
+          <code>build()</code> 在 <code>disableMemoryTools == false</code> 时注册四个对象<span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2687-2693"
+            >HarnessAgent.java:2687-2693</span
+          >，但它们一共暴露 <strong>6 个</strong> <code>@Tool</code> 名字——<code>SessionSearchTool</code> 一个类里有三个：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>工具名</th><th>关键默认值 / 行为</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>memory_search</code></td>
+                <td>逐行 <code>substring</code> 匹配，<strong>没有条数上限</strong>；每条命中带 <code>Source: &lt;path&gt;#&lt;line&gt;</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/MemorySearchTool.java:45-89">MemorySearchTool.java:45-89</span></td>
+              </tr>
+              <tr>
+                <td><code>memory_get</code></td>
+                <td>1-based 闭区间；路径 normalize 后用 <code>startsWith</code> 防穿越；输出 <code>N|line</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/MemoryGetTool.java:37-83">MemoryGetTool.java:37-83</span></td>
+              </tr>
+              <tr>
+                <td><code>memory_save</code></td>
+                <td>同时 append 到 <code>MEMORY.md</code> 与今日日账，返回 <code>Saved N memor(y|ies) to MEMORY.md</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/MemorySaveTool.java:48-86">MemorySaveTool.java:48-86</span></td>
+              </tr>
+              <tr>
+                <td><code>session_search</code></td>
+                <td>用 <code>.log.jsonl</code> 枚举会话，但<strong>读同名的 <code>.jsonl</code></strong> 取条目；默认 10 条，预览截 200 字符</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SessionSearchTool.java:52-101">SessionSearchTool.java:52-101</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SessionSearchTool.java:269-308">:269-308</span></td>
+              </tr>
+              <tr>
+                <td><code>session_list</code></td>
+                <td>优先返回 <code>sessions.json</code> 索引内容；没有索引才列本地 <code>.jsonl</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SessionSearchTool.java:103-163">:103-163</span></td>
+              </tr>
+              <tr>
+                <td><code>session_history</code></td>
+                <td>默认最近 20 条；单条内容超过 500 字符截断加 <code>... [truncated]</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SessionSearchTool.java:165-219">:165-219</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct"><code>session_search</code> 为什么读 <code>.jsonl</code> 而不是 <code>.log.jsonl</code></span>
+          <p>
+            枚举阶段 <code>collectLogFiles</code> 只收 <code>.log.jsonl</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SessionSearchTool.java:256-267"
+              >:256-267</span
+            >，进入搜索时 <code>resolveSibling(...replace(SESSION_LOG_EXT, SESSION_CONTEXT_EXT))</code> 换成 <code>.jsonl</code><span
+              class="src"
+              data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SessionSearchTool.java:269-280"
+              >:269-280</span
+            >。后果是：<strong>只存在于 <code>.log.jsonl</code> 的条目搜不到</strong>。如果你的搜索总是少东西，先确认目标条目在哪个文件里。
+          </p>
+        </div>
+
+        <h2 id="inject">注入：maxContextTokens=8000 只管什么</h2>
+        <p>
+          这个参数名字极具误导性。它<strong>不</strong>控制压缩阈值，也<strong>不</strong>限制整个 system prompt；它只决定 <code>MEMORY.md</code> 注入多少：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先在 system prompt 里拼出各个固定块</span>
+            <div>
+              <code>sessionContext</code>、<code>AGENTS.md</code>、知识块、额外上下文文件，四个都用 <code>estimateTokens = length / 4</code> 估出 token<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:228-232"
+                >WorkspaceContextMiddleware.java:228-232</span
+              >。
+            </div>
+          </li>
+          <li>
+            <span class="sh">预算 = maxContextTokens - 其他固定块</span>
+            <div>
+              只有 <code>available &gt; 0</code> 且 <code>memoryTokens &gt; available</code> 时才截断 MEMORY.md<span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:233-239"
+                >:233-239</span
+              >。换句话说，它是一份「记忆注入预算」，不是「上下文预算」。
+            </div>
+          </li>
+          <li>
+            <span class="sh">截断会带一句给模型看的提示</span>
+            <div>
+              有 memory 工具时是 <code>... (memory truncated — use memory_search for older entries) ...</code>，没有工具时是 <code>... (memory truncated) ...</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:123-126"
+                >:123-126</span
+              >。这句提示是「模型自己会去搜」的触发点。
+            </div>
+          </li>
+          <li>
+            <span class="sh">什么时候干脆不注入</span>
+            <div>
+              <code>includeMemoryContext() = !(disableMemoryTools &amp;&amp; disableMemoryHooks)</code><span
+                class="src"
+                data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:250-256"
+                >:250-256</span
+              >。只关一个，MEMORY.md 仍然注入；两个都关才彻底不出现。
+            </div>
+          </li>
+        </ol>
+        <p>
+          顺带记住两个默认值：字段初始值 <code>maxContextTokens = 8000</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1240-1240"
+            >HarnessAgent.java:1240</span
+          >，中间件自己的常量也是 <code>DEFAULT_MAX_CONTEXT_TOKENS = 8000</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/WorkspaceContextMiddleware.java:128-128"
+            >:128</span
+          >。两个 8000 一个是 builder 默认、一个是构造器兜底，值相同但来源不同。
+        </p>
+
+        <h2 id="assemble">装配：build() 顺序与真实回调顺序</h2>
+        <p>
+          这是本章唯一需要对着源码逐行读的地方。本章涉及的中间件在 <code>build()</code> 里的注册顺序如下（行号为 2.0.4）：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>#</th><th>中间件</th><th>条件</th><th>行号</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>1</td><td><code>SandboxLifecycleMiddleware</code></td><td><code>sandboxLifecycleMw != null</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2519-2521">:2519-2521</span></td></tr>
+              <tr><td>2</td><td><code>AgentTraceMiddleware</code></td><td><code>agentTracingLogEnabled</code>（默认 true）</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2522-2524">:2522-2524</span></td></tr>
+              <tr><td>3</td><td><code>WorkspaceContextMiddleware</code></td><td><code>!disableWorkspaceContext</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2527-2539">:2527-2539</span></td></tr>
+              <tr><td>4</td><td><code>AtPathExpansionMiddleware</code></td><td><code>!disableAtPathExpansion</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2540-2542">:2540-2542</span></td></tr>
+              <tr><td>5</td><td><code>TranscriptMiddleware</code></td><td><code>!disableTranscript</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2543-2561">:2543-2561</span></td></tr>
+              <tr><td>6</td><td><code>MemoryFlushMiddleware</code></td><td><code>memoryModel != null &amp;&amp; !disableMemoryHooks</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2562-2577">:2562-2577</span></td></tr>
+              <tr><td>7</td><td><code>MemoryMaintenanceMiddleware</code></td><td>同上</td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2579-2598">:2579-2598</span></td></tr>
+              <tr><td>8</td><td><code>CompactionMiddleware</code></td><td><code>!disableCompaction &amp;&amp; compactionConfig != null &amp;&amp; compactionModel != null</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2600-2609">:2600-2609</span></td></tr>
+              <tr><td>9</td><td><code>ToolResultEvictionMiddleware</code></td><td><code>!disableToolResultEviction &amp;&amp; config != null</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2610-2613">:2610-2613</span></td></tr>
+              <tr><td>10</td><td><code>InboxMiddleware</code></td><td><code>messageBus != null</code></td><td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2614-2616">:2614-2616</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          两个模型选择的细节常被忽略：记忆模型是 <code>memoryConfig.model() != null ? … : model</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2562-2562"
+            >:2562</span
+          >，压缩模型是 <code>compactionConfig.getModel() != null ? … : model</code><span
+            class="src"
+            data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2602-2603"
+            >:2602-2603</span
+          >。两者都只在 build 时解析一次，运行期改配置无效。
+        </p>
+        <p>
+          接下来是最容易推错的一步。<code>MiddlewareChain.build</code> 从后往前包装，<strong>第一个注册的位于最外层</strong><span
+            class="src"
+            data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareChain.java:55-61"
+            >MiddlewareChain.java:55-61</span
+          >。所以：
+        </p>
+        <div class="compare">
+          <div class="col pick">
+            <h4>onReasoning：外层先进</h4>
+            <ul>
+              <li>顺序（只列本章相关）：<code>Compaction</code> → <code>Eviction</code> → <code>Inbox</code> → … → core</li>
+              <li>所以压缩看到的是<strong>尚未逐出</strong>的上下文；压缩算完，逐出再对「摘要 + 尾巴」做一次单条检查</li>
+              <li>这个顺序是合理的：先做整体裁剪，再做局部卸载，避免把即将被摘要掉的大结果白写一次盘</li>
+            </ul>
+          </div>
+          <div class="col">
+            <h4>onAgent 完成回调：内层先回</h4>
+            <ul>
+              <li><code>doOnComplete</code> 随流完成由内向外触发，所以 <code>MemoryMaintenance</code>（#7）<strong>先</strong>于 <code>MemoryFlush</code>（#6）</li>
+              <li>而 <code>MemoryMaintenanceMiddleware</code> 的 javadoc 写的是 “after <code>MemoryFlushMiddleware</code>”<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryMaintenanceMiddleware.java:43-46">:43-46</span></li>
+              <li>两者都在 <code>boundedElastic</code> 上异步跑，所以这是「派发顺序」而非严格先后；但足以说明 javadoc 描述与装配顺序相反</li>
+            </ul>
+          </div>
+        </div>
+        <div class="callout">
+          <span class="ct">这条顺序的实用含义</span>
+          <p>
+            同一轮的 consolidation 很可能<strong>看不到</strong>本轮 flush 刚写进日账的内容——它的派发更早，而且 consolidation 读的是「水位线之后」的日账。想让「刚聊的事立刻进 MEMORY.md」，别指望一轮内完成；要么显式调 <code>memory_save</code>，要么接受「下一轮或下次维护才合并」。
+          </p>
+        </div>
+
+        <h2 id="doc-gap">官方说了什么 vs 源码实际是什么</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方文档的说法</th><th>2.0.4 源码实际</th><th>对照位置</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>compaction.md</code>：「压缩与逐出默认关闭，要显式配 <code>compaction(...)</code>」</td>
+                <td>Builder 字段默认就是 <code>CompactionConfig.builder().build()</code> 与 <code>ToolResultEvictionConfig.defaults()</code>，两个 disable 均 false；javadoc 也写 enabled by default</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1227-1231">HarnessAgent.java:1227-1231</span></td>
+              </tr>
+              <tr>
+                <td><code>compaction.md</code>：「工具执行后触发卸载」</td>
+                <td>在 <code>onReasoning</code> 里做，即<strong>下一次推理前</strong>，不是工具执行后</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/ToolResultEvictionMiddleware.java:79-84">ToolResultEvictionMiddleware.java:79-84</span></td>
+              </tr>
+              <tr>
+                <td><code>compaction.md</code>：默认排除工具含 <code>list_files</code></td>
+                <td>默认集合只有 6 个：<code>read_file</code>、<code>write_file</code>、<code>edit_file</code>、<code>memory_search</code>、<code>memory_get</code>、<code>session_search</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ToolResultEvictionConfig.java:66-73">ToolResultEvictionConfig.java:66-73</span></td>
+              </tr>
+              <tr>
+                <td><code>compaction.md</code>：压缩前的 flush 由 <code>MemoryFlushMiddleware</code> 触发</td>
+                <td>由 <code>ConversationCompactor</code> 直接 new 一个 <code>MemoryFlushManager</code>，不经过 <code>MemoryFlushMiddleware</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:106-109">CompactionMiddleware.java:106-109</span></td>
+              </tr>
+              <tr>
+                <td><code>compaction.md</code> / <code>memory.md</code>：offload 到 <code>.log.jsonl</code></td>
+                <td>摘要里嵌入的是 <code>resolveContextPath()</code> 返回的 <code>.jsonl</code>；而每次转写<strong>两份都写</strong></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/session/SessionTranscriptWriter.java:166-182">SessionTranscriptWriter.java:166-182</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/session/SessionTree.java:326-347">SessionTree.java:326-347</span></td>
+              </tr>
+              <tr>
+                <td><code>memory.md</code>：三处 flush 用同一份 <code>flushPrompt</code></td>
+                <td>压缩前那次用 2 参构造，固定 <code>DEFAULT_FLUSH_PROMPT</code></td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/MemoryFlushManager.java:95-97">MemoryFlushManager.java:95-97</span></td>
+              </tr>
+              <tr>
+                <td><code>memory.md</code>：flush 与 offload 都是 fire-and-forget</td>
+                <td>只有 flush 是；offload 在压缩链路里同步执行，transcript 用 <code>concatWith</code> 阻塞到写完</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:155-183">ConversationCompactor.java:155-183</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/TranscriptMiddleware.java:61-79">TranscriptMiddleware.java:61-79</span></td>
+              </tr>
+              <tr>
+                <td><code>memory.md</code>：启用记忆后自动获得两个工具，<code>memory_search</code> 最多 30 条</td>
+                <td>注册 4 个对象、暴露 6 个工具名；<code>memory_search</code> 无条数上限</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2687-2693">HarnessAgent.java:2687-2693</span>、<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/MemorySearchTool.java:45-89">MemorySearchTool.java:45-89</span></td>
+              </tr>
+              <tr>
+                <td><code>memory.md</code>：溢出恢复的前提是你配了 <code>compaction(...)</code></td>
+                <td>默认已配，所以默认就具备恢复能力；反过来说 <code>compaction(null)</code> 会同时失去这条兜底</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:958-968">HarnessAgent.java:958-968</span></td>
+              </tr>
+              <tr>
+                <td><code>memory.md</code>：按「天数」归档日流水账</td>
+                <td>按<strong>文件名里的日期</strong>解析，解析失败直接跳过（<code>MEMORY.md</code> 因此不受影响）</td>
+                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/MemoryMaintenanceMiddleware.java:217-241">MemoryMaintenanceMiddleware.java:217-241</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cheatsheet">速查</h2>
+        <pre data-lang="java" data-file="一份「长会话 + 省钱」的常见配置">HarnessAgent agent =
+        HarnessAgent.builder()
+                .name("long-session")
+                .model("dashscope:qwen-plus")
+                .workspace(workspace)
+                // 压缩：小窗口模型要显式收 reserved，否则触发点会被 clamp
+                .compaction(CompactionConfig.builder()
+                        .reserved(4_000)
+                        .triggerMessages(60)
+                        .keepTokens(6_000)
+                        .model("dashscope:qwen-turbo")   // 摘要用便宜模型
+                        .build())
+                // 记忆：节流 per-call flush，压缩前与兜底不受影响
+                .memory(MemoryConfig.builder()
+                        .flushTrigger(MemoryConfig.FlushTrigger.throttled(Duration.ofMinutes(10)))
+                        .consolidationMinGap(Duration.ofHours(2))
+                        .model("dashscope:qwen-turbo")
+                        .build())
+                // 逐出：阈值调大一点，减少「刚卸载又要 read_file」的来回
+                .toolResultEviction(ToolResultEvictionConfig.builder()
+                        .maxResultChars(120_000)
+                        .build())
+                .build();</pre>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>想关掉什么</th><th>怎么写</th><th>连带影响</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>压缩</td><td><code>.compaction(null)</code> 或 <code>.disableCompaction()</code></td><td>溢出兜底一起失效</td></tr>
+              <tr><td>结果逐出</td><td><code>.toolResultEviction(null)</code> 或 <code>.disableToolResultEviction()</code></td><td>无，独立开关</td></tr>
+              <tr><td>prune</td><td><code>CompactionConfig.builder().pruneConfig(null)</code></td><td>只影响剪枝，摘要照跑</td></tr>
+              <tr><td>参数截断</td><td>不配即可（默认 null）</td><td>—</td></tr>
+              <tr><td>per-call flush</td><td><code>flushTrigger(FlushTrigger.never())</code></td><td>维护照跑</td></tr>
+              <tr><td>flush + 维护 + memory 注入</td><td><code>.disableMemoryHooks()</code></td><td>工具还在，MEMORY.md 仍注入</td></tr>
+              <tr><td>记忆工具</td><td><code>.disableMemoryTools()</code></td><td>6 个工具名全部消失</td></tr>
+              <tr><td>转写</td><td><code>.disableTranscript()</code></td><td>没有 <code>.jsonl</code>，<code>session_search</code> 失效</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>文件</th><th>内容</th><th>默认保留</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>MEMORY.md</code></td><td>策划后的长期记忆，注入 system prompt</td><td>受 <code>consolidationMaxTokens=4 000</code> 约束</td></tr>
+              <tr><td><code>memory/YYYY-MM-DD.md</code></td><td>append-only 日账</td><td>90 天后移到 <code>memory/archive/</code></td></tr>
+              <tr><td><code>memory/.consolidation_state</code></td><td>水位线</td><td>常驻</td></tr>
+              <tr><td><code>agents/&lt;id&gt;/sessions/&lt;sid&gt;.jsonl</code></td><td>LLM 面向的会话树</td><td>不自动删</td></tr>
+              <tr><td><code>agents/&lt;id&gt;/sessions/&lt;sid&gt;.log.jsonl</code></td><td>全量日志</td><td>180 天后删除</td></tr>
+              <tr><td><code>large_tool_results/&lt;agent&gt;/…</code></td><td>被逐出的工具结果</td><td>不自动删</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">陷阱与窍门</h2>
+        <div class="pitfall">
+          <div class="pf-h">1. 以为「没配 = 没开」</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>线上长会话突然出现一条 <code>__compaction_summary__</code> 消息，工作区里冒出 <code>MEMORY.md</code> 与 <code>memory/</code>。</dd>
+            <dt>因为</dt>
+            <dd>三份配置在 Builder 字段上就有非空默认值，两个 disable 都是 false<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1227-1231">HarnessAgent.java:1227-1231</span>。</dd>
+            <dt>改成</dt>
+            <dd>要「什么都不发生」，必须显式 <code>.compaction(null)</code>、<code>.toolResultEviction(null)</code>、<code>.disableMemoryHooks()</code>、<code>.disableTranscript()</code>；只写一个不够。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">2. 关掉压缩后，长会话直接抛异常</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>Context overflow: no compaction configured, unable to recover</code>，或者原始模型报错原样冒泡。</dd>
+            <dt>因为</dt>
+            <dd><code>onErrorResume</code> 只在 <code>compactionHook != null</code> 时挂载；<code>compaction(null)</code> 之后 hook 为 null，兜底路径根本不存在<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:958-968">:958-968</span>。</dd>
+            <dt>改成</dt>
+            <dd>想「平时不压缩、溢出时救一次」，把 <code>triggerMessages</code> 调得极大（例如 10 000）而不是置 <code>null</code>——这样兜底仍然在。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">3. 改了 <code>flushPrompt</code>，压缩前那次没变</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>per-call flush 的日账段落风格变了，压缩前 flush 的段落还是老风格；同一份文件里两种口径。</dd>
+            <dt>因为</dt>
+            <dd><code>CompactionMiddleware</code> 用 2 参构造，固定默认 prompt；只有 per-call 与溢出兜底读 <code>MemoryConfig.flushPrompt</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:106-107">CompactionMiddleware.java:106-107</span>。</dd>
+            <dt>改成</dt>
+            <dd>如果 prompt 里有硬性合规要求，别只依赖配置：要么关掉 <code>flushBeforeCompact</code>，要么在压缩链路外自己接管 flush。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">4. 以为无窗口模型会保留 8 000 token</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>自定义模型（<code>getContextWindowSize()</code> 返回 0）下，压缩后只剩 20 来条消息，比预期短很多。</dd>
+            <dt>因为</dt>
+            <dd>keep 的动态分支在无窗口时返回 0；<code>0</code> 在 <code>determineCutoffIndex</code> 里意味着「用 keepMessages」<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:199-215">:199-215</span>。trigger 也退到 160 000<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/CompactionConfig.java:63-67">CompactionConfig.java:63-67</span>。</dd>
+            <dt>改成</dt>
+            <dd>给模型实现一个真实的 <code>getContextWindowSize()</code>，或直接写死 <code>triggerTokens</code> 与 <code>keepTokens</code>。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">5. <code>memory_save</code> 之后，同一条事实出现两遍</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd><code>MEMORY.md</code> 里刚写了一条，过一会儿又出现一条措辞不同的同样内容。</dd>
+            <dt>因为</dt>
+            <dd><code>memory_save</code> 同时 append 到 <code>MEMORY.md</code> 和今日日账<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/MemorySaveTool.java:71-80">MemorySaveTool.java:71-80</span>；下一轮 consolidation 会把日账当作新条目再合并一次。</dd>
+            <dt>改成</dt>
+            <dd>要么接受（consolidation 的 prompt 里有去重规则），要么在 <code>consolidationPrompt</code> 里明确「与现有 MEMORY.md 重复则跳过」并要求输出保持精简。</dd>
+          </dl>
+        </div>
+        <div class="pitfall">
+          <div class="pf-h">6. 以为 transcript 是纯后台</div>
+          <dl>
+            <dt>你会看到</dt>
+            <dd>每次 <code>call()</code> 的总耗时比预期多出几毫秒到几十毫秒，且磁盘慢时更明显。</dd>
+            <dt>因为</dt>
+            <dd><code>concatWith</code> 会等 append 完成才 complete<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/TranscriptMiddleware.java:61-79">TranscriptMiddleware.java:61-79</span>。它不是 fire-and-forget。</dd>
+            <dt>改成</dt>
+            <dd>对延迟敏感的场景，用 <code>.disableTranscript()</code> 并在业务侧异步落盘；别指望它自己「后台化」。</dd>
+          </dl>
+        </div>
+
+        <h2 id="quiz">自检三问</h2>
+        <details>
+          <summary>默认配置下，一个 32K 窗口的模型什么时候触发压缩、保留多少？如果窗口只有 16K 呢？</summary>
+          <p>
+            32K：<code>trigger = 32 000 - 20 000 = 12 000</code>，<code>keep = min(8 000, max(2 000, 12 000 × 0.25 = 3 000)) = 3 000</code>。16K：<code>trigger</code> 算出 -4 000，被 clamp 成 <code>max(1, 8 000) = 8 000</code> 并打 warn；<code>keep</code> 算出 -1 000，夹到下限 2 000<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:167-215">CompactionMiddleware.java:167-215</span>。注意触发条件是「条数 ≥ 50 <strong>或</strong> token ≥ trigger」，所以短消息多的时候往往是条数先到。
+          </p>
+        </details>
+        <details>
+          <summary>压缩管线的顺序为什么是「prune → shouldCompact」，而不是反过来？</summary>
+          <p>
+            因为 prune 不花钱。<code>compactIfNeeded</code> 先做 <code>truncateArgs</code> 与 <code>pruneToolResults</code>，再重新估算 token、再判断<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:103-113">ConversationCompactor.java:103-113</span>。一次纯本地剪枝可能就把总量压到阈值以下，于是这一轮不需要调用摘要 LLM。反过来先判断，就会多付一次摘要费用。
+          </p>
+        </details>
+        <details>
+          <summary>为什么说「同一轮的 consolidation 看不到本轮 flush」？这是 bug 吗？</summary>
+          <p>
+            不是 bug，是洋葱顺序的推论。注册顺序里 <code>MemoryFlushMiddleware</code>（#6）在 <code>MemoryMaintenanceMiddleware</code>（#7）之外，流完成时内层先回，所以 maintenance 的 <code>doOnComplete</code> 先派发<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/middleware/MiddlewareChain.java:55-61">MiddlewareChain.java:55-61</span>。两者都异步，实际完成顺序不确定；再叠加 consolidation 只读「水位线之后」的日账，就更容易漏掉刚写入的段落。要立即生效就用 <code>memory_save</code>。
+          </p>
+        </details>
+
+        <h2 id="exercise">20 分钟动手练习</h2>
+        <ol class="steps">
+          <li>
+            <span class="sh">看见 prune 在摘要之前发生</span>
+            <div>
+              把日志级别调到 DEBUG，构造一段含 3 个「各 3 000 字符」工具结果的会话（很容易：让模型调 3 次 <code>execute</code> 跑 <code>dir /s</code>）。观察日志顺序：先出现 <code>Pruned N tool results (~M tokens freed)</code>，再出现 <code>Compaction triggered</code>。如果可剪总量不足 20 000 token，会一条 prune 日志都没有——这正是 <code>minimumTokens</code> 在起作用<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/memory/compaction/ConversationCompactor.java:555-557">:555-557</span>。
+            </div>
+          </li>
+          <li>
+            <span class="sh">亲手把 reserved 调到不合理</span>
+            <div>
+              用 <code>reserved(100_000)</code> 配一个 32K 窗口模型，跑一轮，确认日志出现 <code>Dynamic compaction trigger clamped</code>，且实际 trigger 是 16 000 而不是负数<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/middleware/CompactionMiddleware.java:170-181">:170-181</span>。然后改成 <code>reserved(4_000)</code>，对比触发点。
+            </div>
+          </li>
+          <li>
+            <span class="sh">验证「逐出与压缩互不影响」</span>
+            <div>
+              只调 <code>.compaction(null)</code>，保留 <code>toolResultEviction</code>，让一次 <code>execute</code> 输出超过 80 000 字符。确认上下文里出现占位符、<code>large_tool_results/</code> 下有文件，而没有任何摘要消息。再反过来（<code>toolResultEviction(null)</code> + 默认压缩）跑一次，确认结果相反。
+            </div>
+          </li>
+          <li>
+            <span class="sh">读一遍自己的会话树</span>
+            <div>
+              会话结束后直接读 <code>agents/demo/sessions/s-1.jsonl</code> 与 <code>s-1.log.jsonl</code>，对比行数：前者不含 <code>&lt;session_context&gt;</code> 与工具细节的完整输出，后者更全。再调 <code>session_history(agentId="demo", sessionId="s-1", lastN=5)</code>，确认它读的是 <code>.jsonl</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/tool/SessionSearchTool.java:188-203">SessionSearchTool.java:188-203</span>。
+            </div>
+          </li>
+        </ol>
+
+        <h2 id="next">完成这一章之后</h2>
+        <p>
+          到这里，Harness 的「上下文工程」主干就齐了：写什么进 prompt（工作区）、装不下怎么办（压缩 + 逐出）、记什么到磁盘（两层记忆 + 转写）。下一章换一个维度：<strong>能力本身怎么治理</strong>——技能从 <code>SKILL.md</code> 到按需披露，再到晋升闸门与 curator。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="16-skill.html">16 技能：从 SKILL.md 到治理</a></td><td>技能也走「按需注入」这条路，和本章的 MEMORY.md 注入预算可以对照看</td></tr>
+              <tr><td><a href="12-workspace-filesystem.html">12 工作区与文件系统</a></td><td><code>MEMORY.md</code>、<code>memory/</code>、<code>agents/&lt;id&gt;/sessions/</code> 的布局与 namespace 来源</td></tr>
+              <tr><td><a href="14-subagent-team.html">14 子 Agent 与团队</a></td><td>子 agent 有独立的会话槽位与上下文，压缩阈值对它们同样生效</td></tr>
+              <tr><td><a href="09-middleware-hook.html">9 中间件与 Hook</a></td><td>洋葱顺序的完整规则，本章只用了其中两条结论</td></tr>
+              <tr><td><a href="../appendix/api-cheatsheet.html#h-context">附录 C：Harness ③上下文与记忆</a></td><td><code>compaction</code> / <code>memory</code> / <code>toolResultEviction</code> 的一页清单</td></tr>
+              <tr><td>官方 <code>docs/v2/zh/docs/harness/compaction.md</code> 与 <code>memory.md</code></td><td>本章「文档 vs 源码」以它们为对照；配置示例仍可参考，结论以源码为准</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip">
+          <span class="ct">一句话记住这一章</span>
+          <p>
+            默认全开、prune 先于摘要、动态 keep 无窗口就退成 20 条、三处 flush 只有两处读你的 prompt——把四句话对上 <code>HarnessAgent:1227</code>、<code>ConversationCompactor:103</code>、<code>CompactionMiddleware:199</code>、<code>CompactionMiddleware:106</code>，剩下的都能推出来。
+          </p>
+        </div>
+      </article>
+    </main>
+
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
