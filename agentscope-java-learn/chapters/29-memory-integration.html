@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 29 章拆 AgentScope Java 2.0.4 的记忆接入：LongTermMemory 的 record / retrieve、三种模式、Mem0 / 百炼 / ReMe 的默认值与过滤差异，以及这条接口从 2.0.0 起被弃用后的迁移路径。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="29 记忆接入：Mem0 / 百炼 / ReMe · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 29 章拆 AgentScope Java 2.0.4 的记忆接入：LongTermMemory 的 record / retrieve、三种模式、Mem0 / 百炼 / ReMe 的默认值与过滤差异，以及这条接口从 2.0.0 起被弃用后的迁移路径。"
+    />
+    <title>29 记忆接入：Mem0 / 百炼 / ReMe · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="29-memory-integration" data-root="..">
+    <main>
+      <article class="article">
+        <h1>29 · 记忆接入：Mem0 / 百炼 / ReMe</h1>
+        <p class="lede">
+          第 28 章解决「模型从哪来」，这一章解决「跨会话记住什么」。先分清三件事：会话上下文、持久化状态、语义长期记忆。
+          官方文档把长期记忆收在 <code>LongTermMemory</code> 下，给出 Mem0、百炼、ReMe 三种实现；
+          但 2.0.4 源码已经把这条接口标成 legacy。本章既拆它现在怎么跑，也拆它为什么不该成为新项目的长期依赖。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>分清 <code>AgentState</code> 的会话上下文、<code>AgentStateStore</code> 的持久化状态与 <code>LongTermMemory</code> 的语义记忆</li>
+          <li>说清 <code>record / retrieve</code> 的调用时机，以及 <code>AGENT_CONTROL</code>、<code>STATIC_CONTROL</code>、<code>BOTH</code> 各装了什么</li>
+          <li>按默认值配置 Mem0、百炼、ReMe，并解释三者的隔离键、过滤规则与检索上限差异</li>
+          <li>识别「接口相同但写入内容不同」：工具结果、SYSTEM 消息、压缩历史在三个后端里命运不同</li>
+          <li>解释异步记录的 1 worker / 3 队列与丢任务边界，以及为什么记忆失败通常不会报错</li>
+          <li>给出从 legacy 记忆迁移到应用层或 <code>AgentStateStore</code> 的可执行方案</li>
+        </ul>
+
+        <h2 id="why">先分清三种「记忆」</h2>
+        <p>
+          同一个词在 AgentScope 里至少指三样东西。混在一起，就会出现「重启后历史没了」「换了会话还记得用户偏好」「记忆库越来越大」
+          这类看似矛盾的需求。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>层</th><th>负责什么</th><th>生命周期</th><th>本章位置</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>会话上下文</td><td>当前对话的消息、滚动摘要、工具与权限子上下文</td><td>一次会话，可被压缩</td><td><code>AgentState.context</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:29-42">AgentState.java:29-42</span></td></tr>
+              <tr><td>持久化状态</td><td>把 <code>AgentState</code> 按 <code>(userId, sessionId)</code> 存取，支持重启恢复</td><td>跨进程，跟会话绑定</td><td>第 31 章 <code>AgentStateStore</code></td></tr>
+              <tr><td>语义长期记忆</td><td>跨会话保存用户偏好、事实、决策，并按 query 检索</td><td>跨会话，跟用户 / Agent 绑定</td><td>本章 <code>LongTermMemory</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          三者不能互相替代：把会话历史塞进长期记忆，会得到重复、昂贵且难删除的向量库；把用户偏好只放在 <code>AgentState</code> 里，
+          换一个 <code>sessionId</code> 就丢了。先决定「这条信息属于哪一层」，再选后端。
+        </p>
+
+        <h2 id="truth">文档与源码的分叉：接口还在，方向已变</h2>
+        <p>
+          官方记忆概览仍把 <code>LongTermMemory</code> 描述成跨会话持久化用户偏好与事实的接口，并列出 Mem0、百炼、ReMe 三种实现
+          <span class="src" data-src="docs/v2/zh/integration/memory/overview.md:6-14">overview.md:6-14</span>。
+          三种实现都实现同一个接口，Agent 侧代码看起来可以完全不变
+          <span class="src" data-src="docs/v2/zh/integration/memory/overview.md:14">overview.md:14</span>。
+        </p>
+        <div class="callout danger">
+          <span class="ct">2.0.4 源码把这条路径标成 legacy</span>
+          <p>
+            <code>LongTermMemory</code> 带 <code>@Deprecated(forRemoval = true, since = "2.0.0")</code>，
+            注释写明长期记忆已移除，会话上下文改由 <code>AgentState.getContext()</code> 承载，跨会话持久化应在应用层集成
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:66-71">LongTermMemory.java:66-71</span>。
+            <code>LongTermMemoryMode</code> 也一起被弃用
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemoryMode.java:51-54">LongTermMemoryMode.java:51-54</span>，
+            <code>ReActAgent</code> 的相关 setter 被归入 1.x legacy 兼容层，并注明会在下一个小版本移除
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5255-5265">ReActAgent.java:5255-5265</span>。
+          </p>
+        </div>
+        <p>
+          「弃用」不等于「立刻不能用」。三个模块仍然实现该接口，<code>ReActAgent</code> 也仍会在
+          <code>longTermMemory != null</code> 时装配工具或 Hook
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5600-5602">ReActAgent.java:5600-5602</span>。
+          但新项目要把它当迁移对象，而不是新能力的地基。
+        </p>
+
+        <h2 id="pipeline">接口只有两个动作：record 与 retrieve</h2>
+        <p>
+          <code>LongTermMemory</code> 的契约非常小：<code>record(List&lt;Msg&gt;)</code> 把消息写入记忆，
+          <code>retrieve(Msg)</code> 用一条消息作为 query 检索相关记忆并返回文本
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:73-110">LongTermMemory.java:73-110</span>。
+          它没有 delete、list、update，也没有分页；删除与合规清理必须回到后端自己的控制台或 API。
+        </p>
+        <p>
+          框架在两种时机调用它：Agent 推理前用最后一条用户消息检索，把结果注入上下文；Agent 回复后用当前记忆里的全部消息记录。
+          具体装哪一套，由 <code>LongTermMemoryMode</code> 决定。
+        </p>
+
+        <h2 id="modes">三种模式：工具、Hook 与两者兼有</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模式</th><th>注册什么</th><th>Agent 侧表现</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>AGENT_CONTROL</code></td><td>只注册 <code>LongTermMemoryTools</code></td><td>Agent 自己决定何时调用 <code>recordToMemory</code> / <code>retrieveFromMemory</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemoryTools.java:103-152">LongTermMemoryTools.java:103-152</span></td></tr>
+              <tr><td><code>STATIC_CONTROL</code></td><td>只注册 <code>StaticLongTermMemoryHook</code></td><td>每次调用自动检索、自动记录，Agent 无感</td></tr>
+              <tr><td><code>BOTH</code>（默认）</td><td>工具 + Hook 都注册</td><td>自动记忆与主动记忆同时存在<span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5460-5489">ReActAgent.java:5460-5489</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          <code>ReActAgent.Builder</code> 里 <code>longTermMemoryMode</code> 默认就是 <code>BOTH</code>，
+          <code>longTermMemoryAsyncRecord</code> 默认 <code>false</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4834-4841">ReActAgent.java:4834-4841</span>。
+          也就是说，只挂 memory 不写模式，默认会同时装工具和 Hook。
+        </p>
+
+        <h2 id="lifecycle">一次调用里，记忆到底在什么时候进出</h2>
+        <p>
+          <code>STATIC_CONTROL</code> 的 Hook 做两件事。推理前，它取最后一条用户消息作为 query，
+          调用 <code>retrieve</code>，把结果包进 <code>&lt;long_term_memory&gt;</code> 标签，然后作为一条
+          <strong>role=USER、name=long_term_memory</strong> 的消息追加到输入消息末尾
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:144-198">StaticLongTermMemoryHook.java:144-198</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">注释说 system，代码是 user</span>
+          <p>
+            Hook 的 javadoc 写的是「注入为 system message」，但实现里角色是 <code>MsgRole.USER</code>，
+            并且追加在消息列表末尾，不是插到 system prompt 前面
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:171-186">StaticLongTermMemoryHook.java:171-186</span>。
+            如果你的 prompt 编排依赖角色或顺序，要按代码验证，而不是只读注释。
+          </p>
+        </div>
+        <p>
+          回复后，Hook 取 <code>memory.getMessages()</code> 的全量消息交给 <code>record</code>，不是只交本轮新增
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:221-251">StaticLongTermMemoryHook.java:221-251</span>。
+          这意味着后端必须自己做去重或抽取；否则多轮之后会把同一段对话反复写入。
+        </p>
+        <p>
+          <code>AGENT_CONTROL</code> 则把两个动作交给模型：<code>recordToMemory(thinking, content)</code> 让模型把事实写成消息，
+          <code>retrieveFromMemory(keywords)</code> 把关键词拼成 query
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemoryTools.java:103-152">LongTermMemoryTools.java:103-152</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemoryTools.java:181-214">LongTermMemoryTools.java:181-214</span>。
+          工具调用是否发生，取决于模型与提示词，不会像 Hook 那样每轮必跑。
+        </p>
+
+        <h2 id="mem0">Mem0：三层 ID + metadata 过滤</h2>
+        <p>
+          Mem0 适合「按用户 / Agent / run 分层，再加业务标签过滤」的场景。builder 要求 <code>apiBaseUrl</code>，
+          并且 <code>agentName</code>、<code>userId</code>、<code>runName</code> 至少填一个，否则 <code>build()</code> 直接抛异常
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:141-153">Mem0LongTermMemory.java:141-153</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:431-433">Mem0LongTermMemory.java:431-433</span>。
+          <code>apiType</code> 默认是 <code>PLATFORM</code>，<code>timeout</code> 默认 60 秒
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:141-143">Mem0LongTermMemory.java:141-143</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:306-313">Mem0LongTermMemory.java:306-313</span>。
+        </p>
+        <pre data-lang="java" data-file="Mem0 最小配置（示意）">Mem0LongTermMemory memory = Mem0LongTermMemory.builder()
+    .agentName("travel-bot")
+    .userId("alice")
+    .runName("trip-2026-spring")
+    .apiBaseUrl("http://localhost:8000")
+    .apiType(Mem0ApiType.SELF_HOSTED)
+    .build();</pre>
+        <p>
+          <code>PLATFORM</code> 与 <code>SELF_HOSTED</code> 不只是 URL 不同：前者写 <code>/v1/memories/</code>、
+          搜 <code>/v2/memories/search/</code>，用 <code>Authorization: Token</code>；后者写 <code>/memories</code>、
+          搜 <code>/search</code>，用 <code>X-API-Key</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0Client.java:49-54">Mem0Client.java:49-54</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0Client.java:112-118">Mem0Client.java:112-118</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0Client.java:150-153">Mem0Client.java:150-153</span>。
+          接错模式时，常见表现是 401 或 404，而不是「记忆为空」。
+        </p>
+        <p>
+          <code>metadata</code> 同时影响写入与检索：写入时随记忆持久化，检索时并入 filters，只有 key/value 完全匹配才返回
+          <span class="src" data-src="docs/v2/zh/integration/memory/mem0.md:74-94">mem0.md:74-94</span>。
+          检索 topK 在源码里固定为 5，不是 builder 参数
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:239-253">Mem0LongTermMemory.java:239-253</span>。
+          另外 Mem0 写入时会传 <code>infer(true)</code>，让服务端做记忆抽取
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:192-203">Mem0LongTermMemory.java:192-203</span>。
+        </p>
+
+        <h2 id="bailian">百炼：托管记忆库 + 检索增强流水线</h2>
+        <p>
+          百炼适合已经在阿里云上的团队。它要求 <code>apiKey</code> 与 <code>userId</code>，
+          <code>memoryLibraryId</code>、<code>projectId</code>、<code>profileSchema</code> 可选；
+          默认 base URL 是 <code>https://dashscope.aliyuncs.com</code>，topK 默认 10，minScore 默认 0.3，
+          rerank / judge / rewrite 三个开关默认都关
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:80-82">BailianLongTermMemory.java:80-82</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:326-337">BailianLongTermMemory.java:326-337</span>。
+          它实现了 <code>AutoCloseable</code>，建议 try-with-resources
+          <span class="src" data-src="docs/v2/zh/integration/memory/bailian.md:47">bailian.md:47</span>。
+        </p>
+        <pre data-lang="java" data-file="百炼记忆（示意）">try (BailianLongTermMemory memory = BailianLongTermMemory.builder()
+        .apiKey(System.getenv("DASHSCOPE_API_KEY"))
+        .userId("user_001")
+        .memoryLibraryId("lib_xxxxx")
+        .projectId("proj_xxxxx")
+        .topK(20)
+        .minScore(0.4)
+        .enableRerank(true)
+        .build()) {
+    // attach to agent
+}</pre>
+        <p>
+          写入侧它只收「自然对话」：仅 <code>USER</code> 与 <code>ASSISTANT</code>，含 <code>ToolUseBlock</code> 的助手消息会被跳过，
+          含 <code>&lt;compressed_history&gt;</code> 的压缩历史也会被跳过
+          <span class="src" data-src="docs/v2/zh/integration/memory/bailian.md:68-76">bailian.md:68-76</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:148-214">BailianLongTermMemory.java:148-214</span>。
+          这意味着工具执行结果不会自动变成长期记忆；要记，需要上层自己组织文本再写。
+        </p>
+
+        <h2 id="reme">ReMe：以 workspace 为单位的轨迹记忆</h2>
+        <p>
+          ReMe 的 <code>userId</code> 实际映射成 <code>workspace_id</code>，这是它切分记忆的最小单位；
+          <code>apiBaseUrl</code> 必填，<code>timeout</code> 默认 60 秒
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:74-84">ReMeLongTermMemory.java:74-84</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:258-261">ReMeLongTermMemory.java:258-261</span>。
+          写入时它把过滤后的消息拼成一个 <code>ReMeTrajectory</code>，整体送给 <code>add</code>；
+          检索时优先用服务端返回的 <code>answer</code>，没有才拼接 memory 片段
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:109-163">ReMeLongTermMemory.java:109-163</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:210-243">ReMeLongTermMemory.java:210-243</span>。
+        </p>
+        <pre data-lang="java" data-file="ReMe 最小配置（示意）">ReMeLongTermMemory memory = ReMeLongTermMemory.builder()
+    .userId("tenant-a:project-1")
+    .apiBaseUrl("http://localhost:8002")
+    .build();</pre>
+        <p>
+          ReMe 的检索 topK 在源码里固定为 5，没有 builder 开关；它也不支持更细的 metadata 过滤，需要按业务标签切分时只能编码进
+          <code>userId</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:220-223">ReMeLongTermMemory.java:220-223</span>
+          <span class="src" data-src="docs/v2/zh/integration/memory/reme.md:55-63">reme.md:55-63</span>。
+          写入过滤与百炼相同：只收 USER / 纯 ASSISTANT，跳过工具调用与压缩历史
+          <span class="src" data-src="docs/v2/zh/integration/memory/reme.md:49-53">reme.md:49-53</span>。
+        </p>
+
+        <h2 id="compare">三家对比：接口一样，默认值不一样</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>维度</th><th>Mem0</th><th>百炼</th><th>ReMe</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>隔离键</td><td><code>agentName</code> / <code>userId</code> / <code>runName</code> 至少一个</td><td><code>userId</code> 必填；library / project 可选</td><td><code>userId</code> 即 workspace</td></tr>
+              <tr><td>默认 topK</td><td>5（固定）</td><td>10（可配）</td><td>5（固定）</td></tr>
+              <tr><td>相似度阈值</td><td>无 builder 参数</td><td><code>minScore</code> 默认 0.3</td><td>无 builder 参数</td></tr>
+              <tr><td>metadata 过滤</td><td>支持，完全匹配</td><td>支持写入 metadata</td><td>不支持，编码进 workspace</td></tr>
+              <tr><td>HTTP 超时</td><td>默认 60s</td><td>未暴露 builder 参数</td><td>默认 60s</td></tr>
+              <tr><td>关闭资源</td><td>不需要</td><td><code>AutoCloseable</code></td><td>不需要</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          这些默认值都能在各自源码里找到：Mem0 topK 5
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:239-253">Mem0LongTermMemory.java:239-253</span>；
+          百炼 topK / minScore
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:80-82">BailianLongTermMemory.java:80-82</span>；
+          ReMe topK 与超时
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:220-223">ReMeLongTermMemory.java:220-223</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:258-261">ReMeLongTermMemory.java:258-261</span>。
+        </p>
+
+        <h2 id="filtering">同一个接口，写进去的内容并不相同</h2>
+        <p>
+          这是本章最容易被忽略的差异。三个后端都叫 <code>LongTermMemory</code>，但 <code>record</code> 的过滤逻辑不同，
+          「切换后端」可能直接改变记忆内容。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>消息类型</th><th>Mem0</th><th>百炼 / ReMe</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>USER</td><td>写入</td><td>写入</td></tr>
+              <tr><td>纯 ASSISTANT</td><td>写入</td><td>写入</td></tr>
+              <tr><td>含 ToolUseBlock 的 ASSISTANT</td><td>写入其文本内容；无文本则跳过</td><td>跳过</td></tr>
+              <tr><td>TOOL 结果</td><td>转成 assistant 文本写入</td><td>跳过</td></tr>
+              <tr><td>SYSTEM</td><td>转成 user 文本写入</td><td>跳过</td></tr>
+              <tr><td><code>&lt;compressed_history&gt;</code></td><td>跳过</td><td>跳过</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Mem0 的角色映射写在 <code>convertToMem0Message</code> 里：USER / SYSTEM 变 user，ASSISTANT / TOOL 变 assistant
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:206-225">Mem0LongTermMemory.java:206-225</span>。
+          百炼与 ReMe 则只收 USER 和纯 ASSISTANT，工具调用请求、工具结果、SYSTEM 都不会进入记忆
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:153-186">BailianLongTermMemory.java:153-186</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:115-153">ReMeLongTermMemory.java:115-153</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">切后端前先对齐「记什么」</span>
+          <p>
+            从 Mem0 切到百炼，工具结果会突然不再进入记忆；从百炼切到 Mem0，SYSTEM 指令可能被当成用户事实写进去。
+            先定义一份消息白名单，再比较检索质量，否则你会把「内容差异」误判成「模型变笨」。
+          </p>
+        </div>
+
+        <h2 id="async">异步记录：1 个 worker，3 个排队位</h2>
+        <p>
+          默认是同步记录：Hook 在返回前调用 <code>record</code>，成功与否不影响主流程，但会增加这一轮延迟。
+          打开 <code>longTermMemoryAsyncRecord(true)</code> 后，记录被丢到一个专用调度器：最多 1 个并发 worker、最多 3 个排队任务，
+          队列满时新任务会被拒绝并记录日志
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:81-86">StaticLongTermMemoryHook.java:81-86</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:208-215">StaticLongTermMemoryHook.java:208-215</span>。
+        </p>
+        <p>
+          所以「开了异步」不等于「一定记上」。高频对话、后端变慢或网络抖动时，队列会饱和，新的记录任务被丢弃；
+          而 Agent 的回复仍然正常返回。要判断是否丢，只能看日志或后端写入量，不能看 Agent 是否回复成功。
+        </p>
+
+        <h2 id="errors">失败通常不报错：记忆是「静默降级」</h2>
+        <p>
+          三个后端在检索失败时都倾向返回空字符串，而不是把异常抛给 Agent：Mem0 用 <code>onErrorReturn("")</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:288-291">Mem0LongTermMemory.java:288-291</span>，
+          百炼记录失败用 <code>onErrorComplete</code>、检索失败返回空
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:211-214">BailianLongTermMemory.java:211-214</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:271-272">BailianLongTermMemory.java:271-272</span>，
+          ReMe 检索失败也返回空
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:243">ReMeLongTermMemory.java:243</span>。
+          Hook 自己也会 catch 后只打日志
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:191-198">StaticLongTermMemoryHook.java:191-198</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>症状</th><th>更可能的原因</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Agent 像「失忆」但不报错</td><td>检索返回空，凭证或服务不可用</td><td>后端日志、API key、baseUrl</td></tr>
+              <tr><td>记忆写入量少于对话量</td><td>异步队列满，任务被丢</td><td><code>long-term-memory-record</code> 日志</td></tr>
+              <tr><td>记忆里出现工具结果 / 系统话术</td><td>Mem0 的角色映射与百炼不同</td><td>切换后端的写入白名单</td></tr>
+              <tr><td>检索始终不命中</td><td>metadata 过滤过严，或 topK / 阈值</td><td>metadata key、百炼 minScore、查询文本</td></tr>
+              <tr><td>成本持续上涨</td><td>每轮全量记录 + 后端抽取</td><td>是否重复写入、是否启用 infer / rewrite</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="deprecation">弃用之后：哪些还能用，哪些该搬走</h2>
+        <p>
+          先把边界说清楚：<code>LongTermMemory</code> 与 <code>LongTermMemoryMode</code> 从 2.0.0 起弃用，
+          <code>ReActAgent</code> 的 legacy setter 会在下一个小版本移除
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5255-5265">ReActAgent.java:5255-5265</span>。
+          但三个后端模块还在，接口也还在，所以「今天能跑」与「明年还能升级」是两个问题。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>资产</th><th>现在</th><th>建议</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Mem0 / 百炼 / ReMe 后端</td><td>仍实现 <code>LongTermMemory</code></td><td>可继续作为外部服务使用，不要绑死在 Agent 内部</td></tr>
+              <tr><td><code>ReActAgent.longTermMemory</code></td><td>仍可装配，已标 legacy</td><td>隔离到适配层，准备移除</td></tr>
+              <tr><td><code>AgentState.context</code></td><td>当前会话主线</td><td>继续用于对话上下文与压缩摘要</td></tr>
+              <tr><td>跨会话语义记忆</td><td>无新的内置接口</td><td>在应用层实现，通过工具或提示注入接入</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          换句话说，弃用的是「Agent 内置长期记忆」这条管线，不是「不要做记忆」。用户偏好、历史决策仍然值得存，
+          只是应该由应用决定存哪、怎么查、怎么删，再把结果作为工具或上下文交给 Agent。
+        </p>
+
+        <h2 id="migration">迁移路径：三种落地方式</h2>
+        <p>
+          迁移不是把类名换掉，而是把「谁拥有记忆」重新分配。下面三条路径可以单独用，也可以组合。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>路径</th><th>怎么做</th><th>适合</th><th>代价</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>冻结 legacy</td><td>保留现有后端，外面包一层自己的 <code>MemoryPort</code> 接口，Agent 只依赖这层</td><td>已有生产流量，暂时不能改</td><td>仍受弃用 API 约束，升级前必须再迁移</td></tr>
+              <tr><td>应用层记忆服务</td><td>自建数据库 / 向量库，把检索暴露成 <code>@Tool</code>，或每轮注入一段摘要</td><td>要控制删除、租户、成本与检索策略</td><td>需要自己实现写入、去重、权限与评测</td></tr>
+              <tr><td>状态存储</td><td>用 <code>AgentStateStore</code> 保存会话上下文，跨会话事实另存</td><td>只需要重启恢复与多副本共享</td><td>不提供语义检索，不能替代长期记忆</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          最稳的组合是「状态归状态、语义归语义」：<code>AgentStateStore</code> 负责会话恢复，应用层记忆服务负责用户偏好；
+          Agent 通过工具调用后者。这样既不用依赖 legacy Hook，也不会把两套数据混在一个存储里。
+        </p>
+
+        <h2 id="selection">选型：先看隔离与过滤，再看检索质量</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>优先考虑</th><th>注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>多租户 + 自定义业务标签过滤</td><td>Mem0</td><td>metadata 完全匹配；topK 固定 5</td></tr>
+              <tr><td>已在阿里云，想要 rerank / judge / rewrite</td><td>百炼</td><td>topK 10、minScore 0.3 起步；工具结果不入记忆</td></tr>
+              <tr><td>本地轻量，按 workspace 做轨迹摘要</td><td>ReMe</td><td>无 metadata；topK 固定 5</td></tr>
+              <tr><td>要自己控制删除、合规与成本</td><td>应用层服务</td><td>需要自建写入与检索链路</td></tr>
+              <tr><td>只要重启恢复会话</td><td><code>AgentStateStore</code></td><td>不是语义记忆，不能按 query 检索</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          官方选型建议也遵循这个顺序：本地一把 docker run 选 Mem0 或 ReMe；已在百炼选 Bailian；
+          需要 metadata 过滤选 Mem0；关注轨迹摘要选 ReMe
+          <span class="src" data-src="docs/v2/zh/integration/memory/overview.md:27-30">overview.md:27-30</span>。
+        </p>
+
+        <h2 id="operations">运维边界：删除、重复与成本</h2>
+        <p>
+          <strong>删除不在接口里。</strong><code>LongTermMemory</code> 只有 record / retrieve，没有 delete；
+          用户要求「忘掉我」时，必须去 Mem0 / 百炼 / ReMe 的控制台或 API 删除，再确认检索不再命中
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:91-110">LongTermMemory.java:91-110</span>。
+        </p>
+        <p>
+          <strong>重复写入是默认风险。</strong>Hook 每轮把全量上下文交给 record；Mem0 用 <code>infer(true)</code> 抽取，
+          百炼可用 <code>enableRewrite</code> 合并，ReMe 按轨迹抽取，但都不是「保证去重」。上线前要用多轮对话检查后端条目数，
+          而不是只看回复。
+        </p>
+        <p>
+          <strong>token 与延迟要算在检索上。</strong>检索结果会作为一条用户消息追加到输入末尾；
+          百炼的 rerank / judge / rewrite 都会增加调用延迟和费用，默认关闭是有原因的。先测命中率，再开增强。
+        </p>
+
+        <h2 id="cheatsheet">速查：默认值与开关</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>默认 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>默认模式</td><td><code>BOTH</code>（工具 + Hook）</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4834-4841">ReActAgent.java:4834-4841</span></td></tr>
+              <tr><td>异步记录</td><td>默认关；开启后 1 worker / 3 队列</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:81-86">StaticLongTermMemoryHook.java:81-86</span></td></tr>
+              <tr><td>记忆注入</td><td><code>&lt;long_term_memory&gt;</code>，role=USER，追加到末尾</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:171-186">StaticLongTermMemoryHook.java:171-186</span></td></tr>
+              <tr><td>Mem0 必填</td><td><code>apiBaseUrl</code> + 至少一个 ID；topK 5；timeout 60s</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:141-153">Mem0LongTermMemory.java:141-153</span></td></tr>
+              <tr><td>百炼默认</td><td>topK 10；minScore 0.3；三个增强开关 false</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:80-82">BailianLongTermMemory.java:80-82</span></td></tr>
+              <tr><td>ReMe 必填</td><td><code>userId</code> + <code>apiBaseUrl</code>；topK 5；timeout 60s</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:74-84">ReMeLongTermMemory.java:74-84</span></td></tr>
+              <tr><td>弃用起点</td><td><code>@Deprecated(forRemoval = true, since = "2.0.0")</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:66-71">LongTermMemory.java:66-71</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="java" data-file="三种模式（示意）">// 自动记忆（Hook）
+.longTermMemory(memory)
+.longTermMemoryMode(LongTermMemoryMode.STATIC_CONTROL)
+
+// 由 Agent 自己决定（工具）
+.longTermMemory(memory)
+.longTermMemoryMode(LongTermMemoryMode.AGENT_CONTROL)
+
+// 两者都要（默认）
+.longTermMemory(memory)
+.longTermMemoryMode(LongTermMemoryMode.BOTH)</pre>
+
+        <h2 id="pitfalls">六个坑：把「接口相同」当成「行为相同」</h2>
+        <p>
+          <strong>坑一：把长期记忆当状态存储。</strong><code>AgentState</code> 保存的是会话上下文，<code>LongTermMemory</code>
+          保存的是跨会话语义；重启恢复找前者，用户偏好找后者
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:29-42">AgentState.java:29-42</span>。
+        </p>
+        <p>
+          <strong>坑二：以为三个后端写入同样内容。</strong>Mem0 会把 SYSTEM / TOOL 转成 user / assistant 文本写入，
+          百炼与 ReMe 直接跳过；切换后端会改变记忆内容
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:206-225">Mem0LongTermMemory.java:206-225</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:153-186">BailianLongTermMemory.java:153-186</span>。
+        </p>
+        <p>
+          <strong>坑三：开了异步就以为不会丢。</strong>队列只有 3 个位置，饱和时新任务被拒绝；Agent 仍正常回复
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:81-86">StaticLongTermMemoryHook.java:81-86</span>。
+        </p>
+        <p>
+          <strong>坑四：每轮全量记录导致重复。</strong>Hook 把 <code>memory.getMessages()</code> 全部交给后端，
+          去重是后端的责任；多轮对话后要检查条目数
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:221-251">StaticLongTermMemoryHook.java:221-251</span>。
+        </p>
+        <p>
+          <strong>坑五：检索失败以为 Agent 会报错。</strong>三个后端大多返回空字符串，Hook 也只打日志；表现是「失忆」而不是异常
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/StaticLongTermMemoryHook.java:191-198">StaticLongTermMemoryHook.java:191-198</span>。
+        </p>
+        <p>
+          <strong>坑六：等接口提供删除。</strong><code>LongTermMemory</code> 没有 delete / list，合规删除必须去后端做
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:91-110">LongTermMemory.java:91-110</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary><code>LongTermMemory</code> 是 2.0.4 推荐的新接口吗？</summary>
+          <p>
+            不是。它从 2.0.0 起就标了 <code>@Deprecated(forRemoval = true)</code>，注释明确说长期记忆已移除，
+            会话上下文改由 <code>AgentState.getContext()</code> 承载；三个后端仍可用，但属于 legacy 路径
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:66-71">LongTermMemory.java:66-71</span>。
+          </p>
+        </details>
+        <details>
+          <summary><code>BOTH</code> 模式到底装了什么？</summary>
+          <p>
+            既注册 <code>LongTermMemoryTools</code>（让 Agent 主动 record / retrieve），又注册
+            <code>StaticLongTermMemoryHook</code>（每轮自动检索与记录）；它是 builder 的默认模式
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5460-5489">ReActAgent.java:5460-5489</span>。
+          </p>
+        </details>
+        <details>
+          <summary>Mem0 与百炼会写入同样的消息吗？</summary>
+          <p>
+            不会。Mem0 把 SYSTEM 映射成 user、TOOL 映射成 assistant；百炼只收 USER 与纯 ASSISTANT，
+            工具调用请求与工具结果都会被跳过。接口相同，不代表记忆内容相同
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:206-225">Mem0LongTermMemory.java:206-225</span>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:153-186">BailianLongTermMemory.java:153-186</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：给「跨会话偏好」选一条记忆路径</h2>
+        <p>目标不是把 Mem0 跑通，而是能解释每条信息为什么放在这一层。建议 45 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先分三层</span>
+            <div>列三条信息：当前对话的一句追问、用户的时区偏好、上一次任务的结论。分别归到上下文、长期记忆、状态 / 应用存储。</div>
+          </li>
+          <li>
+            <span class="sh">选一个后端</span>
+            <div>在 Mem0 / 百炼 / ReMe 中选一个，写下隔离键、必填参数、默认 topK 与超时。</div>
+          </li>
+          <li>
+            <span class="sh">跑一轮自动记忆</span>
+            <div>用 <code>STATIC_CONTROL</code> 发一条包含偏好的消息，确认后端出现记录，并在下一轮检索到。</div>
+          </li>
+          <li>
+            <span class="sh">切到工具模式</span>
+            <div>改成 <code>AGENT_CONTROL</code>，观察模型是否主动调用 <code>recordToMemory</code> / <code>retrieveFromMemory</code>；记录差异。</div>
+          </li>
+          <li>
+            <span class="sh">检查注入位置</span>
+            <div>打印发给模型的消息列表，确认记忆是 role=USER、name=long_term_memory，并追加在末尾。</div>
+          </li>
+          <li>
+            <span class="sh">制造一次失败</span>
+            <div>把 apiKey 改错，确认 Agent 仍能回复、检索变空；记录日志里实际报了什么。</div>
+          </li>
+          <li>
+            <span class="sh">检查重复与删除</span>
+            <div>连续三轮相近对话，观察后端条目数；再尝试从后端删除一条，确认检索不再命中。</div>
+          </li>
+          <li>
+            <span class="sh">写迁移结论</span>
+            <div>写三行：哪些信息继续用 legacy、哪些搬到应用层、哪些交给 <code>AgentStateStore</code>。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          记忆讲完，下一章进入分布式存储：当 Agent 从单机走到多副本，状态、工作区文件、沙箱快照和并发锁分别该落在哪。
+          那也是 <code>AgentStateStore</code> 与 <code>DistributedStore</code> 真正发挥作用的地方。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>第 30 章 · 分布式存储</td><td><code>DistributedStore</code> 的四件套与混合后端</td></tr>
+              <tr><td>第 31 章 · Agent 状态存储</td><td><code>AgentStateStore</code> 的序列化、CAS 与多副本</td></tr>
+              <tr><td>第 28 章 · 模型接入</td><td>记忆抽取通常还要一次模型调用，先确保模型可用</td></tr>
+              <tr><td><a href="15-compaction-memory.html">15 压缩与记忆</a></td><td>会话上下文、摘要与压缩策略</td></tr>
+              <tr><td><a href="27-extension-ecosystem.html">27 扩展生态总览</a></td><td>记忆在扩展生态里的位置</td></tr>
+              <tr><td><a href="../appendix/errata.html">附录 E · 勘误汇总</a></td><td>LongTermMemory 这类文档与源码差异的核对方式</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的记忆文档在 2.0.4 仓库里仍按 <code>LongTermMemory</code> 介绍实现；正文以源码为准，
+          默认值、过滤规则与弃用状态都标了具体出处。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
