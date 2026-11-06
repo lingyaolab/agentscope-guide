@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 27 章给 AgentScope Java 2.0.4 的扩展生态画地图：契约、模块与装配三层，出站能力与入站入口的方向，10 个模型 id / 6 个 artifact、记忆、状态、分布式存储、RAG、协议、渠道与技能仓库的选型边界。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="27 扩展生态总览：模型 / 记忆 / 存储 / RAG / 协议 / 渠道 · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 27 章给 AgentScope Java 2.0.4 的扩展生态画地图：契约、模块与装配三层，出站能力与入站入口的方向，10 个模型 id / 6 个 artifact、记忆、状态、分布式存储、RAG、协议、渠道与技能仓库的选型边界。"
+    />
+    <title>27 扩展生态总览：模型 / 记忆 / 存储 / RAG / 协议 / 渠道 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="27-extension-ecosystem" data-root="..">
+    <main>
+      <article class="article">
+        <h1>27 · 扩展生态总览：模型 / 记忆 / 存储 / RAG / 协议 / 渠道</h1>
+        <p class="lede">
+          前 26 章讲的是 Agent 本体、Harness 工程能力和 Service 控制面。从这一章开始，视角换成
+          <strong>「框架把哪些能力留成接口，由外部模块来实现」</strong>。生态不是插件市场：每个扩展都是独立的 Maven 模块，
+          按需引入；接口在 core / harness，实现在 extensions，装配靠 builder 或 Spring Boot starter。
+          先分清这两层，才不会把「加了一个依赖」误当成「换了一种运行时」。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>用「契约 → 实现 → 装配」三层解释一个扩展从依赖到生效的完整路径</li>
+          <li>分清出站能力（模型、记忆、RAG、状态、存储）与入站入口（渠道、协议、调度）</li>
+          <li>说清 10 个模型 id 为什么只对应 6 个 artifact，以及 <code>ModelRegistry</code> 如何解析</li>
+          <li>按需求选择记忆、状态存储、分布式存储、RAG、协议与渠道，而不是按品牌背模块名</li>
+          <li>识别 2.0.4 里仍可用但已标记弃用的记忆 / RAG 旧路径，并知道该往哪迁移</li>
+          <li>用 BOM、starter 与 <code>mvn dependency:tree</code> 控制版本和 classpath</li>
+        </ul>
+
+        <h2 id="why">为什么先看地图：生态的代价是 classpath</h2>
+        <p>
+          官方把集成扩展集中放在 <code>agentscope-extensions/</code> 下，每个扩展都是独立 Maven 模块，按需引入即可
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:6">overview.md:6</span>。
+          core 只保留共享契约，例如模型提供商全部迁到独立模块，core 里只留下模型接口
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:12">overview.md:12</span>。
+          这带来一个和普通「配置文件开关」完全不同的后果：<strong>引入哪个模块，决定了运行时存在哪些实现</strong>。
+        </p>
+        <p>
+          所以生态章最容易犯的错不是「不会配」，而是「配错层」：在 prompt 里调模型行为，却没发现 provider 模块不在
+          classpath；以为加了 Redis 依赖就有分布式状态，却没发现状态仍落在 JSON 文件；或者同时引入两套存储，最后不知道
+          哪个 builder 参数生效。下面三个问题能挡住大部分误判：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">它补的是哪个接口？</span>
+            <div><code>Model</code>、<code>AgentStateStore</code>、<code>Knowledge</code>、<code>Channel</code> 各自解决不同层的问题，接口不同就不能互相替代。</div>
+          </li>
+          <li>
+            <span class="sh">方向是出站还是入站？</span>
+            <div>Agent 主动调用模型 / 记忆 / RAG / 存储，和外部系统主动调用 Agent，是两条相反的依赖方向。</div>
+          </li>
+          <li>
+            <span class="sh">模块怎么进 classpath？</span>
+            <div>手写依赖、BOM 管版本、starter 自动装配，三条路最终都要落到同一组接口实现上。</div>
+          </li>
+        </ol>
+
+        <h2 id="shape">三层结构：契约、实现、装配</h2>
+        <p>
+          AgentScope 的扩展不是「在 core 里加 if」，而是三层分开。第一层是 core / harness 里的接口；第二层是
+          <code>agentscope-extensions-*</code> 里的实现；第三层是 builder 参数或 Spring Boot starter。
+          接口定义能力边界，模块提供实现，装配决定这一次运行用哪个实现。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>层</th><th>在哪</th><th>典型内容</th><th>换掉它会怎样</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>契约</td><td><code>agentscope-core</code> / <code>agentscope-harness</code></td><td><code>Model</code>、<code>AgentStateStore</code>、<code>Knowledge</code>、<code>Channel</code></td><td>改的是 Agent 能看见的能力种类</td></tr>
+              <tr><td>实现</td><td><code>agentscope-extensions-*</code></td><td>OpenAI、Redis、Dify、飞书等适配器</td><td>换的是同一能力的后端</td></tr>
+              <tr><td>装配</td><td>builder / starter / 配置</td><td><code>.model(...)</code>、<code>.stateStore(...)</code>、<code>.distributedStore(...)</code></td><td>决定本次运行实际用哪一个实现</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Maven 侧也一样：扩展模块依赖 core，但不重复声明版本；版本由 BOM 统一管理。根 POM 导入
+          <code>agentscope-dependencies-bom</code> 与 <code>agentscope-bom</code>
+          <span class="src" data-src="agentscope-java-2.0.4/pom.xml:134-151">pom.xml:134-151</span>，
+          具体模块版本在 BOM 的 <code>dependencyManagement</code> 里
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-distribution/agentscope-bom/pom.xml:80-87">pom.xml:80-87</span>。
+          以 OpenAI 扩展为例，它声明 <code>agentscope-core</code> 依赖时不写版本
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/pom.xml:29-37">pom.xml:29-37</span>。
+        </p>
+        <pre data-lang="xml" data-file="引入一个模型扩展（示意）">&lt;dependencyManagement&gt;
+  &lt;dependencies&gt;
+    &lt;dependency&gt;
+      &lt;groupId&gt;io.agentscope&lt;/groupId&gt;
+      &lt;artifactId&gt;agentscope-bom&lt;/artifactId&gt;
+      &lt;version&gt;2.0.4&lt;/version&gt;
+      &lt;type&gt;pom&lt;/type&gt;
+      &lt;scope&gt;import&lt;/scope&gt;
+    &lt;/dependency&gt;
+  &lt;/dependencies&gt;
+&lt;/dependencyManagement&gt;
+
+&lt;dependency&gt;
+  &lt;groupId&gt;io.agentscope&lt;/groupId&gt;
+  &lt;artifactId&gt;agentscope-extensions-model-dashscope&lt;/artifactId&gt;
+&lt;/dependency&gt;</pre>
+        <p>
+          装配层可以手写，也可以交给 starter。官方说明大多数扩展都有对应的 Spring Boot starter，用来减少手动装配代码
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:116-118">overview.md:116-118</span>；
+          仓库里现有 12 个 starter 模块，按 provider、协议与后台能力拆分
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/pom.xml:39-52">pom.xml:39-52</span>。
+        </p>
+
+        <h2 id="map">一张地图：十组扩展，十种职责</h2>
+        <p>
+          官方集成概览把扩展分成模型、分布式存储、沙箱、记忆、RAG、技能仓库、Channel、协议、基础设施与生态几组
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:8-113">overview.md:8-113</span>。
+          下面按「接口 + 方向 + 下一章」重排，方便先建立选择顺序。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>组</th><th>核心接口 / 契约</th><th>代表模块或后端</th><th>方向</th><th>下一章</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>模型</td><td><code>Model</code> + <code>ModelRegistry</code></td><td>OpenAI、DashScope、Gemini、Anthropic、Ollama</td><td>Agent 出站调用</td><td>第 28 章</td></tr>
+              <tr><td>记忆</td><td><code>LongTermMemory</code>（已弃用）</td><td>Mem0、百炼、ReMe</td><td>Agent 出站读写</td><td>第 29 章</td></tr>
+              <tr><td>状态</td><td><code>AgentStateStore</code></td><td>JSON 文件、Redis、MySQL、OSS</td><td>运行时持久化</td><td>第 31 章</td></tr>
+              <tr><td>分布式存储</td><td><code>DistributedStore</code></td><td>Redis、JDBC / MySQL、MongoDB、OSS</td><td>运行时持久化</td><td>第 30 章</td></tr>
+              <tr><td>沙箱</td><td><code>SandboxFilesystemSpec</code></td><td>Docker 内置；Kubernetes / AgentRun / Daytona / E2B<span class="src" data-src="docs/v2/zh/integration/overview.md:44-52">overview.md:44-52</span></td><td>工具执行隔离</td><td>第 13 章</td></tr>
+              <tr><td>RAG</td><td><code>Knowledge</code>（已弃用）</td><td>Simple、百炼、Dify、HayStack、RAGFlow</td><td>Agent 出站检索</td><td>第 32 章</td></tr>
+              <tr><td>协议</td><td>A2A / AG-UI / Agent Protocol</td><td>a2a-client/server、agui、agent-protocol</td><td>外部入站或互调</td><td>第 33 章</td></tr>
+              <tr><td>渠道</td><td><code>Channel</code></td><td>钉钉、飞书、企微、GitHub、GitLab</td><td>外部入站</td><td>第 34 章</td></tr>
+              <tr><td>技能仓库</td><td><code>AgentSkillRepository</code></td><td>Git、MySQL、PostgreSQL、Nacos</td><td>启动时加载</td><td>第 35 章</td></tr>
+              <tr><td>基础设施 / 生态</td><td>Nacos / Higress / Scheduler / Studio / Training</td><td>注册发现、网关工具、定时、调试、训练</td><td>横向治理</td><td>第 36 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          「已弃用」不是笔误：<code>LongTermMemory</code> 与 <code>Knowledge</code> 在 2.0.4 源码里都标了
+          <code>@Deprecated(forRemoval = true, since = "2.0.0")</code>，而官方集成文档仍在按这两个接口介绍实现。
+          本章先标出差异，第 29、32 章再拆迁移方式。
+        </p>
+
+        <h2 id="direction">方向：谁调用谁，决定故障往哪找</h2>
+        <p>
+          同样是「接一个外部系统」，方向不同，故障位置完全不同。模型、记忆、RAG、状态存储与沙箱是 Agent
+          <strong>主动出站</strong>：Agent 发起请求，外部系统返回结果。渠道、协议和调度器则是
+          <strong>外部入站</strong>：平台把消息或任务送进来，Agent 再执行。基础设施则更像横向治理，既可能被 Agent 调用，
+          也可能替 Agent 做注册、发现或触发。
+        </p>
+        <div class="loop">
+          <div class="lp">外部入口<small>Channel / Protocol / Scheduler</small></div>
+          <span class="lp-arrow">→</span>
+          <div class="lp model">Agent 运行时<small>ReAct / Harness</small></div>
+          <span class="lp-arrow">→</span>
+          <div class="lp tool">出站能力<small>Model / Memory / RAG / Store</small></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方向</th><th>典型扩展</th><th>平台差异由谁吸收</th><th>排障先看</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>出站</td><td>模型、记忆、RAG、状态 / 分布式存储、沙箱</td><td>适配器把外部 API 转成统一接口</td><td>凭证、网络、超时、序列化</td></tr>
+              <tr><td>入站</td><td>Channel、A2A / AG-UI / Agent Protocol、Scheduler</td><td>适配器负责认证、签名、消息解析与回复投递<span class="src" data-src="docs/v2/zh/integration/channel/index.md:6">index.md:6</span></td><td>回调地址、签名、路由、幂等</td></tr>
+              <tr><td>横向</td><td>Nacos 注册发现 / 配置、Higress 工具网关、Studio、Training</td><td>扩展点接企业基础设施</td><td>注册状态、配置版本、采样链路</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          一个常见误判是把入站问题当模型问题：飞书不回消息，先看 webhook 签名和路由，而不是换模型；反过来，
+          模型 401 也不该去查渠道配置。方向表的价值就是让你在五分钟内选对日志。
+        </p>
+
+        <h2 id="model">模型：10 个 id，6 个 artifact</h2>
+        <p>
+          模型是最典型的「一个接口，多种 provider」。core 只保留共享模型契约，provider 全部在独立模块里
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:12">overview.md:12</span>。
+          <code>Model</code> 接口本身很小：一个流式 <code>stream(...)</code> 方法、一个模型名，外加结构化输出、上下文窗口等
+          带默认实现的 optional 能力
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/Model.java:22-33">Model.java:22-33</span>。
+        </p>
+        <p>
+          真正容易混的是 artifact 与 provider id。官方表格列了 10 个 provider id，但只落在 6 个 artifact 上：
+          <code>agentscope-extensions-model-openai</code> 同时承载 OpenAI、DeepSeek、GLM、Kimi、MiniMax 五个 id
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:14-25">overview.md:14-25</span>。
+          所以「支持 DeepSeek」不等于要加一个 DeepSeek 依赖，而是加 OpenAI 兼容模块，再选 <code>deepseek:&lt;model&gt;</code>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>artifact</th><th>可用 id</th><th>标准凭据</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>agentscope-extensions-model-openai</code></td><td><code>openai:</code>、<code>deepseek:</code>、<code>glm:</code>、<code>kimi:</code>、<code>minimax:</code></td><td><code>OPENAI_API_KEY</code> 等各 provider 变量</td></tr>
+              <tr><td><code>agentscope-extensions-model-openai-official</code></td><td><code>openai-official:</code></td><td><code>OPENAI_API_KEY</code></td></tr>
+              <tr><td><code>agentscope-extensions-model-dashscope</code></td><td><code>dashscope:</code> / <code>qwen*</code></td><td><code>DASHSCOPE_API_KEY</code></td></tr>
+              <tr><td><code>agentscope-extensions-model-gemini</code></td><td><code>gemini:</code></td><td><code>GEMINI_API_KEY</code></td></tr>
+              <tr><td><code>agentscope-extensions-model-anthropic</code></td><td><code>anthropic:</code></td><td><code>ANTHROPIC_API_KEY</code></td></tr>
+              <tr><td><code>agentscope-extensions-model-ollama</code></td><td><code>ollama:</code></td><td><code>OLLAMA_BASE_URL</code>（可选）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          解析由 <code>ModelRegistry</code> 完成：它支持按名字注册实例、按正则注册 factory，也支持从
+          <code>ModelProvider</code> SPI 加载；用户注册的 factory 优先级高于 SPI
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:36-53">ModelRegistry.java:36-53</span>。
+          模块在 classpath 时，才能通过字符串 id 选到对应 provider
+          <span class="src" data-src="docs/v2/zh/integration/model/index.md:6">index.md:6</span>。
+        </p>
+        <pre data-lang="java" data-file="按 id 解析模型（示意）">Model model = ModelRegistry.resolve("dashscope:qwen-plus");
+ReActAgent agent = ReActAgent.builder()
+    .name("assistant")
+    .model(model)
+    .build();</pre>
+        <p class="footnote">
+          仓库里的 <code>agentscope-extensions-model-e2e-tests</code> 是测试模块，不是面向用户的集成依赖
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:28-32">overview.md:28-32</span>。
+          第 28 章会逐个拆 provider 的凭证、formatter 与切换方式。
+        </p>
+
+        <h2 id="memory">记忆：接口在，方向变了</h2>
+        <p>
+          官方文档把 <code>LongTermMemory</code> 描述成跨会话持久化用户偏好与事实的接口，并给出 Mem0、百炼、ReMe 三种实现：
+          Mem0 适合本地或自托管、需要 metadata 过滤；百炼适合已在阿里云上；ReMe 关注工作区级轨迹摘要
+          <span class="src" data-src="docs/v2/zh/integration/memory/overview.md:6-12">overview.md:6-12</span>
+          <span class="src" data-src="docs/v2/zh/integration/memory/overview.md:27-30">overview.md:27-30</span>。
+          三者都实现同一个接口，因此 Agent 侧代码可以不变
+          <span class="src" data-src="docs/v2/zh/integration/memory/overview.md:14">overview.md:14</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">2.0.4 的源码把这条路径标成 legacy</span>
+          <p>
+            <code>LongTermMemory</code> 接口本身带 <code>@Deprecated(forRemoval = true, since = "2.0.0")</code>，
+            注释写明长期记忆已移除，会话上下文改由 <code>AgentState</code> 的 context 承载，跨会话持久化应在应用层集成
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:66-71">LongTermMemory.java:66-71</span>。
+            <code>ReActAgent</code> 的 <code>longTermMemory(...)</code> 也被归入 1.x legacy 兼容 setter，
+            并注明会在下一个小版本移除
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5255-5265">ReActAgent.java:5255-5265</span>。
+          </p>
+        </div>
+        <p>
+          这不代表三个模块不能用。Mem0、百炼、ReMe 仍然实现了该接口
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/src/main/java/io/agentscope/core/memory/mem0/Mem0LongTermMemory.java:113">Mem0LongTermMemory.java:113</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/src/main/java/io/agentscope/core/memory/bailian/BailianLongTermMemory.java:77">BailianLongTermMemory.java:77</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/src/main/java/io/agentscope/core/memory/reme/ReMeLongTermMemory.java:66">ReMeLongTermMemory.java:66</span>。
+          新代码要做的不是「找更好的 memory 后端」，而是先决定：这部分状态到底该放在会话上下文、应用数据库，还是外部记忆服务。
+          第 29 章会把这条差异逐项对齐。
+        </p>
+
+        <h2 id="state">状态：AgentStateStore 是当前主线</h2>
+        <p>
+          和记忆不同，<code>AgentStateStore</code> 是 2.0.4 的当前接口：它按 <code>(userId, sessionId)</code> 保存、读取、删除和列出
+          <code>State</code> 对象，供 Agent、Toolkit 等有状态组件跨进程恢复
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:22-38">AgentStateStore.java:22-38</span>。
+          它还定义 <code>UNVERSIONED = -1</code>，用 <code>saveIfVersion</code> 表达乐观并发
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:63-67">AgentStateStore.java:63-67</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>实现</th><th>所在模块</th><th>适合场景</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>InMemoryAgentStateStore</code></td><td><code>agentscope-core</code></td><td>单元测试</td></tr>
+              <tr><td><code>JsonFileAgentStateStore</code></td><td><code>agentscope-core</code></td><td>单机开发，HarnessAgent 默认</td></tr>
+              <tr><td><code>RedisAgentStateStore</code></td><td><code>agentscope-extensions-redis</code></td><td>多副本生产首选</td></tr>
+              <tr><td><code>MysqlAgentStateStore</code></td><td><code>agentscope-extensions-mysql</code></td><td>已有关系型数据库</td></tr>
+              <tr><td><code>OssAgentStateStore</code></td><td><code>agentscope-extensions-oss</code></td><td>阿里云对象存储生态</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          这些实现的定位见官方会话状态概览
+          <span class="src" data-src="docs/v2/zh/integration/session/overview.md:20-28">overview.md:20-28</span>。
+          HarnessAgent 默认是 JSON 文件，意味着「本地能跑」和「多副本能跑」不是同一件事。第 31 章会拆序列化、CAS 与分布式约束。
+        </p>
+
+        <h2 id="distributed">分布式存储：一个门面，四种能力</h2>
+        <p>
+          <code>DistributedStore</code> 是 harness 里的一站式门面：它把 Agent 状态、工作区文件系统 KV、沙箱快照和沙箱并发锁
+          收在同一组 getter 下
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:30-73">DistributedStore.java:30-73</span>。
+          官方给的能力矩阵很直接：Redis 四项齐全；MySQL 四项齐全；MongoDB 四项齐全；OSS 没有
+          <code>SandboxExecutionGuard</code>，因为对象存储不适合做分布式锁
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:24-33">index.md:24-33</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>能力</th><th>Redis</th><th>MySQL / JDBC</th><th>MongoDB</th><th>OSS</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>AgentStateStore</code></td><td>有</td><td>有</td><td>有</td><td>有</td></tr>
+              <tr><td><code>BaseStore</code> 工作区 KV</td><td>有</td><td>有</td><td>有</td><td>有</td></tr>
+              <tr><td><code>SandboxSnapshotSpec</code></td><td>有</td><td>有</td><td>有</td><td>有</td></tr>
+              <tr><td><code>SandboxExecutionGuard</code></td><td>有</td><td>有</td><td>有</td><td>无</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          允许混搭：状态和文件放 MySQL，沙箱锁和快照放 Redis；优先级是显式 builder 参数高于 <code>distributedStore</code>
+          自动注入，高于本地默认
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:35-56">index.md:35-56</span>
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:76-82">index.md:76-82</span>。
+          还有一个容易漏的边界：aistio 控制面托管的 Store 覆盖协调类能力，但 <code>AgentStateStore</code> 仍需自备后端
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:91-108">index.md:91-108</span>。
+          第 30 章会拆这四件套和混合配置。
+        </p>
+
+        <h2 id="rag">RAG：五种知识库，一条旧接口</h2>
+        <p>
+          官方把 RAG 统一到 <code>Knowledge</code> 接口：Agent 通过它检索文档片段，再交给模型生成
+          <span class="src" data-src="docs/v2/zh/integration/rag/overview.md:6">overview.md:6</span>。
+          五种实现分别是 Simple（自建 embedding + 向量库）、百炼、Dify、HayStack 与 RAGFlow
+          <span class="src" data-src="docs/v2/zh/integration/rag/overview.md:8-14">overview.md:8-14</span>。
+          接入方式也一样：<code>.knowledge(...)</code> 加 <code>.ragMode(...)</code>，或者包装成
+          <code>KnowledgeRetrievalTools</code> 让 Agent 自己决定是否检索
+          <span class="src" data-src="docs/v2/zh/integration/rag/overview.md:16-33">overview.md:16-33</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">Knowledge 也是 legacy</span>
+          <p>
+            <code>Knowledge</code> 接口在 2.0.4 里同样标了 <code>@Deprecated(forRemoval = true, since = "2.0.0")</code>，
+            注释写明 rag 包已移除，检索应在应用层集成
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/Knowledge.java:30-34">Knowledge.java:30-34</span>；
+            <code>ReActAgent</code> 的 <code>knowledge(...)</code> 也注明「legacy adapters remain functional」
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5289-5293">ReActAgent.java:5289-5293</span>。
+            五个实现仍然可用，但新项目应先判断：检索是放在 Agent 外部做成工具，还是继续走 legacy 适配器。
+          </p>
+        </div>
+        <p>
+          选型上，官方给的建议是按已有基础设施选：要自己掌控 embedding 和向量库选 Simple；已在百炼、Dify、HayStack 或
+          RAGFlow 上维护知识库，就选对应适配器。除 Simple 外，其余实现只负责检索，文档导入与更新走对应平台
+          <span class="src" data-src="docs/v2/zh/integration/rag/overview.md:35-45">overview.md:35-45</span>。
+          第 32 章会拆接口与检索参数。
+        </p>
+
+        <h2 id="protocol">协议：三个方向，别混成一个「对外接口」</h2>
+        <p>
+          协议解决的是 Agent 与外部世界如何互操作。官方把三种协议分开：A2A 用于 Agent 之间互相调用、组成工作流；
+          AG-UI 把 Agent 事件流标准化输出给前端 UI；Agent Protocol 提供 HTTP 标准接口，让其他系统提交任务
+          <span class="src" data-src="docs/v2/zh/integration/protocol/overview.md:6-14">overview.md:6-14</span>。
+          还有一个 Chat Completions Web，把 Agent 包装成 OpenAI Chat Completions 兼容接口。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>选什么</th><th>边界</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>前端实时消费事件流（含 ThinkingBlock）</td><td>AG-UI</td><td>面向用户</td></tr>
+              <tr><td>业务系统通过 REST 调度 Agent / 托管远程子 Agent</td><td>Agent Protocol</td><td>内部任务 HTTP 面</td></tr>
+              <tr><td>多个 Agent 或外部 Agent 系统互相调用</td><td>A2A</td><td>外部互操作</td></tr>
+              <tr><td>现有 OpenAI 客户端直接接入</td><td>Chat Completions Web</td><td>兼容层，不是新协议</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          官方给的分层是：AG-UI 面向用户，Agent Protocol 是内部远程子 Agent / 任务 HTTP 面，A2A 用于外部互操作
+          <span class="src" data-src="docs/v2/zh/integration/protocol/overview.md:16-22">overview.md:16-22</span>。
+          第 33 章会拆服务端与客户端怎么接。
+        </p>
+
+        <h2 id="channel">渠道：入站适配器，重点在共享状态</h2>
+        <p>
+          Channel 适配器把 Agent 接进真实消息平台：钉钉走 Stream 持久 WebSocket，飞书走事件订阅回调，GitHub / GitLab
+          走 Webhook，企业微信走加密回调
+          <span class="src" data-src="docs/v2/zh/integration/channel/index.md:8-14">index.md:8-14</span>。
+          所有适配器遵循同一模式：入站解析成 <code>InboundMessage</code>，去重、防循环，再通过 Gateway 分发；出站调用平台 API
+          把回复投递回去
+          <span class="src" data-src="docs/v2/zh/integration/channel/index.md:18-21">index.md:18-21</span>。
+        </p>
+        <p>
+          平台差异被三个共享组件吃掉：<code>IdempotencyStore</code> 按消息 id 去重、<code>BotLoopGuard</code> 按 peer 限速防止
+          bot 死循环、<code>AccessTokenStore</code> 缓存出站 token
+          <span class="src" data-src="docs/v2/zh/integration/channel/index.md:23-27">index.md:23-27</span>。
+          但它们的默认实现把状态放在 JVM 内，多副本部署时必须换成共享实现，否则平台重试会在不同副本上各处理一次
+          <span class="src" data-src="docs/v2/zh/integration/channel/index.md:29-38">index.md:29-38</span>。
+          第 34 章会拆 webhook 校验、消息路由与平台差异。
+        </p>
+
+        <h2 id="skill">技能仓库：把 Markdown 技能放到哪</h2>
+        <p>
+          <code>AgentSkill</code> 用 Markdown 加资源文件描述可复用技能，<code>AgentSkillRepository</code> 负责把这些技能从外部存储加载进来，
+          再交给 Toolkit / ReActAgent 使用
+          <span class="src" data-src="docs/v2/zh/integration/skill/overview.md:6">overview.md:6</span>。
+          官方给了 Git、MySQL、PostgreSQL 三种实现，Nacos 也提供一个技能仓库
+          <span class="src" data-src="docs/v2/zh/integration/skill/overview.md:8-16">overview.md:8-16</span>。
+        </p>
+        <p>
+          选型不是看数据库品牌，而是看变更流程：想用 Git PR 管控、可读可 review，选 Git；要在管理后台动态修改、立即生效，
+          选 MySQL、PostgreSQL 或 Nacos
+          <span class="src" data-src="docs/v2/zh/integration/skill/overview.md:34-38">overview.md:34-38</span>。
+          接口本身很小：按名取、列全部、保存和删除
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/skill/repository/AgentSkillRepository.java:35-60">AgentSkillRepository.java:35-60</span>。
+          第 35 章会拆三种仓库的存储布局与同步。
+        </p>
+
+        <h2 id="infra">基础设施与生态：治理、触发和调试</h2>
+        <p>
+          最后一组不属于「模型 / 记忆 / RAG」任何一类，而是把 Agent 接到企业基础设施和开发工具上。Higress 通过 MCP 把网关上的工具
+          引入 Toolkit；Nacos 做 A2A AgentCard 注册发现、Prompt 配置中心和 Skill 仓库；Scheduler 用 XXL-Job / Quartz
+          让 Agent 按 CRON 或固定速率定时跑
+          <span class="src" data-src="docs/v2/zh/integration/infrastructure/overview.md:6-19">overview.md:6-19</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>扩展</th><th>解决什么</th><th>什么时候需要</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Higress</td><td>把网关上的工具通过 MCP 接进 Toolkit</td><td>工具已经在网关上治理</td></tr>
+              <tr><td>Nacos</td><td>AgentCard 注册发现、Prompt 配置、Skill 仓库</td><td>多 Agent 需要发现与动态配置</td></tr>
+              <tr><td>Scheduler</td><td>CRON / 固定速率触发 Agent</td><td>工作不是人触发，而是定时触发</td></tr>
+              <tr><td>Studio</td><td>可视化调试 Agent</td><td>开发阶段观察事件与调用链</td></tr>
+              <tr><td>Training</td><td>生产流量采样喂给训练后端</td><td>需要闭环优化模型</td></tr>
+              <tr><td>Chat Completions Web</td><td>OpenAI 兼容接口</td><td>现有客户端零改造接入</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          Studio、Training、Chat Completions Web 属于「生态扩展」，不对应记忆 / 会话 / RAG / 协议中的某一类
+          <span class="src" data-src="docs/v2/zh/integration/ecosystem/overview.md:6-12">overview.md:6-12</span>。
+          第 36 章会把这一组一起收尾。
+        </p>
+
+        <h2 id="assembly">装配：一条依赖，三种生效方式</h2>
+        <p>
+          扩展进 classpath 只是第一步，真正生效还要经过装配。手写 builder 最直观；Spring Boot starter 把常见 bean 和配置项
+          预先装好；BOM 则只负责版本，不负责实例。三者职责不要混。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方式</th><th>你写什么</th><th>适合</th><th>容易错在哪</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>手写 builder</td><td>显式传 <code>Model</code> / <code>AgentStateStore</code> / <code>Channel</code></td><td>需要精细控制、非 Spring 应用</td><td>忘了传，运行时用默认实现</td></tr>
+              <tr><td>Spring Boot starter</td><td>加 starter 依赖 + 配置项</td><td>Spring 应用、想少写装配代码</td><td>以为 starter 会替代所有 builder 参数</td></tr>
+              <tr><td>BOM</td><td>只导入 <code>agentscope-bom</code></td><td>统一版本</td><td>以为 BOM 会自动引入模块</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          推荐的扩展节奏是「一次只加一种能力」：先让模型通，再加状态存储，再加记忆或 RAG，最后才接入渠道或协议。
+          每加一个模块，都用 <code>mvn dependency:tree -Dincludes=io.agentscope</code> 确认实际引入的 artifact，
+          再用一个最小任务验证。这样出问题时能立刻判断是新模块、凭证还是装配顺序。
+        </p>
+
+        <h2 id="selection">选型：先接口，再后端，最后部署</h2>
+        <p>
+          下面这张表把常见需求映射到接口与章节。注意「接口」列：同一行里换后端，Agent 代码通常不变；跨行换接口，
+          才是真正的架构变化。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>先选接口</th><th>再选后端 / 模块</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>接一个托管或本地模型</td><td><code>Model</code></td><td>按 provider id 选 6 个 artifact 之一</td><td>28</td></tr>
+              <tr><td>跨会话记住用户偏好</td><td>先判断是否真需要长期记忆</td><td>Mem0 / 百炼 / ReMe，注意 legacy 标记</td><td>29</td></tr>
+              <tr><td>多副本共享 Agent 状态</td><td><code>AgentStateStore</code></td><td>Redis 优先；已有库用 MySQL；OSS 看生态</td><td>31</td></tr>
+              <tr><td>状态、文件、快照、锁一起换</td><td><code>DistributedStore</code></td><td>Redis 最全；OSS 需混入锁后端</td><td>30</td></tr>
+              <tr><td>让 Agent 查企业知识库</td><td><code>Knowledge</code> 或外部工具</td><td>Simple / 百炼 / Dify / HayStack / RAGFlow</td><td>32</td></tr>
+              <tr><td>前端实时看 Agent 事件</td><td>AG-UI</td><td>agui 扩展 / starter</td><td>33</td></tr>
+              <tr><td>业务系统提交任务</td><td>Agent Protocol</td><td>agent-protocol 扩展</td><td>33</td></tr>
+              <tr><td>Agent 之间互调</td><td>A2A</td><td>a2a-client / a2a-server</td><td>33</td></tr>
+              <tr><td>接入 IM / 代码平台</td><td><code>Channel</code></td><td>钉钉 / 飞书 / 企微 / GitHub / GitLab</td><td>34</td></tr>
+              <tr><td>技能要版本化或动态发布</td><td><code>AgentSkillRepository</code></td><td>Git / MySQL / PostgreSQL / Nacos</td><td>35</td></tr>
+              <tr><td>定时触发、注册发现、网关工具</td><td>Scheduler / Nacos / Higress</td><td>对应基础设施扩展</td><td>36</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          三步顺序不要反：<strong>先确认接口</strong>，否则会把「换模型」做成「换记忆」；<strong>再确认后端能力</strong>，
+          否则会以为所有分布式存储都能做锁；<strong>最后确认部署形态</strong>，否则单机默认在多副本下会悄悄失效。
+        </p>
+
+        <h2 id="failure">故障边界：扩展问题通常不在 prompt 里</h2>
+        <p>
+          扩展接错时，Agent 往往还能启动、还能回复，只是行为不对。下面这些症状值得先查依赖和装配，而不是改提示词。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>症状</th><th>更可能的原因</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>ModelRegistry</code> 解析不到 id</td><td>provider 模块不在 classpath，或 id 拼错</td><td><code>mvn dependency:tree</code>、artifact 与 id 对照</td></tr>
+              <tr><td>模型 401 / 403</td><td>凭据缺失、变量名不对、环境没重建</td><td>provider 标准环境变量、容器环境</td></tr>
+              <tr><td>重启后状态丢失</td><td>仍在用 JSON / 内存存储</td><td>是否真正传入 <code>AgentStateStore</code></td></tr>
+              <tr><td>多副本重复处理消息</td><td>Channel 去重状态在 JVM 内</td><td>共享 <code>InboundEventDeduplicator</code></td></tr>
+              <tr><td>OSS 沙箱并发冲突</td><td>对象存储没有 <code>SandboxExecutionGuard</code></td><td>混入 Redis 的 guard</td></tr>
+              <tr><td>编译警告 deprecated</td><td>用了 legacy 记忆 / RAG setter</td><td>迁移到应用层或新接口</td></tr>
+              <tr><td>版本冲突 / 方法不存在</td><td>扩展与 core 版本不配套</td><td>BOM 与 <code>dependency:tree</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          最后一类最隐蔽：代码能编译，运行时却用了默认实现。比如 <code>HarnessAgent</code> 没传
+          <code>distributedStore</code> 时，状态可能仍落在本地 JSON；单机测试全过，多副本才暴露。判断方法不是读配置，
+          而是看运行时实际注入的对象和落盘位置。
+        </p>
+
+        <h2 id="cheatsheet">速查：命名、数量与默认值</h2>
+        <p>先记命名规律，再记几个容易混的数字：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>规则 / 值</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>多数扩展 artifact 命名</td><td><code>agentscope-extensions-&lt;group&gt;-&lt;backend&gt;</code></td><td><span class="src" data-src="docs/v2/zh/integration/overview.md:6">overview.md:6</span></td></tr>
+              <tr><td>模型 provider id</td><td>10 个 id，落在 6 个 artifact</td><td><span class="src" data-src="docs/v2/zh/integration/overview.md:14-25">overview.md:14-25</span></td></tr>
+              <tr><td>记忆后端</td><td>Mem0 / 百炼 / ReMe</td><td><span class="src" data-src="docs/v2/zh/integration/memory/overview.md:8-12">overview.md:8-12</span></td></tr>
+              <tr><td>RAG 后端</td><td>Simple / 百炼 / Dify / HayStack / RAGFlow</td><td><span class="src" data-src="docs/v2/zh/integration/rag/overview.md:8-14">overview.md:8-14</span></td></tr>
+              <tr><td>Channel 平台</td><td>钉钉 / 飞书 / 企微 / GitHub / GitLab</td><td><span class="src" data-src="docs/v2/zh/integration/channel/index.md:8-14">index.md:8-14</span></td></tr>
+              <tr><td>HarnessAgent 默认状态存储</td><td><code>JsonFileAgentStateStore</code></td><td><span class="src" data-src="docs/v2/zh/integration/session/overview.md:25">overview.md:25</span></td></tr>
+              <tr><td>分布式优先级</td><td>显式 builder &gt; <code>distributedStore</code> &gt; 本地默认</td><td><span class="src" data-src="docs/v2/zh/integration/distributed/index.md:76-82">index.md:76-82</span></td></tr>
+              <tr><td>Java 版本</td><td>17</td><td><span class="src" data-src="agentscope-java-2.0.4/pom.xml:33-35">pom.xml:33-35</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="bash" data-file="检查实际引入的扩展（示意）">mvn dependency:tree -Dincludes=io.agentscope
+mvn dependency:tree -Dincludes=io.agentscope:agentscope-extensions-model-dashscope</pre>
+
+        <h2 id="pitfalls">六个坑：模块名、接口与部署形态</h2>
+        <p>
+          <strong>坑一：把 artifact 当 provider。</strong><code>agentscope-extensions-model-openai</code> 同时服务 OpenAI、DeepSeek、
+          GLM、Kimi 与 MiniMax；加一个依赖不等于只支持一个品牌
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:14-25">overview.md:14-25</span>。
+        </p>
+        <p>
+          <strong>坑二：模块没进 classpath 就调 prompt。</strong>模块不在 classpath 时，<code>ModelRegistry</code> 解析不到对应 id；
+          先看依赖树，再谈提示词
+          <span class="src" data-src="docs/v2/zh/integration/model/index.md:6">index.md:6</span>。
+        </p>
+        <p>
+          <strong>坑三：给每个扩展手写版本。</strong>版本应由 BOM 统一管理；扩展自己的 POM 也不写 core 的版本
+          <span class="src" data-src="agentscope-java-2.0.4/pom.xml:134-151">pom.xml:134-151</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/pom.xml:35-37">pom.xml:35-37</span>。
+        </p>
+        <p>
+          <strong>坑四：把 legacy 当新主线。</strong><code>LongTermMemory</code> 与 <code>Knowledge</code> 都从 2.0.0 起标记移除，
+          新代码要用它们之前先读源码注释
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:66-71">LongTermMemory.java:66-71</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/Knowledge.java:30-34">Knowledge.java:30-34</span>。
+        </p>
+        <p>
+          <strong>坑五：单机默认直接上多副本。</strong>JSON 状态、JVM 内去重、无分布式锁，在单机测试里都不会暴露；
+          多副本前先换成共享实现
+          <span class="src" data-src="docs/v2/zh/integration/session/overview.md:25">overview.md:25</span>
+          <span class="src" data-src="docs/v2/zh/integration/channel/index.md:29-38">index.md:29-38</span>。
+        </p>
+        <p>
+          <strong>坑六：以为 <code>DistributedStore</code> 什么都能托管。</strong>它覆盖状态、文件、快照和锁，但 aistio 托管 Store
+          仍要求自备 <code>AgentStateStore</code>；OSS 也没有分布式锁
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:24-33">index.md:24-33</span>
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:91-108">index.md:91-108</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>加了 <code>agentscope-extensions-model-openai</code>，是不是就只支持 OpenAI？</summary>
+          <p>
+            不是。这个 artifact 同时承载 OpenAI、DeepSeek、GLM、Kimi、MiniMax 五个 id；支持哪个 provider 由 id 和对应凭据决定，
+            不是由 artifact 名字决定
+            <span class="src" data-src="docs/v2/zh/integration/overview.md:14-25">overview.md:14-25</span>。
+          </p>
+        </details>
+        <details>
+          <summary>用了 <code>DistributedStore</code>，还需要理解 <code>AgentStateStore</code> 吗？</summary>
+          <p>
+            需要。它只是把 <code>AgentStateStore</code>、<code>BaseStore</code>、快照和锁收成一个门面，能力与优先级仍按各组件计算；
+            aistio 托管 Store 甚至要求另备 <code>AgentStateStore</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:30-73">DistributedStore.java:30-73</span>
+            <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:91-108">index.md:91-108</span>。
+          </p>
+        </details>
+        <details>
+          <summary>2.0.4 里 <code>LongTermMemory</code> 和 <code>Knowledge</code> 还是推荐入口吗？</summary>
+          <p>
+            不是。两者都标了 <code>@Deprecated(forRemoval = true, since = "2.0.0")</code>，适配器仍可用，但新代码应先评估应用层方案；
+            这也是第 29、32 章要重点拆的文档与源码差异
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:66-71">LongTermMemory.java:66-71</span>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/Knowledge.java:30-34">Knowledge.java:30-34</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：给一个真实需求选扩展</h2>
+        <p>目标不是把所有模块都装一遍，而是能写出一份可解释的选型记录。建议 45 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">写需求与方向</span>
+            <div>选一个真实场景（例如「企业微信里回答内部文档问题」），标出它需要哪些出站能力和哪些入站入口。</div>
+          </li>
+          <li>
+            <span class="sh">先选接口</span>
+            <div>把需求映射到 <code>Model</code>、<code>Channel</code>、<code>Knowledge</code> 或 <code>AgentStateStore</code>，写下为什么不是另一层。</div>
+          </li>
+          <li>
+            <span class="sh">只加一个模型模块</span>
+            <div>导入 BOM，加一个 provider artifact，用 <code>ModelRegistry.resolve</code> 跑通一次最小调用；记录实际使用的 id。</div>
+          </li>
+          <li>
+            <span class="sh">换一次装配方式</span>
+            <div>再引入对应 starter，比较手写 builder 与自动装配的差异；确认哪个参数最终生效。</div>
+          </li>
+          <li>
+            <span class="sh">检查状态落点</span>
+            <div>确认当前用的是 JSON、内存还是远端 <code>AgentStateStore</code>；重启一次，看历史是否还在。</div>
+          </li>
+          <li>
+            <span class="sh">读一次弃用警告</span>
+            <div>加一个 legacy 记忆或 RAG 适配器，观察编译警告，并把警告原文记进选型记录。</div>
+          </li>
+          <li>
+            <span class="sh">画依赖图</span>
+            <div>用 <code>mvn dependency:tree</code> 画出本次引入的 artifact，标出哪些是直接依赖、哪些是传递依赖。</div>
+          </li>
+          <li>
+            <span class="sh">最后写三行结论</span>
+            <div>分别写「接口选了什么」「后端为什么是它」「部署形态还缺什么」，确保每一行都能独立核对。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          地图画完，接下来逐组拆开。下一章从模型开始：同样一个 <code>Model</code> 接口，不同 provider 在凭证、formatter、
+          结构化输出和错误映射上有什么区别，以及怎样在不改 Agent 代码的前提下切换。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>第 28 章 · 模型接入</td><td>10 个 provider id、6 个 artifact、凭证与切换方式</td></tr>
+              <tr><td>第 29–32 章 · 记忆、存储、RAG</td><td>把运行时能力逐个落到接口与后端</td></tr>
+              <tr><td>第 33–36 章 · 协议、渠道、技能、基础设施</td><td>把 Agent 接到外部世界与企业治理</td></tr>
+              <tr><td>官方「集成概览」</td><td>全部扩展的分组与模块清单<span class="src" data-src="docs/v2/zh/integration/overview.md:6-118">overview.md:6-118</span></td></tr>
+              <tr><td><a href="26-production-operations.html">26 生产部署与运维</a></td><td>先有可备份、可升级的部署，再谈扩展</td></tr>
+              <tr><td><a href="19-service-basics.html">19 Service 起站</a></td><td>五个组件与 Compose 安装，扩展的运行底座</td></tr>
+              <tr><td><a href="../appendix/api-cheatsheet.html">附录 C · API 速查</a></td><td>Builder 方法按能力分组，适合装配时对照</td></tr>
+              <tr><td><a href="../appendix/source-map.html">附录 D · 源码地图</a></td><td>从接口名定位到 core / harness 的包</td></tr>
+              <tr><td><a href="../appendix/errata.html">附录 E · 勘误汇总</a></td><td>记忆 / RAG 这类文档与源码差异的核对方式</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的集成文档在 2.0.4 仓库里仍带「预览」提示
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:1-4">overview.md:1-4</span>。
+          凡文档与实现有出入的地方，正文以源码为准；数字、默认值与弃用状态都标了具体出处。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
