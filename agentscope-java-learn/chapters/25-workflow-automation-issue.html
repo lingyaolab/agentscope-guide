@@ -1,0 +1,850 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="第 25 章拆 Workflow、Automation、Issue 与 Inbox 的闭环：草稿与发布版本、触发与执行、Run 终态与 Issue 验收为什么是三件不同的事。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="25 Workflow、自动化与 Issue 闭环 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="第 25 章拆 Workflow、Automation、Issue 与 Inbox 的闭环：草稿与发布版本、触发与执行、Run 终态与 Issue 验收为什么是三件不同的事。" />
+    <title>25 Workflow、自动化与 Issue 闭环 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="25-workflow-automation-issue" data-root="..">
+    <main>
+      <article class="article">
+        <h1>25 · Workflow、自动化与 Issue 闭环</h1>
+        <p class="lede">
+          第 24 章的 Team 把「下一步派给谁」交给 Leader 临场决定；这一章反过来，把步骤、依赖和人工关口提前写进一张图。
+          Workflow 负责声明式拓扑，Automation 负责「什么时候触发」，Issue 保存工作本身，Inbox 承担验收。
+          全章只围绕三组容易混淆的事实：<strong>草稿不等于已发布 revision</strong>、
+          <strong>触发被接收不等于工作已执行</strong>、<strong>Run 到终态不等于 Issue 已验收</strong>。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 Workflow、Automation、Issue、Inbox 各自保存哪一层事实，以及什么时候该用 Team</li>
+          <li>从 draft 到 revision 再到 Run，解释一次 Workflow 执行究竟冻结了什么</li>
+          <li>读懂八种节点、边状态、join 模式、CEL 输入映射与发布前校验</li>
+          <li>区分 fail_fast、continue、partial_success，并知道 Run 终态如何回写 Issue</li>
+          <li>配置 cron 与 Webhook，处理时区、幂等、跳过、排队和两种超时</li>
+          <li>按验收闸门逐项排查「Run 已结束，Issue 为什么还不能 Done」</li>
+        </ul>
+
+        <h2 id="why">边界：四张表，四种职责</h2>
+        <p>
+          Workflow 适合有明确步骤、依赖和人工关口的工作：定义先保存为可编辑草稿，发布后生成不可变 revision，
+          每次执行固定一个 revision，所以后续改草稿不会改变已有运行的拓扑
+          <span class="src" data-src="docs/v2/zh/service/workflows.md:10">workflows.md:10</span>。
+          Automation 则把「何时触发」与「执行什么工作」保存成一条可复用规则，适合日报、定期检查和外部事件
+          <span class="src" data-src="docs/v2/zh/service/automation.md:10">automation.md:10</span>。
+          Issue 保存目标、负责人、讨论、执行记录和交付物，即使执行失败或服务重启，工作本身仍然可追踪
+          <span class="src" data-src="docs/v2/zh/service/issues.md:10">issues.md:10</span>。
+          Inbox 只汇集与你相关的更新、审批和验收，不替你做决定
+          <span class="src" data-src="docs/v2/zh/service/inbox.md:10">inbox.md:10</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>对象</th><th>回答的问题</th><th>不该拿它回答</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><strong>Definition / Revision</strong></td><td>步骤与依赖长什么样，发布的是哪一版</td><td>这次工作有没有人验收</td></tr>
+              <tr><td><strong>Automation / Delivery</strong></td><td>什么时候收到触发，事件有没有被过滤</td><td>工作是否已经执行成功</td></tr>
+              <tr><td><strong>Run / Node</strong></td><td>本次执行走到哪一步，哪个节点失败或等待</td><td>业务交付是否满足验收标准</td></tr>
+              <tr><td><strong>Issue / Inbox</strong></td><td>工作目标、负责人、结果与最终验收</td><td>执行图内部如何调度</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          Automation 与 Workflow 的分工是官方明确写出的：需要固定多步骤拓扑时用 Workflow，Automation 主要负责触发
+          <span class="src" data-src="docs/v2/zh/service/automation.md:10">automation.md:10</span>。
+        </p>
+        <div class="callout">
+          <span class="ct">一句话判断</span>
+          <p>
+            如果「下一步做什么」在运行前就能画出来，用 Workflow；如果需要模型看上下文再决定，用 Team。
+            Automation 不改变这个判断，它只负责在某个时间点或某个事件之后把工作交出去。
+          </p>
+        </div>
+
+        <h2 id="lifecycle">定义与版本：draft 可改，revision 不可变</h2>
+        <p>
+          一个 Workflow 定义同时保存 <code>draftSpec</code>、<code>draftVersion</code> 与 <code>version</code>；
+          发布后生成独立的 <code>OrchestrationRevision</code>，带递增的 <code>revision</code>、规范化后的
+          <code>spec</code>、<code>checksum</code> 和发布者
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/orchestration.go:122-148">orchestration.go:122-148</span>。
+          发布动作会先校验草稿，再把规范化 JSON 的 SHA-256 作为校验和写入 revision
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:87-107">service.go:87-107</span>。
+          因而「修改草稿」与「发布新版本」是两个独立动作，已有 Run 也不会被悄悄换图。
+        </p>
+        <ul class="timeline">
+          <li>
+            <span class="who">编辑</span>
+            <span class="what">在设计器或 JSON 中修改 <code>draftSpec</code>；图形编辑与 JSON 编辑操作的是同一份定义<span class="src" data-src="docs/v2/zh/service/workflows.md:47">workflows.md:47</span>。</span>
+          </li>
+          <li>
+            <span class="who">校验</span>
+            <span class="what">检查节点 key、必填字段、边引用、终态条件与无环性；这一步不会生成可执行版本。</span>
+          </li>
+          <li>
+            <span class="who">发布</span>
+            <span class="what">服务端重新校验草稿并创建不可变 revision；已归档的定义不能发布<span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:87-107">service.go:87-107</span>。</span>
+          </li>
+          <li>
+            <span class="who">启动</span>
+            <span class="what">选择已发布 revision 启动 Run；未指定时使用最新 revision，没有发布版本则返回冲突<span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:138-152">service.go:138-152</span>。</span>
+          </li>
+          <li>
+            <span class="who">冻结</span>
+            <span class="what">Run 只记录 <code>definitionRevisionId</code>，之后所有节点都从该 revision materialize，不受草稿继续修改影响<span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/orchestration.go:150-178">orchestration.go:150-178</span>。</span>
+          </li>
+        </ul>
+        <p>一个最小的发布定义可以写成这样，节点 key 在整张图中必须唯一：</p>
+        <pre data-lang="json" data-file="Workflow definition draftSpec（示意）">{
+  "nodes": [
+    { "key": "draft", "type": "agent", "agentId": "&lt;agent-uuid&gt;",
+      "input": { "request": "run.input.request" } },
+    { "key": "approve", "type": "approval",
+      "approval": { "approverRef": "&lt;human-ref&gt;", "prompt": "检查草稿后批准" } },
+    { "key": "publish", "type": "agent", "agentId": "&lt;agent-uuid&gt;",
+      "input": { "draft": "nodes.draft.output" } }
+  ],
+  "edges": [
+    { "from": "draft", "to": "approve" },
+    { "from": "approve", "to": "publish" }
+  ]
+}</pre>
+        <p class="footnote">
+          节点与边字段见
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:39-65">spec.go:39-65</span>；
+          发布成功返回 201，校验失败返回 422
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:183-202">orchestration_handler.go:183-202</span>。
+        </p>
+
+        <h2 id="nodes">八种节点：谁在等，谁在选，谁在汇合</h2>
+        <p>
+          节点类型在源码里只有八个取值，每一种都对应不同的等待或收敛语义
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/orchestration.go:74-85">orchestration.go:74-85</span>。
+          官方节点表也按这个顺序列出用途
+          <span class="src" data-src="docs/v2/zh/service/workflows.md:28-39">workflows.md:28-39</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>节点</th><th>引擎做什么</th><th>必填或关键配置</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>agent</code></td><td>为节点创建一条 Agent 任务，节点进入 waiting，任务终态后回写结果</td><td><code>agentId</code> 必须是合法 UUID<span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:174-177">spec.go:174-177</span></td></tr>
+              <tr><td><code>team</code></td><td>物化 Team 协调节点，由 Leader 驱动动态协作</td><td><code>teamRef</code> 必须是 active Team 的 UUID<span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:179-181">spec.go:179-181</span></td></tr>
+              <tr><td><code>condition</code></td><td>作为显式分支点；节点成功后由出边的 condition 选择下游，节点自身条件为假时直接 skipped</td><td>条件必须返回 bool；节点级条件见 <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:263-279">engine.go:263-279</span>，边条件见 <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:180-190">engine.go:180-190</span></td></tr>
+              <tr><td><code>join</code></td><td>按 all / any / quorum 决定入边满足多少条才放行</td><td>默认 <code>all</code>；quorum 必须为正且不超过入边数<span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:191-201">spec.go:191-201</span></td></tr>
+              <tr><td><code>approval</code></td><td>创建 pending approval，节点 waiting；批准后成功，拒绝后失败</td><td><code>approverRef</code> 必填<span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:206-208">spec.go:206-208</span></td></tr>
+              <tr><td><code>timer</code></td><td>记录唤醒时间，到点后节点成功</td><td><code>at</code> 或正的 <code>durationSeconds</code> 二选一<span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:209-211">spec.go:209-211</span></td></tr>
+              <tr><td><code>signal</code></td><td>等待名为 <code>signalName</code> 的外部信号事件</td><td><code>signalName</code> 必填<span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:203-205">spec.go:203-205</span></td></tr>
+              <tr><td><code>subrun</code></td><td>按固定 revision 启动子 Run，子 Run 终态后回写节点</td><td><code>definitionRevisionId</code> 必须是已发布 revision<span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:212-214">spec.go:212-214</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          边不是「执行完就一定走」：<code>on</code> 只能声明终态，未声明时默认只接受 <code>succeeded</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/materialize.go:93-102">materialize.go:93-102</span>。
+          普通节点要等所有入边都到达终态，再看其中有多少条被状态和条件选中；没有选中任何入边就 skipped。
+          join 节点则只看选中的数量是否达到 all / any / quorum 的门槛
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:192-223">engine.go:192-223</span>。
+        </p>
+
+        <h2 id="validate">发布前校验：一张图必须先能证明自己可终止</h2>
+        <p>
+          服务端把校验集中在 <code>ParseAndValidateSpec</code>：节点 key 非空且唯一、类型必须属于八种、每种节点的必填字段、
+          <code>issueMode</code> 只能是 inherit / child、<code>failurePolicy</code> 只能是三种之一、边只能引用已知节点、
+          <code>on</code> 只能是终态、整图必须无环
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:150-281">spec.go:150-281</span>。
+          这些检查同时约束草稿创建、显式校验接口和发布动作。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>检查项</th><th>不通过时说明什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>节点 key / 类型</td><td>拼写错误、复制粘贴后的重复 key，或用了未支持的节点类型</td></tr>
+              <tr><td>节点必填字段</td><td>agent 缺 <code>agentId</code>、team 缺 <code>teamRef</code>、approval 缺审批人、timer 既无时间也无时长</td></tr>
+              <tr><td>边与终态</td><td>边指向不存在的节点、自环，或把 running 之类非终态写进 <code>on</code></td></tr>
+              <tr><td>join 门槛</td><td>quorum 为 0，或大于实际入边数，永远无法满足</td></tr>
+              <tr><td>无环性</td><td>拓扑排序没有访问完所有节点，说明图里存在环</td></tr>
+              <tr><td>CEL 表达式</td><td>条件或 input 映射编译失败；表达式超过 4096 字节也会被拒绝</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          CEL 在这里是受限表达式，不是任意脚本：表达式最长 4096 字节，单次求值默认超时 50 ms，输出最大 1 MiB
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:32">spec.go:32</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:85-97">spec.go:85-97</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/spec.go:113-147">spec.go:113-147</span>。
+          可引用的顶层变量只有 <code>run</code>、<code>issue</code>、<code>trigger</code> 与 <code>nodes</code>：
+          运行输入和变量在 <code>run</code> 下，前序节点的状态、输出与产物在 <code>nodes</code> 下
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:665-678">engine.go:665-678</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">描边不等于可执行</span>
+          <p>
+            设计器能画出来，只说明 JSON 结构可保存；发布前仍要过一次服务端校验。尤其是 join 门槛、边状态和 CEL 类型，
+            它们经常在运行到一半时才暴露，而发布校验本来可以提前拦住。
+          </p>
+        </div>
+
+        <h2 id="start">启动：一个 Issue、一个幂等键、一个固定 revision</h2>
+        <p>
+          启动接口要求 <code>idempotencyKey</code>，并且 <code>issueId</code> 与内联 <code>issue</code> 必须二选一
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:124-130">service.go:124-130</span>。
+          幂等锁按 tenant / namespace / key 串行化，同一把键不会并发创建两个 Run
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:110-123">service.go:110-123</span>。
+          内联创建 Issue 时，服务端会用确定性的 UUID 复用同一项工作，并把负责人清空，避免 Workflow 目标与 assignee 同时存在
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:160-172">service.go:160-172</span>。
+        </p>
+        <pre data-lang="json" data-file="启动 Workflow 的请求体（示意）">{
+  "idempotencyKey": "release-2026-11-06-001",
+  "issueId": "&lt;issue-uuid&gt;",
+  "input": { "request": "整理本周发布说明" },
+  "triggerType": "manual"
+}</pre>
+        <p>
+          Run 创建时状态是 <code>planned</code>，模式固定为 <code>declared</code>，并绑定 revision
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:183-205">service.go:183-205</span>。
+          如果省略 <code>triggerType</code>，默认写 <code>definition</code>；它不是业务事件类型，只表示这次启动来自定义入口。
+          启动成功后返回 201 和 <code>run</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:216-264">orchestration_handler.go:216-264</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>情况</th><th>结果</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>缺少幂等键，或 Issue 来源不是恰好一个</td><td>400</td><td>请求体；不要靠重试绕过参数错误</td></tr>
+              <tr><td>定义已归档、没有已发布 revision，或 Issue 跨命名空间</td><td>409</td><td>是否先发布；Issue 与定义是否同租户同空间</td></tr>
+              <tr><td>revision 里的定义校验失败</td><td>422</td><td>revision 是否来自旧数据或手工改写</td></tr>
+              <tr><td>成功创建 Run</td><td>201</td><td>保存 <code>run.id</code>，再用它查图与事件</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          状态码来源：启动成功
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:259-264">orchestration_handler.go:259-264</span>；
+          无效定义映射 422
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:688-693">orchestration_handler.go:688-693</span>；
+          冲突映射 409
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/taskplane_handler.go:862-871">taskplane_handler.go:862-871</span>。
+        </p>
+
+        <h2 id="scheduling">调度：planned 先落图，ready 才真正开始</h2>
+        <p>
+          引擎不会在创建 Run 时就把所有节点跑起来。状态为 <code>planned</code> 的 Run 先执行一次可恢复的 materialization：
+          按 revision 校验后，用确定性 ID 建节点和边，入度为 0 的节点直接置为 <code>ready</code>，其余为 <code>pending</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/materialize.go:26-83">materialize.go:26-83</span>。
+          写入 <code>run.started</code> 事件后，Run 才从 planned 进入 running
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/materialize.go:104-110">materialize.go:104-110</span>。
+          中途崩溃后，任何 worker 都能凭同一批确定性 ID 继续补齐，而不是重复建一套图。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>状态</th><th>含义</th><th>下一步</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>planned</code></td><td>Run 已创建，节点与边可能尚未物化</td><td>materialize 后进入 running</td></tr>
+              <tr><td><code>running</code></td><td>至少还有 ready / running 的节点可推进</td><td>继续调度，或等待外部条件</td></tr>
+              <tr><td><code>waiting</code></td><td>只剩等待中的节点，没有可运行节点</td><td>等待任务结果、审批、计时器、信号或子 Run</td></tr>
+              <tr><td><code>paused</code></td><td>调度被显式暂停</td><td>Resume 后恢复；已运行步骤仍可返回</td></tr>
+              <tr><td><code>cancelling</code></td><td>已请求取消，正在收尾</td><td>最终进入 cancelled</td></tr>
+              <tr><td><code>succeeded</code> / <code>partial_succeeded</code> / <code>failed</code> / <code>cancelled</code></td><td>四种终态</td><td>不再调度节点；按结果收敛 Issue</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          状态取值和终态判断来自模型层
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/orchestration.go:36-52">orchestration.go:36-52</span>。
+          每次 reconciliation 最多循环 128 轮，避免单次调用里无限推进
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:61">engine.go:61</span>。
+          当还有 waiting 节点但没有 runnable 节点时，Run 进入 waiting；一旦出现可运行节点，又切回 running
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:454-462">engine.go:454-462</span>。
+        </p>
+
+        <h2 id="gates">人工关口与外部事件：approval、timer、signal、subrun</h2>
+        <p>
+          <strong>approval 节点</strong>会创建一条目标为 <code>run-node</code> 的 pending approval，节点进入 waiting；
+          批准后节点成功，拒绝或取消则节点失败，失败码是 <code>approval_rejected</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:344-352">engine.go:344-352</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:765-789">engine.go:765-789</span>。
+          审批通过只放行下一步；后续 Agent 要用什么工具、有没有权限，仍由它自己的运行环境决定
+          <span class="src" data-src="docs/v2/zh/service/workflows.md:41">workflows.md:41</span>。
+        </p>
+        <p>
+          <strong>timer 节点</strong>支持绝对时间 <code>at</code> 或相对秒数 <code>durationSeconds</code>；
+          引擎把 <code>wakeAt</code> 写进节点输出并进入 waiting，到点后由 sweep 推进为成功
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:353-360">engine.go:353-360</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:811-819">engine.go:811-819</span>。
+          <strong>signal 节点</strong>等待名为 <code>signalName</code> 的运行事件，收到 <code>run.signal.&lt;name&gt;</code> 后把事件载荷写成节点输出
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:361-365">engine.go:361-365</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:790-810">engine.go:790-810</span>。
+          信号接口返回 202，表示事件已接收，不表示节点已经完成
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:376-395">orchestration_handler.go:376-395</span>。
+        </p>
+        <p>
+          <strong>subrun 节点</strong>只能引用固定 revision，且 revision 必须与父 Run 同租户同空间；子 Run 终态后，
+          成功或部分成功写回父节点成功，failed / cancelled 写回父节点失败
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:372-389">engine.go:372-389</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:821-839">engine.go:821-839</span>。
+        </p>
+        <div class="callout tip">
+          <span class="ct">等待不是失败</span>
+          <p>
+            waiting 节点仍可能被任务结果、审批决定、计时器、信号或子 Run 推进。排障时先看节点的
+            <code>waitReason</code>，不要因为 Run 停在 waiting 就重启整个流程。
+          </p>
+        </div>
+
+        <h2 id="failure">失败策略：fail_fast、continue 与 partial_success</h2>
+        <p>
+          每个节点可以声明自己的失败策略；不写时默认 <code>fail_fast</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:100-108">engine.go:100-108</span>。
+          fail_fast 会取消所有尚未终态的节点、把失败节点的错误写到 Run 上，并让 Run 直接失败
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:116-134">engine.go:116-134</span>。
+          continue 保留其他分支继续推进；partial_success 允许在「有失败也有成功」时把 Run 收敛为
+          <code>partial_succeeded</code>，但 Team 协调节点失败会阻止这种收敛
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:437-452">engine.go:437-452</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>策略</th><th>节点失败后发生什么</th><th>Run 可能的结果</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>fail_fast</code>（默认）</td><td>取消其他未终态节点，立即收敛失败</td><td><code>failed</code></td></tr>
+              <tr><td><code>continue</code></td><td>继续推进其他分支，失败仍留在节点上</td><td>有成功则可能成功或部分成功；全失败则 failed</td></tr>
+              <tr><td><code>partial_success</code></td><td>允许把部分完成视为可接受结果</td><td>失败与成功并存且协调节点未失败时为 <code>partial_succeeded</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          失败任务是否重试由节点 <code>retry.maxAttempts</code>、<code>backoffSeconds</code> 和错误码共同决定；
+          <code>maxAttempts</code> 不填时只尝试一次
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:734-745">engine.go:734-745</span>。
+          凭据缺失、权限不足、配置错误、能力不支持、输入非法等九类错误被明确列为不可重试，重试只会重复失败
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:846-860">engine.go:846-860</span>。
+        </p>
+        <div class="callout danger">
+          <span class="ct">partial_success 不是自动验收</span>
+          <p>
+            Run 变成 partial_succeeded 只说明执行层接受了部分结果，Issue 仍按自己的完成策略处理。业务是否接受缺项，
+            要由验收标准决定，不能拿 Run 状态替代。
+          </p>
+        </div>
+
+        <h2 id="controls">控制与重跑：Pause、Resume、Cancel、Rerun</h2>
+        <p>
+          Pause 只阻止新节点被调度，已经在运行的步骤仍可以返回结果；Resume 恢复调度。
+          Cancel 会请求取消节点、任务和子运行，但不会把 Issue 自动验收，也不会删除工作记录
+          <span class="src" data-src="docs/v2/zh/service/workflows.md:51">workflows.md:51</span>。
+          这三个动作成功后返回 200 和更新后的 Run
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:340-374">orchestration_handler.go:340-374</span>。
+        </p>
+        <p>
+          Rerun 只接受终态 Run，并且固定使用原始 revision 创建一条全新的 Run，原 Run 不会被重开或改写
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:208-232">service.go:208-232</span>。
+          新 Run 通过 <code>rerunOfRunId</code> 保留来源关联，输入可显式覆盖；成功返回 201
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:343-362">orchestration_handler.go:343-362</span>。
+          但 Rerun 会产生新的执行机会，外部副作用可能重复发生，流程本身不保证补偿已经发生的副作用
+          <span class="src" data-src="docs/v2/zh/service/workflows.md:53">workflows.md:53</span>。
+        </p>
+        <p>
+          如果 Workflow 通过 Endpoint 对外提供，发布新 revision 不等于调用方已经切换；还要更新 Endpoint release，
+          再检查实际调用版本
+          <span class="src" data-src="docs/v2/zh/service/workflows.md:57">workflows.md:57</span>。
+          这两个「版本」不要混：Workflow revision 决定图，Endpoint release 决定外部请求落到哪个图。
+        </p>
+
+        <h2 id="automation">Automation：触发规则与执行快照分开保存</h2>
+        <p>
+          Automation 是持久的入口规则，包含执行快照、触发器集合、动作类型与 Webhook 配置；触发配置和动作配置由控制面保存，
+          不交给运行时
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/collaboration.go:521-545">collaboration.go:521-545</span>。
+          执行快照里固定 Runbook、目标 Agent / Team、输出方式、完成策略、并发策略、两种超时和订阅者
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/automation.go:23-36">automation.go:23-36</span>。
+          触发器有稳定 ID，编辑规则不会因为光标变化就生成新身份
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/automation.go:38-49">automation.go:38-49</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>触发器</th><th>适合什么</th><th>实现边界</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>cron</code></td><td>日报、定期检查、固定时间巡检</td><td>支持时区与预览；表达式按分钟级解析</td></tr>
+              <tr><td><code>webhook</code></td><td>CI、构建、第三方事件</td><td>需要 secret 与稳定幂等键；事件可筛选</td></tr>
+              <tr><td><code>channel</code></td><td>从消息渠道进入</td><td>带执行快照的规则不支持，会返回「not implemented」<span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:183-186">service.go:183-186</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          执行目标只能是已注册且 active 的 Agent，或者 active Team 的 Leader；Team 在执行时会解析成 Leader Agent
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:68-93">service.go:68-93</span>。
+          规则启用时才强制校验目标可用性；停用规则可以先保存，但不能因此假设它随时可运行
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:144-146">service.go:144-146</span>。
+        </p>
+
+        <h2 id="schedules">计划与积压：时区、skip、queue 与两种超时</h2>
+        <p>
+          cron 的时区留空时默认 <code>UTC</code>；表达式里嵌入的 <code>TZ=</code> 会被拒绝，必须改用独立的 timezone 字段；
+          <code>@every</code> 的间隔不得小于 1 分钟
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/schedule.go:27-49">schedule.go:27-49</span>。
+          预览接口一次返回接下来的 5 个触发时间，并统一转成 UTC 返回
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/schedule.go:51-70">schedule.go:51-70</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/automation_handler.go:373-387">automation_handler.go:373-387</span>。
+          因此「页面上写 09:00」和「日志里的时间」可能相差时区，先核对 timezone 再判断有没有漏跑。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>默认</th><th>规则</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>outputMode</code></td><td><code>create_issue</code></td><td>可切到 <code>run_only</code>，只保留自动化执行记录</td></tr>
+              <tr><td><code>completionPolicy</code></td><td><code>review</code></td><td><code>run_only</code> 会强制改为 <code>automatic</code><span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:105-119">service.go:105-119</span></td></tr>
+              <tr><td><code>concurrencyPolicy</code></td><td><code>skip</code></td><td>已有活跃运行时跳过新触发，或改为 <code>queue</code> 顺序排队<span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:120-125">service.go:120-125</span></td></tr>
+              <tr><td><code>queueTimeoutSeconds</code></td><td>3600</td><td>允许 60–604800；只限制排队阶段</td></tr>
+              <tr><td><code>runTimeoutSeconds</code></td><td>3600</td><td>允许 60–604800；只限制已经开始的执行</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          超时范围校验在创建时一次完成
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:126-134">service.go:126-134</span>。
+          skip 的触发会留下一条 <code>skipped</code> 记录，错误码 <code>already_active</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/store/automation.go:83-99">automation.go:83-99</span>。
+          queue 模式下，超过排队截止仍没开始的执行会以 <code>queue_timeout</code> 失败；已经开始但超过运行截止的则是
+          <code>execution_timeout</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/runtime.go:366-381">runtime.go:366-381</span>。
+          这两个阶段必须分开看：一个在执行前，一个在执行中。
+        </p>
+        <p class="footnote">
+          规则上限还包括：名称 1–200 字符、Runbook 1–100000 字符、最多 10 个触发器、50 个事件筛选、50 个订阅者
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:95-103">service.go:95-103</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:141-143">service.go:141-143</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:158-160">service.go:158-160</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:179-182">service.go:179-182</span>。
+        </p>
+
+        <h2 id="webhook">Webhook：Delivery 回答「收到没有」，Run 回答「做了没有」</h2>
+        <p>
+          Webhook 入口校验 <code>X-Automation-Secret</code>，缺失或不匹配返回 401；请求体必须是 JSON 对象或数组，
+          上限 256 KiB，超过返回 413
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/automation_handler.go:522-550">automation_handler.go:522-550</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/automation_handler.go:236-249">automation_handler.go:236-249</span>。
+          幂等键优先读 <code>Idempotency-Key</code> 或 <code>X-Idempotency-Key</code>，没有时回退到
+          <code>X-GitHub-Delivery</code>；仍然为空则返回 400
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/automation_handler.go:229-235">automation_handler.go:229-235</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/automation_handler.go:538-548">automation_handler.go:538-548</span>。
+          重传同一事件要复用同一把键和同一份内容，否则会得到冲突，而不是第二条新执行。
+        </p>
+        <pre data-lang="bash" data-file="Webhook 调用（示意）">curl --fail-with-body "$AUTOMATION_WEBHOOK_URL" \
+  -H 'Content-Type: application/json' \
+  -H "X-Automation-Secret: $AUTOMATION_SECRET" \
+  -H 'Idempotency-Key: build-2026-11-06-001' \
+  -H 'X-Event-Type: build.completed' \
+  --data '{"project":"example","result":"passed"}'</pre>
+        <p>
+          事件类型优先取 <code>X-GitHub-Event</code>，其次 <code>X-Event-Type</code>，JSON 里的 <code>event</code>
+          字段可以覆盖它；都没有时记为 <code>webhook.received</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/automation_handler.go:550-564">automation_handler.go:550-564</span>。
+          事件筛选留空接受全部；不匹配的 delivery 会被标成 <code>ignored</code>，原因 <code>event_filtered</code>，
+          不会创建 Run
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/webhook.go:42-69">webhook.go:42-69</span>。
+          同一幂等键重复到达时，响应里的状态会显式写成 <code>duplicate</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/automation_handler.go:565-579">automation_handler.go:565-579</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>看哪里</th><th>能回答</th><th>不能回答</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Deliveries</td><td>事件是否收到、是否通过 secret、是否被筛选、是否重复</td><td>Agent 是否真的完成了工作</td></tr>
+              <tr><td>Runs</td><td>是否排队、是否开始、当前状态、错误码、关联 Issue</td><td>事件有没有被防火墙或发送方丢在门外</td></tr>
+              <tr><td>Issue / Inbox</td><td>交付是否满足验收标准，是否需要人决策</td><td>Webhook 请求有没有通过认证</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          事件载荷会作为 <code>Trigger data</code> 附到任务说明里，但其中的地址不会自动赋予 Agent 读取能力
+          <span class="src" data-src="docs/v2/zh/service/automation.md:67">automation.md:67</span>。
+          收到事件也不等于原来的 Team 或 Run 已恢复执行；需要恢复时要在对应工作上显式处理
+          <span class="src" data-src="docs/v2/zh/service/automation.md:69">automation.md:69</span>。
+          Replay delivery 或 Rerun 会产生新的处理机会，可能重复业务副作用
+          <span class="src" data-src="docs/v2/zh/service/automation.md:73">automation.md:73</span>。
+        </p>
+
+        <h2 id="issue">Issue：工作状态与完成策略是两套轴</h2>
+        <p>
+          Issue 有七个状态：<code>backlog</code>、<code>todo</code>、<code>in_progress</code>、<code>in_review</code>、
+          <code>blocked</code>、<code>done</code>、<code>cancelled</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/collaboration.go:40-50">collaboration.go:40-50</span>。
+          转换不是任意跳转：例如 backlog 可直接进 todo、in_progress 或 cancelled；in_progress 可进 in_review、blocked、
+          done 或 cancelled；done 也允许回到 in_progress 以支持重新打开
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/collaboration.go:52-71">collaboration.go:52-71</span>。
+        </p>
+        <p>
+          完成策略是另一套轴：<code>review</code> 需要人工确认，<code>automatic</code> 允许按自动规则收敛，
+          <code>external</code> 由外部流程管理
+          <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/collaboration.go:101-107">collaboration.go:101-107</span>。
+          官方文档把这条边界写得很直接：一次 Run 成功不等于 Issue 已验收，以详情里的 Policy 和当前状态为准
+          <span class="src" data-src="docs/v2/zh/service/issues.md:57">issues.md:57</span>。
+        </p>
+        <p>
+          Issue 也可以直接把 Workflow 作为执行目标。此时不能再同时填 assignee，目标必须是同空间的已发布 Workflow；
+          没有发布 revision 会返回 409
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/collaboration_handler.go:170-204">collaboration_handler.go:170-204</span>。
+          创建请求会选最新 revision，并在同一次调用里启动 Run，响应同时返回 <code>issue</code> 和
+          <code>orchestrationRun</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/collaboration_handler.go:217-232">collaboration_handler.go:217-232</span>。
+          官方界面说明也提醒：没有发布版本时应先发布，创建成功后要检查 Executions，而不是从「Issue 创建成功」推断
+          Agent 已开始工作
+          <span class="src" data-src="docs/v2/zh/service/issues.md:26">issues.md:26</span>。
+        </p>
+        <div class="callout">
+          <span class="ct">状态不是进度百分比</span>
+          <p>
+            in_progress 表示工作正在推进，in_review 表示等待验收，blocked 表示缺信息、授权或依赖。
+            done 是完成策略满足后的结果，不是「最后一个节点跑完」的同义词。
+          </p>
+        </div>
+
+        <h2 id="acceptance">验收闸门：Done 之前要过九道检查</h2>
+        <p>
+          把 Issue 推向 <code>done</code> 时，服务端会跑一组验收守卫。任何一项不满足都会返回
+          <code>acceptance blocked</code>，而不是静默改状态
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:136-213">service.go:136-213</span>。
+          这组检查把「执行完了」与「交付可接受」分开。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>闸门</th><th>阻断条件</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Team 复核策略</td><td>Team 要求人工复核，而当前操作者不是人类</td></tr>
+              <tr><td>子 Issue</td><td>仍有子 Issue 不处于 done 或 cancelled</td></tr>
+              <tr><td>待审批</td><td>Issue 上仍有 pending approval</td></tr>
+              <tr><td>任务终态</td><td>仍有 AgentTask 不在终态</td></tr>
+              <tr><td>任务输入</td><td>输入仍处于未处理状态，未进入 processed / deferred / dead_letter / blocked</td></tr>
+              <tr><td>结果评论</td><td>负责人是 Agent 或 Team，但没有可见的 result 评论</td></tr>
+              <tr><td>验收标准</td><td>必填 checklist 未满足，或 artifact / approval 数量不足</td></tr>
+              <tr><td>结果要求</td><td>显式要求 <code>requiredResult</code>，但没有任何可见 result 评论</td></tr>
+              <tr><td>活跃 Run</td><td>同一根 Issue 上仍有未终态的 orchestration Run</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Acceptance criteria 的结构很小：<code>checklist</code>、<code>minimumArtifacts</code>、
+          <code>minimumApprovals</code> 与 <code>requiredResult</code>；checklist 项默认必填，只有显式
+          <code>required=false</code> 才可跳过
+          <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:319-397">service.go:319-397</span>。
+          它故意保持可移植，未知字段会被保存，但不会产生额外执行语义。
+        </p>
+        <pre data-lang="json" data-file="Acceptance criteria（示意）">{
+  "requiredResult": true,
+  "minimumArtifacts": 1,
+  "minimumApprovals": 1,
+  "checklist": [
+    { "id": "sources", "text": "三条结论都带来源", "satisfied": false },
+    { "id": "scope", "text": "没有访问生产日志", "satisfied": false },
+    { "id": "optional", "text": "附上可选的改进建议", "required": false, "satisfied": false }
+  ]
+}</pre>
+        <p class="footnote">
+          审批与验收是两个独立决策：approval 决定等待中的执行继续还是失败，验收决定交付是否达到要求
+          <span class="src" data-src="docs/v2/zh/service/inbox.md:41">inbox.md:41</span>。
+          评论线程的 Resolve 只表示讨论已处理，也不会完成验收
+          <span class="src" data-src="docs/v2/zh/service/issues.md:42">issues.md:42</span>。
+        </p>
+
+        <h2 id="inbox">Inbox：读到消息不等于做出决策</h2>
+        <p>
+          Inbox 的视图是 <code>all</code>、<code>unread</code>、<code>attention</code> 与 <code>action</code>，
+          默认每页 50 条，最大 499；非法视图或 cursor 返回 400
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/inbox_handler.go:28-54">inbox_handler.go:28-54</span>。
+          <code>unread</code> 只表示尚未阅读，<code>action</code> 才表示仍需决策；读过消息不等于处理完工作
+          <span class="src" data-src="docs/v2/zh/service/inbox.md:24">inbox.md:24</span>。
+        </p>
+        <p>
+          通知不是对所有状态变化广播。只有面向人类的工作 Issue，或者显式指派给人类的子 Issue，才进入工作 Inbox；
+          review_request 只对 <code>review</code> 完成策略生成，automatic / external 不会产生人工验收请求
+          <span class="src" data-src="agentscope-service/aistio/internal/store/inbox.go:123-177">inbox.go:123-177</span>。
+          需要动作的通知只把 <code>needsAction</code> 给负责人，订阅者收到的是普通更新
+          <span class="src" data-src="agentscope-service/aistio/internal/store/inbox.go:157-175">inbox.go:157-175</span>。
+        </p>
+        <p>
+          验收动作有三个入口：accept、reject、reopen。accept 和 reject 都必须带正整数
+          <code>expectedVersion</code>，reject 还必须写原因；Issue 不在 in_review 时返回 409
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/collaboration_handler.go:443-506">collaboration_handler.go:443-506</span>。
+          要求修改会把 Issue 退回 in_progress 并记录反馈，但不会自动发起下一次执行
+          <span class="src" data-src="docs/v2/zh/service/inbox.md:35">inbox.md:35</span>。
+          页面提示工作已变化时，应刷新后重新核对结果，旧版本的确认不会被静默套到新版本上
+          <span class="src" data-src="docs/v2/zh/service/inbox.md:37">inbox.md:37</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>你看到</th><th>它表示</th><th>下一步</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Unread</td><td>这条消息还没读</td><td>阅读后再判断是否需要动作</td></tr>
+              <tr><td>Needs action</td><td>仍需要负责人作决定</td><td>验收、审批或补充信息</td></tr>
+              <tr><td>Review requested</td><td>review 策略的 Issue 等待验收</td><td>核对结果、附件与子 Issue</td></tr>
+              <tr><td>Archived</td><td>通知已收纳</td><td>历史可查；归档不删除 Issue 或 Run</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="closure">闭环：Run 终态之后，Issue 还要再走一段</h2>
+        <p>
+          把一条 Workflow 从触发到验收串起来，完整链路有七个可观察点。任何一段都不能用下一段的状态反推：
+        </p>
+        <ul class="timeline">
+          <li>
+            <span class="who">触发</span>
+            <span class="what">cron、Webhook 或手工请求到达；Webhook 先写一条 delivery，状态可能是 queued、ignored 或 duplicate<span class="src" data-src="agentscope-service/aistio/internal/httpapi/automation_handler.go:565-579">automation_handler.go:565-579</span>。</span>
+          </li>
+          <li>
+            <span class="who">执行</span>
+            <span class="what">Automation 创建或复用 Issue，并把工作交给 Agent、Team、Workflow 或 Endpoint；Runbook 与执行快照此时已固定。</span>
+          </li>
+          <li>
+            <span class="who">建图</span>
+            <span class="what">Workflow Run 从 planned 进入 materialize，固定 revision，创建节点与边，根节点变 ready<span class="src" data-src="agentscope-service/aistio/internal/orchestration/materialize.go:26-110">materialize.go:26-110</span>。</span>
+          </li>
+          <li>
+            <span class="who">推进</span>
+            <span class="what">节点按边状态与条件推进；agent / team 等待任务，approval / timer / signal / subrun 等待外部条件。</span>
+          </li>
+          <li>
+            <span class="who">收敛</span>
+            <span class="what">没有活跃节点后，Run 收敛为 succeeded、partial_succeeded、failed 或 cancelled<span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:437-452">engine.go:437-452</span>。</span>
+          </li>
+          <li>
+            <span class="who">回写</span>
+            <span class="what">成功的根 Run 把仍在 in_progress 的 Issue 推进到 in_review；只有 automatic 策略直接推进到 done<span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:527-539">engine.go:527-539</span>。</span>
+          </li>
+          <li>
+            <span class="who">验收</span>
+            <span class="what">人或其他授权方检查验收标准，accept 后 done，reject 后退回 in_progress；失败 Run 会把 Issue 树标记为 blocked<span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:588-628">engine.go:588-628</span>。</span>
+          </li>
+        </ul>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Run 结果</th><th>Issue 的预期去向</th><th>还不能得出什么结论</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>succeeded</code></td><td>in_progress → in_review；automatic 策略可直接 done</td><td>交付一定满足验收标准</td></tr>
+              <tr><td><code>partial_succeeded</code></td><td>同样只推进到 in_review（除非 automatic）</td><td>缺项可以被业务接受</td></tr>
+              <tr><td><code>failed</code></td><td>根 Issue 与可达子 Issue 进入 blocked，保留失败码</td><td>工作已经彻底结束、不需要恢复</td></tr>
+              <tr><td><code>cancelled</code></td><td>不会自动验收，也不会删除 Issue</td><td>取消等于工作被放弃</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Team 作为 Workflow 的一个节点时，协调节点还有更严格的收敛条件：Leader 任务完成并不自动等于协调节点成功，
+          必须等团队汇总真正收敛
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:721-726">engine.go:721-726</span>。
+          这也是第 24 章那条边界在 Workflow 里的延续：动态协作可以被装进声明式外壳，但它的内部收敛仍按 Team 的规则走。
+        </p>
+
+        <h2 id="cheatsheet">速查：字段、默认值与状态码</h2>
+        <p>先看启动和发布：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>值 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Run 模式</td><td><code>declared</code>（Workflow 启动时固定）</td><td><span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:183-187">service.go:183-187</span></td></tr>
+              <tr><td>启动幂等键</td><td>必填；按 tenant / namespace / key 加锁</td><td><span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:110-127">service.go:110-127</span></td></tr>
+              <tr><td>Issue 来源</td><td><code>issueId</code> 与内联 <code>issue</code> 恰好一个</td><td><span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:128-130">service.go:128-130</span></td></tr>
+              <tr><td>默认 triggerType</td><td><code>definition</code></td><td><span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:183-186">service.go:183-186</span></td></tr>
+              <tr><td>无已发布 revision</td><td>409 Conflict</td><td><span class="src" data-src="agentscope-service/aistio/internal/orchestration/service.go:143-152">service.go:143-152</span></td></tr>
+              <tr><td>创建 / 发布 / 启动</td><td>201 Created</td><td><span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:42-62">orchestration_handler.go:42-62</span> <span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:183-202">orchestration_handler.go:183-202</span> <span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:216-264">orchestration_handler.go:216-264</span></td></tr>
+              <tr><td>Signal</td><td>202 Accepted</td><td><span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:376-395">orchestration_handler.go:376-395</span></td></tr>
+              <tr><td>Rerun</td><td>201 Created</td><td><span class="src" data-src="agentscope-service/aistio/internal/httpapi/orchestration_handler.go:343-362">orchestration_handler.go:343-362</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>再看 Automation 与 Inbox：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>值 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>cron 默认时区</td><td><code>UTC</code></td><td><span class="src" data-src="agentscope-service/aistio/internal/automation/schedule.go:27-31">schedule.go:27-31</span></td></tr>
+              <tr><td><code>@every</code> 下限</td><td>1 分钟</td><td><span class="src" data-src="agentscope-service/aistio/internal/automation/schedule.go:38-42">schedule.go:38-42</span></td></tr>
+              <tr><td>并发策略默认</td><td><code>skip</code></td><td><span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:120-125">service.go:120-125</span></td></tr>
+              <tr><td>队列 / 运行超时默认</td><td>3600 s / 3600 s；范围 60–604800</td><td><span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:126-134">service.go:126-134</span></td></tr>
+              <tr><td>Webhook 密钥头</td><td><code>X-Automation-Secret</code>；错误 401</td><td><span class="src" data-src="agentscope-service/aistio/internal/httpapi/automation_handler.go:522-528">automation_handler.go:522-528</span></td></tr>
+              <tr><td>幂等键回退</td><td><code>X-GitHub-Delivery</code>；仍为空 400</td><td><span class="src" data-src="agentscope-service/aistio/internal/httpapi/automation_handler.go:538-548">automation_handler.go:538-548</span></td></tr>
+              <tr><td>Inbox 默认 / 上限</td><td>50 / 499</td><td><span class="src" data-src="agentscope-service/aistio/internal/httpapi/inbox_handler.go:45-54">inbox_handler.go:45-54</span></td></tr>
+              <tr><td>验收冲突</td><td>非 in_review 或版本不匹配：409</td><td><span class="src" data-src="agentscope-service/aistio/internal/httpapi/collaboration_handler.go:477-506">collaboration_handler.go:477-506</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">六个坑：先分清层，再改配置</h2>
+        <p>
+          <strong>坑一：改完草稿就以为线上流程变了。</strong>已有 Run 固定的是 revision，不是当前草稿；要让新执行使用新图，
+          必须先发布，再让下一次启动选中它
+          <span class="src" data-src="docs/v2/zh/service/workflows.md:10">workflows.md:10</span>。
+        </p>
+        <p>
+          <strong>坑二：把 Webhook 的 200 当成执行成功。</strong>200 只说明 delivery 被接收、可能已入队或判重；
+          工作是否执行要看 Run，是否验收要看 Issue
+          <span class="src" data-src="docs/v2/zh/service/automation.md:73">automation.md:73</span>。
+        </p>
+        <p>
+          <strong>坑三：用 Run succeeded 直接推断 Issue done。</strong>review 策略会停在 in_review；只有 automatic
+          才会由 Run 收敛直接推进到 done
+          <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:527-539">engine.go:527-539</span>。
+        </p>
+        <p>
+          <strong>坑四：把 skip 和 run timeout 混为一谈。</strong>skip 是并发策略在触发阶段跳过；queue_timeout 是排队截止；
+          execution_timeout 才是执行超时。三者发生在不同阶段
+          <span class="src" data-src="docs/v2/zh/service/automation.md:46">automation.md:46</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/runtime.go:366-381">runtime.go:366-381</span>。
+        </p>
+        <p>
+          <strong>坑五：在 cron 表达式里写 <code>TZ=</code>。</strong>服务端会直接拒绝，必须使用独立 timezone 字段；
+          留空则按 UTC 解释
+          <span class="src" data-src="agentscope-service/aistio/internal/automation/schedule.go:27-37">schedule.go:27-37</span>。
+        </p>
+        <p>
+          <strong>坑六：读过 Inbox 消息就开始验收。</strong>Unread 只描述阅读状态；验收要核对结果、附件、子 Issue 和
+          Acceptance criteria，归档更不能代替决策
+          <span class="src" data-src="docs/v2/zh/service/inbox.md:24">inbox.md:24</span>
+          <span class="src" data-src="docs/v2/zh/service/inbox.md:47">inbox.md:47</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>发布新 revision 后，正在运行的 Workflow 会自动切到新拓扑吗？</summary>
+          <p>
+            不会。每次执行固定一个 revision，发布新版本只影响后续选择该版本的启动；已有 Run 仍按原 revision 的节点和边推进
+            <span class="src" data-src="docs/v2/zh/service/workflows.md:10">workflows.md:10</span>。
+            如果外部通过 Endpoint 调用，还要单独更新 Endpoint release
+            <span class="src" data-src="docs/v2/zh/service/workflows.md:57">workflows.md:57</span>。
+          </p>
+        </details>
+        <details>
+          <summary>Webhook 返回 200，说明 Agent 已经开始执行了吗？</summary>
+          <p>
+            不一定。200 表示请求通过了认证、写入了 delivery，并根据开关、筛选和幂等键决定是 queued、ignored 还是
+            duplicate；真正的执行记录在 Run 里
+            <span class="src" data-src="agentscope-service/aistio/internal/automation/webhook.go:42-72">webhook.go:42-72</span>。
+          </p>
+        </details>
+        <details>
+          <summary>Run 变成 partial_succeeded，Issue 就能直接 Done 吗？</summary>
+          <p>
+            不能直接推断。partial_succeeded 只说明执行层在允许部分成功时接受了结果；Issue 还要过完成策略与验收闸门。
+            review 策略会停在 in_review，由人核对 checklist、artifact、approval 等条件
+            <span class="src" data-src="agentscope-service/aistio/internal/orchestration/engine.go:437-452">engine.go:437-452</span>
+            <span class="src" data-src="agentscope-service/aistio/internal/collaboration/service.go:136-213">service.go:136-213</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：搭一条带人工审批的发布流水线</h2>
+        <p>目标不是「点一次成功」，而是能解释每次状态变化由哪一层产生。建议 45 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先单独验证两个 Agent</span>
+            <div>准备「草稿」和「发布准备」两个 Agent，各跑一次小任务。草稿要能读取指定输入，发布准备要能指出缺失的证据；此时先不建 Workflow。</div>
+          </li>
+          <li>
+            <span class="sh">写一张三节点图</span>
+            <div>用 agent → approval → agent 建图，给每个节点写唯一 key 和 input 映射；先故意留一个未知边引用，确认校验失败。</div>
+          </li>
+          <li>
+            <span class="sh">发布并固定版本</span>
+            <div>修复后发布 revision，记下 revision id；再改一次草稿但不发布，确认新启动仍可选择旧 revision。</div>
+          </li>
+          <li>
+            <span class="sh">用 Issue 启动</span>
+            <div>创建带验收标准的 Issue，把 Workflow 设为执行目标。确认响应同时有 issue 和 orchestrationRun，且 Issue 没有额外 assignee。</div>
+          </li>
+          <li>
+            <span class="sh">走一次审批</span>
+            <div>在 Inbox 处理 approval 节点。先拒绝一次，确认节点失败、Run 按 fail_fast 收敛；再用新幂等键 Rerun，批准后观察节点继续。</div>
+          </li>
+          <li>
+            <span class="sh">制造一次验收阻断</span>
+            <div>在 Acceptance criteria 里要求 1 个 artifact，但先不上传。尝试 Accept，记录 blocked 原因；补齐 artifact 与 result 后再接受。</div>
+          </li>
+          <li>
+            <span class="sh">加一条 cron 自动化</span>
+            <div>创建日报规则，时区设为 Asia/Shanghai，先保持停用并做 Test run。核对预览时间、Runbook、输出方式和完成策略，再启用。</div>
+          </li>
+          <li>
+            <span class="sh">用 Webhook 重放一次</span>
+            <div>添加 webhook trigger，发送同一幂等键两次，确认第二次是 duplicate；再换新键并加不匹配的事件筛选，确认 delivery 为 ignored 且没有新 Run。</div>
+          </li>
+          <li>
+            <span class="sh">最后对齐三层事实</span>
+            <div>把这次练习写成三行：delivery 状态、automation run 状态、Issue 状态。检查每一行是否能独立解释，而不是用后一层的成功掩盖前一层的失败。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          到这里，声明式执行与工作闭环已经接上：Workflow 固定拓扑，Automation 负责入口，Issue 保存工作，Inbox 承担验收。
+          下一章会把视角从「一条流程」抬到「一套服务」：Kubernetes、PostgreSQL、备份恢复、升级演练与常见故障。
+          在进入部署之前，最好先能用本章的三个不等式解释一次真实事故。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方「Workflow：多 Agent 流程编排」</td><td>设计、发布、节点、控制与 Endpoint 版本<span class="src" data-src="docs/v2/zh/service/workflows.md:10-59">workflows.md:10-59</span></td></tr>
+              <tr><td>官方「自动化任务：计划与 Webhook」</td><td>触发、队列、Webhook、Delivery 与 Run 的分工<span class="src" data-src="docs/v2/zh/service/automation.md:10-75">automation.md:10-75</span></td></tr>
+              <tr><td>官方「控制台创建 Issue 与分派任务」</td><td>状态、完成策略、验收与返工<span class="src" data-src="docs/v2/zh/service/issues.md:10-64">issues.md:10-64</span></td></tr>
+              <tr><td>官方「控制台信箱」</td><td>通知视图、审批与验收操作<span class="src" data-src="docs/v2/zh/service/inbox.md:10-53">inbox.md:10-53</span></td></tr>
+              <tr><td><a href="24-team-collaboration.html">24 Team 协作</a></td><td>动态 Leader 决策如何作为 team 节点嵌入 Workflow</td></tr>
+              <tr><td><a href="20-endpoints-sse.html">20 Endpoint、Job 与 SSE</a></td><td>Workflow 对外提供时的 release、job 与状态查询</td></tr>
+              <tr><td><a href="19-service-basics.html">19 Service 起站</a></td><td>先有控制面、数据库与运行时，再谈自动化</td></tr>
+              <tr><td><a href="../appendix/errors.html">附录 B · 报错速查</a></td><td>400 / 409 / 422 与 acceptance blocked 的排查顺序</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的 Workflow、Automation、Issue 与 Inbox 文档在 2.0.4 仓库里仍带「预览」提示
+          <span class="src" data-src="docs/v2/zh/service/workflows.md:6-8">workflows.md:6-8</span>。
+          凡文档与实现有出入的地方，正文以源码为准；数字、默认值与状态码都标了具体出处。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
