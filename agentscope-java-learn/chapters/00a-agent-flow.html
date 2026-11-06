@@ -40,9 +40,9 @@
 
         <h2 id="goals">这一页怎么用</h2>
         <ul class="goals">
-          <li>用「最小」场景看清一次 ReAct 调用的 9 个节点，以及每个节点吐出什么</li>
-          <li>用「工程化」场景看 Harness 在工作区、中间件、沙箱、子 Agent、状态上加了哪几层</li>
-          <li>用「全依赖」场景看 Nacos、Higress、Studio、Training 等外围设施接在哪个位置</li>
+          <li>用「最小」场景看清 L1 的 9 个基础节点，以及每个节点吐出什么</li>
+          <li>用「工程化」场景看 L2 在 L1 上新增的 5 个节点：RuntimeContext、Workspace、Sandbox、Subagent、Event</li>
+          <li>用「全依赖」场景看 L3 在 L2 上新增的 8 个外围节点，以及它们接在哪个位置</li>
           <li>用「上一步 / 下一步 / 播放」把信息流走一遍，而不是只看一张静态图</li>
           <li>知道每一步应该看哪一章、哪个源码入口</li>
         </ul>
@@ -82,7 +82,7 @@
 
             <aside class="fd-panel" aria-live="polite">
               <div class="fd-step" id="fd-step"></div>
-              <h3 class="fd-title" id="fd-title"></h3>
+              <div class="fd-title" id="fd-title" role="status"></div>
               <dl class="fd-detail">
                 <dt>输入</dt><dd id="fd-input"></dd>
                 <dt>输出</dt><dd id="fd-output"></dd>
@@ -101,10 +101,18 @@
           提示：节点按执行顺序排成网格；播放会每 1.4 秒前进一格，到末尾自动停止。
           在 <code>prefers-reduced-motion</code> 下，高亮仍会切换，但不会平滑滚动或扫光。
         </p>
+        <div class="callout tip">
+          <span class="ct">三档是叠加关系，不是三条独立链路</span>
+          <p>
+            <strong>L1 基础 9 个节点</strong> → <strong>L2 保留 L1 再加 5 个（共 14）</strong> →
+            <strong>L3 保留 L2 再加 8 个（共 22）</strong>。节点右上角的 <code>+L2</code> / <code>+L3</code>
+            就是本层新增的那一批。
+          </p>
+        </div>
 
         <h2 id="minimal">最小链路：一次 ReAct 调用</h2>
         <p>
-          最小场景只有一个 <code>ReActAgent</code>：消息进来，拼上下文，模型决定「说话还是调工具」，工具结果回填后再让模型收尾。
+          L1 只有 9 个节点：消息进来，拼上下文，模型决定「说话还是调工具」，工具结果回填后再让模型收尾。
           这条链路里没有 Workspace、没有沙箱、没有子 Agent，也没有 Gateway。
         </p>
         <div class="table-wrap">
@@ -123,30 +131,31 @@
           </table>
         </div>
 
-        <h2 id="harness">工程化：Harness 加了什么</h2>
+        <h2 id="harness">工程化：在 L1 上加了什么</h2>
         <p>
-          <code>HarnessAgent</code> 不重写 ReAct 循环，而是在它外面加壳：工作区投影、中间件链、文件系统 / 沙箱、子 Agent、
-          状态落盘与消息总线。信息流还是同一条，只是每一段前后多了「谁在读、谁在写」。
+          L2 不是另起一条链路：它在 L1 的 9 个节点上新增 5 个，共 14 个。新增的是
+          <strong>RuntimeContext、Workspace、Sandbox、Subagent、Event</strong>；
+          <code>HarnessAgent</code> 不重写 ReAct 循环，而是在它外面加壳，信息流还是同一条。
         </p>
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>新增层</th><th>插在哪</th><th>它改变什么</th></tr>
+              <tr><th>L2 的层</th><th>插在哪</th><th>它改变什么</th></tr>
             </thead>
             <tbody>
-              <tr><td>RuntimeContext</td><td>进入 Agent 之前</td><td>userId / sessionId / 会话状态与请求级上下文</td></tr>
-              <tr><td>Workspace 投影</td><td>system prompt 之前</td><td>把 AGENTS.md、技能、文件说明投进上下文</td></tr>
+              <tr><td>RuntimeContext <span class="tag">+L2</span></td><td>进入 Agent 之前</td><td>userId / sessionId / 会话状态与请求级上下文</td></tr>
+              <tr><td>Workspace 投影 <span class="tag">+L2</span></td><td>system prompt 之前</td><td>把 AGENTS.md、技能、文件说明投进上下文</td></tr>
               <tr><td>Middleware 链</td><td>模型与工具前后</td><td>压缩、技能、计划模式、权限、动态工具面</td></tr>
-              <tr><td>Sandbox / Filesystem</td><td>工具执行时</td><td>把文件与命令关进隔离环境</td></tr>
-              <tr><td>Subagent / Team</td><td>工具调用内</td><td>把一部分工作委派给另一个 Agent</td></tr>
-              <tr><td>Gateway / MessageBus</td><td>Agent 之外</td><td>入站路由、会话排队、后台结果唤醒</td></tr>
+              <tr><td>Sandbox / Filesystem <span class="tag">+L2</span></td><td>工具执行时</td><td>把文件与命令关进隔离环境</td></tr>
+              <tr><td>Subagent / Team <span class="tag">+L2</span></td><td>工具调用内</td><td>把一部分工作委派给另一个 Agent</td></tr>
+              <tr><td>Event / Hook <span class="tag">+L2</span></td><td>Agent 之外</td><td>生命周期事件、日志、推送与后续网关</td></tr>
             </tbody>
           </table>
         </div>
 
-        <h2 id="full">全依赖：外围设施也接上</h2>
+        <h2 id="full">全依赖：在 L2 上再接什么</h2>
         <p>
-          全依赖场景把「请求从哪来、工具从哪出、谁触发、谁观测、谁训练」都接上。
+          L3 在 L2 的 14 个节点上再加 8 个，共 22 个：Scheduler、Inbound、Gateway、Nacos、Higress、Studio、Training、Outbound。
           注意它们不是都塞进 ReAct 循环：Nacos 在配置 / 注册层，Higress 在工具层，Scheduler 在触发层，
           Studio 与 Training 在旁路。
         </p>

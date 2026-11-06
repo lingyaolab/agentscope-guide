@@ -579,16 +579,18 @@ async function browserChecks() {
     const flow = await ev(
       `(function(){var step=document.getElementById('fd-step');if(!step)return 'no-demo';
         var before=step.textContent;
+        document.querySelector('[data-scenario="harness"]').click();
+        var l2=document.querySelectorAll('.fd-node').length;
         document.querySelector('[data-scenario="full"]').click();
         var after=step.textContent;
-        var nodes=document.querySelectorAll('.fd-node').length;
+        var l3=document.querySelectorAll('.fd-node').length;
         document.getElementById('fd-next').click();
-        return [before,after,nodes,step.textContent].join('|');})()`
+        return [before,l2,after,l3,step.textContent].join('|');})()`
     );
     check(
       "browser",
       "信息流实验室可切换场景与步进",
-      /^第 1 \/ 9 步\|第 1 \/ 13 步\|13\|第 2 \/ 13 步$/.test(String(flow)),
+      /^第 1 \/ 9 步\|14\|第 1 \/ 22 步\|22\|第 2 \/ 22 步$/.test(String(flow)),
       flow
     );
 

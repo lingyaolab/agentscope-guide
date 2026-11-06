@@ -250,6 +250,24 @@
   color: #67e8f9;
 }
 
+.fd-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  padding: 1px 4px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 8.5px;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
+  opacity: 0.85;
+}
+
+.fd-badge.l2 { color: #c4b5fd; }
+.fd-badge.l3 { color: #67e8f9; }
+
 .fd-node.active::after {
   content: "";
   position: absolute;
