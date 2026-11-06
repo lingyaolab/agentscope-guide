@@ -1,0 +1,28 @@
+CHANGELOG.md
+  h_000d6d73c03ff5 12,23
+agentscope-java-learn/assets/flow-demo.css
+  h_000d6d73c03ff5 253-270
+agentscope-java-learn/assets/flow-demo.js
+  h_000d6d73c03ff5 1,8-225,229-239,245-260,266-289,317-323,342,345-348,409,438-440,447-451,503-504
+agentscope-java-learn/assets/nav.js
+  h_000d6d73c03ff5 52-53
+agentscope-java-learn/assets/search-index-01.js
+  h_000d6d73c03ff5 3
+agentscope-java-learn/chapters/00a-agent-flow.html
+  h_000d6d73c03ff5 43-45,85,104-111,115,134,136-138,143,146-147,149-151,156,158
+agentscope-java-learn/index.html
+  h_000d6d73c03ff5 208
+tools/check-site.cjs
+  h_000d6d73c03ff5 582-583,586,588,593
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9e4d0d3a9680a12f689a546f6ee0e6c2a69f6ce3",
+  "prompts": {},
+  "humans": {
+    "h_000d6d73c03ff5": {
+      "author": "lingyao <lingyao@tianmagroup.com>"
+    }
+  }
+}
