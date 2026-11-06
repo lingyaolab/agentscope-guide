@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 33 章拆 AgentScope Java 2.0.4 的三种协议：A2A 的客户端 / 服务端与 AgentCard、Agent Protocol 的 /tasks 与 SSE / HITL、AG-UI 的事件映射、starter 默认值与 interrupt resume，并给出选型与部署边界。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="33 协议：A2A / Agent Protocol / AG-UI · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 33 章拆 AgentScope Java 2.0.4 的三种协议：A2A 的客户端 / 服务端与 AgentCard、Agent Protocol 的 /tasks 与 SSE / HITL、AG-UI 的事件映射、starter 默认值与 interrupt resume，并给出选型与部署边界。"
+    />
+    <title>33 协议：A2A / Agent Protocol / AG-UI · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="33-protocols" data-root="..">
+    <main>
+      <article class="article">
+        <h1>33 · 协议：A2A / Agent Protocol / AG-UI</h1>
+        <p class="lede">
+          第 20 章的 Endpoint 是平台自己的调用契约；这一章讲三种「标准协议」适配器。它们不是同一个接口的三种写法，
+          而是三个不同边界：A2A 让 Agent 之间互调，Agent Protocol 让业务系统按任务 HTTP 提交，AG-UI 把事件流推给前端。
+          选错协议，最先出问题的不是代码，而是信任边界与状态归属。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>用「谁调用谁、传输什么、默认入口是什么」三句话区分 A2A、Agent Protocol 与 AG-UI</li>
+          <li>把远端 A2A Agent 包成本地 <code>Agent</code>，或把本地 <code>ReActAgent</code> 暴露成 A2A Server</li>
+          <li>说清 Agent Protocol 的 <code>/tasks</code>、等待、取消、SSE 与 HITL resume 的完整链路</li>
+          <li>配置 AG-UI 的 path、agent 路由、工具合并、token usage 与 interrupt-on-disconnect</li>
+          <li>识别三处默认值 / 命名差异，尤其是 A2A starter 的 artifact 名</li>
+          <li>按部署形态选择协议，并说清 CORS、forwardedProps、任务存储与并发边界</li>
+        </ul>
+
+        <h2 id="why">三条边界，不是三个 endpoint</h2>
+        <p>
+          官方把三种协议按信任边界分开：AG-UI 面向用户 UI 的事件流，Agent Protocol 是内部远程子 Agent / 任务 HTTP 面，
+          A2A 用于外部 Agent 互操作
+          <span class="src" data-src="docs/v2/zh/integration/protocol/overview.md:6-22">overview.md:6-22</span>。
+          这三句话决定了它们的入口、事件格式和默认安全假设。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>协议</th><th>谁调用谁</th><th>主要传输</th><th>默认入口 / 形态</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>A2A</td><td>Agent ↔ Agent</td><td>JSON-RPC（默认）等 transport</td><td>客户端包远端 Agent；服务端交给你所在 Web 框架监听</td></tr>
+              <tr><td>Agent Protocol</td><td>业务系统 / 父 Harness → Agent</td><td>HTTP + SSE</td><td><code>/tasks</code> 系列，默认关闭</td></tr>
+              <tr><td>AG-UI</td><td>前端 UI ↔ Agent</td><td>HTTP + SSE</td><td><code>/agui/run</code>，默认开启 CORS</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="map">一张对照表：入口、状态与默认值</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>维度</th><th>A2A</th><th>Agent Protocol</th><th>AG-UI</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>核心抽象</td><td><code>AgentCard</code> + transport wrapper</td><td><code>TaskRecord</code> + <code>AgentFactory</code></td><td><code>RunAgentInput</code> + <code>AguiEvent</code></td></tr>
+              <tr><td>会话键</td><td>由远端 Agent 决定</td><td><code>task_id</code> 同时作为 session id</td><td><code>threadId</code> 映射为 sessionId</td></tr>
+              <tr><td>默认值</td><td>无 transport 时用 JSONRPC</td><td><code>enabled=false</code>；streaming / hitl 默认 true</td><td>path <code>/agui</code>；run timeout 10m</td></tr>
+              <tr><td>重点风险</td><td>服务端不监听端口，需自己接 Web 框架</td><td>任务存储与执行 workspace 分离</td><td>CORS 默认 <code>*</code>；forwardedProps 不可信</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="a2a">A2A：客户端把远端 Agent 变成本地 Agent</h2>
+        <p>
+          A2A 模块分客户端与服务端，两个子模块完全独立，可以只用其一
+          <span class="src" data-src="docs/v2/zh/integration/protocol/a2a.md:6-11">a2a.md:6-11</span>。
+          客户端侧，<code>A2aAgent</code> 是 <code>AgentBase</code> 的子类，可以像普通 Agent 一样放进 Pipeline、MsgHub 或 Subagent
+          <span class="src" data-src="docs/v2/zh/integration/protocol/a2a.md:25-62">a2a.md:25-62</span>。
+        </p>
+        <pre data-lang="java" data-file="A2A 客户端（示意）">A2aAgent remote = A2aAgent.builder()
+    .name("remote-translator")
+    .agentCard(card)
+    .build();
+
+Msg result = remote.call(new UserMessage("Translate to English: 你好")).block();</pre>
+        <p>
+          没有现成 AgentCard 时，可以用 <code>WellKnownAgentCardResolver</code> 从
+          <code>/.well-known/agent-card.json</code> 拉取
+          <span class="src" data-src="docs/v2/zh/integration/protocol/a2a.md:45-54">a2a.md:45-54</span>。
+          这适合「对方已经按 A2A 标准暴露发现文档」的场景；否则直接传 card 更可控。
+        </p>
+
+        <h2 id="a2a-server">A2A 服务端：只组装处理器，不监听端口</h2>
+        <p>
+          <code>AgentScopeA2aServer</code> 负责构建组件和请求处理链，本身不监听端口、不暴露 endpoint；
+          具体监听由你的 Spring / Quarkus / Vert.x 完成
+          <span class="src" data-src="docs/v2/zh/integration/protocol/a2a.md:64-100">a2a.md:64-100</span>。
+          它默认用内存 <code>TaskStore</code>、<code>QueueManager</code> 与 push config；生产要换成持久化实现
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:241-287">AgentScopeA2aServer.java:241-287</span>。
+        </p>
+        <pre data-lang="java" data-file="A2A 服务端（示意）">AgentScopeA2aServer server = AgentScopeA2aServer.builder()
+    .agentBuilder(ReActAgent.builder().name("backend-agent").model(model))
+    .transportProperties(new JsonRpcTransportProperties())
+    .build();
+
+TransportWrapper wrapper = server.getTransportWrapper("JSONRPC");
+// 交给你的 Web 框架转发
+server.postEndpointReady();   // Web 服务就绪后再注册</pre>
+        <p>
+          没有指定 transport 时，builder 默认尝试 <code>JSONRPC</code>；如果连默认 transport 的 properties 都找不到，
+          直接抛 <code>IllegalArgumentException</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:383-395">AgentScopeA2aServer.java:383-395</span>。
+          <code>postEndpointReady()</code> 会触发 AgentCard 注册，顺序不能反
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:161-162">AgentScopeA2aServer.java:161-162</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">A2A starter 名与文档不一致</span>
+          <p>
+            A2A 文档写的是 <code>agentscope-spring-boot-starter-a2a-server</code>
+            <span class="src" data-src="docs/v2/zh/integration/protocol/a2a.md:108-110">a2a.md:108-110</span>，
+            但仓库里实际的 artifact 是 <code>agentscope-a2a-spring-boot-starter</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-a2a-spring-boot-starter/pom.xml:28">pom.xml:28</span>。
+            照文档写依赖会解析失败。
+          </p>
+        </div>
+
+        <h2 id="agent-protocol">Agent Protocol：/tasks 是任务 API，不是聊天 UI</h2>
+        <p>
+          Agent Protocol 把 Harness Agent 暴露成标准 HTTP 任务接口，适合 CI、其他 Agent 平台、自动化任务，以及远程子 Agent 的托管端
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agent-protocol.md:6-13">agent-protocol.md:6-13</span>。
+          它由 Spring Boot 自动配置提供，默认关闭：不打开 <code>agentscope.agent-protocol.enabled</code> 就不会注册任何 REST 接口
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolProperties.java:25-32">AgentProtocolProperties.java:25-32</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>端点</th><th>作用</th><th>关键点</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>POST /tasks</code></td><td>提交任务</td><td>必须带 <code>task_id</code>；成功返回 <code>pending</code></td></tr>
+              <tr><td><code>GET /tasks/{id}</code></td><td>快照</td><td>状态、结果、错误、待确认项</td></tr>
+              <tr><td><code>GET /tasks/{id}/wait</code></td><td>阻塞等待</td><td><code>timeout_seconds</code> 默认 7200 秒</td></tr>
+              <tr><td><code>POST /tasks/{id}/cancel</code></td><td>请求取消</td><td>不是删除记录</td></tr>
+              <tr><td><code>GET /tasks/{id}/events</code></td><td>SSE 事件流</td><td><code>from_seq</code> / <code>Last-Event-ID</code> 续传</td></tr>
+              <tr><td><code>POST /tasks/{id}/resume</code></td><td>HITL 恢复</td><td>提交 <code>decisions</code>，成功返回 <code>running</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          端点与默认等待时间来自控制器实现
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolController.java:59-109">AgentProtocolController.java:59-109</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolController.java:126-137">AgentProtocolController.java:126-137</span>。
+        </p>
+
+        <h2 id="protocol-flow">Agent Protocol 的状态：pending、running、success、error、cancelled</h2>
+        <p>
+          提交后任务先进入 pending，开始执行变 running；完成、失败、取消分别映射成 success、error、cancelled。
+          等待工具确认时，快照会显示 <code>awaiting_confirm</code>，但底层存储的 <code>TaskStatus</code> 仍是 RUNNING，
+          所以父侧 barrier 会继续等
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agent-protocol.md:218-226">agent-protocol.md:218-226</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolTaskStore.java:577-584">AgentProtocolTaskStore.java:577-584</span>。
+        </p>
+        <p>
+          SSE 的详细度由提交时的 <code>context.detail</code> 控制，默认 <code>status</code>，再往上依次是
+          <code>full</code> 与 <code>verbose</code>；只有 <code>verbose</code> 能完整复现 Agent 自身事件流
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agent-protocol.md:241-251">agent-protocol.md:241-251</span>。
+          每条事件带 <code>eventType</code> 与 <code>payload</code>，客户端可以只读扁平字段，也可以还原原始事件
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agent-protocol.md:253-260">agent-protocol.md:253-260</span>。
+        </p>
+        <p>
+          HITL 恢复时，<code>decisions</code> 按 <code>toolCallId</code>（也接受 <code>tool_call_id</code>）给出
+          <code>approved</code> 与可选 <code>reason</code>；只有 <code>hitl-enabled=true</code> 时才会因工具确认暂停
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agent-protocol.md:262-275">agent-protocol.md:262-275</span>。
+        </p>
+
+        <h2 id="protocol-config">Agent Protocol 配置：任务 Store 与 workspace 分开</h2>
+        <p>
+          三个最关键的默认值：<code>enabled=false</code>、<code>streaming-enabled=true</code>、
+          <code>hitl-enabled=true</code>；SSE 回放缓冲默认 256 条，<code>sse-timeout-ms</code> 默认 10,800,000 毫秒，
+          但源码注释说明它是客户端 idle hint、默认不由服务端强制
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolProperties.java:25-45">AgentProtocolProperties.java:25-45</span>。
+        </p>
+        <pre data-lang="yaml" data-file="Agent Protocol 配置（示意）">agentscope:
+  agent-protocol:
+    enabled: true
+    streaming-enabled: true
+    hitl-enabled: true
+    sse-replay-buffer-size: 256
+    sse-timeout-ms: 10800000
+    # task-store-path 是协议控制面目录，不是 Agent workspace
+    # task-store-path: ${user.dir}/.agentscope/agent-protocol</pre>
+        <p>
+          任务记录由 <code>ProtocolTaskRepository</code> 持久化，默认落在
+          <code>${user.dir}/.agentscope/agent-protocol</code>；它和每个 Agent 的 <code>WorkspaceManager</code>
+          （MEMORY、sessions、skills）完全独立
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agent-protocol.md:52-64">agent-protocol.md:52-64</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolProperties.java:91-97">AgentProtocolProperties.java:91-97</span>。
+          把两者混用，会出现「任务元数据写进了执行工作区」或「清理 workspace 把任务记录删了」。
+        </p>
+
+        <h2 id="agui">AG-UI：把 AgentEvent 映射成前端事件流</h2>
+        <p>
+          AG-UI 把 AgentScope 的 <code>AgentEvent</code> 转成 AG-UI 事件，覆盖文本、推理、工具调用、状态、自定义事件、
+          token usage 与 HITL interrupt
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:6-22">agui.md:6-22</span>。
+          手动使用时，构造 <code>AguiAgentAdapter</code>，把 <code>RunAgentInput</code> 转成事件流
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:46-67">agui.md:46-67</span>。
+        </p>
+        <pre data-lang="java" data-file="AG-UI adapter（示意）">AguiAdapterConfig config = AguiAdapterConfig.builder()
+    .enableReasoning(true)
+    .emitTokenUsage(true)
+    .runTimeout(Duration.ofMinutes(5))
+    .build();
+
+AguiAgentAdapter adapter = new AguiAgentAdapter(agent, config);
+Flux<AguiEvent> events = adapter.run(runAgentInput);</pre>
+        <p>
+          事件映射有固定语义：<code>AgentStartEvent</code> → <code>RUN_STARTED</code>，
+          <code>AgentEndEvent</code> → <code>RUN_FINISHED</code>，文本走 <code>TEXT_MESSAGE_*</code>，
+          工具调用走 <code>TOOL_CALL_*</code>，未映射事件回退成 <code>RAW</code>
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:69-85">agui.md:69-85</span>。
+          <code>RUN_ERROR</code> 与 <code>RUN_FINISHED</code> 是互斥终态；只有旧客户端才需要
+          <code>emitRunFinishedAfterError=true</code> 补一个完成事件。
+        </p>
+
+        <h2 id="agui-config">AG-UI starter：path、路由与工具合并</h2>
+        <p>
+          Spring Boot starter 的默认入口是 <code>POST /agui/run</code>，启用 path routing 时还有
+          <code>/agui/run/{agentId}</code>；agent 也可以从 <code>X-Agent-Id</code> 头读取
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-agui-spring-boot-starter/src/main/java/io/agentscope/spring/boot/agui/mvc/AguiRestController.java:84-110">AguiRestController.java:84-110</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>配置</th><th>默认</th><th>含义</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>path-prefix</code></td><td><code>/agui</code></td><td>入口前缀</td></tr>
+              <tr><td><code>cors-enabled</code> / <code>cors-allowed-origins</code></td><td><code>true</code> / <code>*</code></td><td>默认放开所有来源，生产要收窄</td></tr>
+              <tr><td><code>run-timeout</code></td><td>10 分钟</td><td>单次 run 上限</td></tr>
+              <tr><td><code>default-agent-id</code></td><td><code>default</code></td><td>请求未指定 agent 时使用</td></tr>
+              <tr><td><code>agent-id-header</code></td><td><code>X-Agent-Id</code></td><td>从请求头选 agent</td></tr>
+              <tr><td><code>emit-state-events</code> / <code>emit-tool-call-args</code></td><td><code>true</code></td><td>状态与工具参数事件</td></tr>
+              <tr><td><code>emit-token-usage</code> / <code>enable-reasoning</code></td><td><code>false</code></td><td>默认不发 token usage 与 reasoning</td></tr>
+              <tr><td><code>server-side-memory</code></td><td><code>false</code></td><td>默认不在服务端按 threadId 保留 Agent 实例</td></tr>
+              <tr><td><code>interrupt-on-disconnect</code></td><td><code>true</code></td><td>客户端断开时中断 Agent run</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          这些默认值在 <code>AguiProperties</code> 里逐项定义
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-agui-spring-boot-starter/src/main/java/io/agentscope/spring/boot/agui/common/AguiProperties.java:49-130">AguiProperties.java:49-130</span>；
+          另有 <code>maxThreadSessions=1000</code>、<code>sessionTimeoutMinutes=30</code>、<code>sseTimeout=600000</code>
+          只在 server-side memory 或 SSE 场景生效。
+        </p>
+        <p>
+          前端可以在 <code>RunAgentInput.tools</code> 里传工具 schema。默认 <code>ToolMergeMode</code> 是
+          <code>MERGE_EXTERNAL_PRIORITY</code>：合并两侧工具，同名时前端优先；<code>EXTERNAL_ONLY</code> 只暴露前端工具，
+          <code>AGENT_ONLY</code> 忽略前端工具
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:254-264">agui.md:254-264</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-agui-spring-boot-starter/src/main/java/io/agentscope/spring/boot/agui/common/AguiProperties.java:61-62">AguiProperties.java:61-62</span>。
+        </p>
+
+        <h2 id="agui-hitl">AG-UI 的 HITL：interrupt 与 resume</h2>
+        <p>
+          工具挂起 / 外部执行、权限确认都会在 <code>RUN_FINISHED</code> 上输出官方 interrupt，
+          <code>reason</code> 固定为 <code>"tool_call"</code>，因为 interrupt 绑定到具体 <code>toolCallId</code>
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:266-273">agui.md:266-273</span>。
+          前端完成后，在同一个 <code>threadId</code> 的下一次 run 里带回 <code>resume[]</code>，包含
+          <code>interruptId</code>、<code>status</code> 与 <code>payload</code>
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:314-336">agui.md:314-336</span>。
+        </p>
+        <p>
+          权限确认只有 <code>payload.approved</code> 严格为布尔 <code>true</code> 才批准；
+          <code>editedArgs</code> 如果存在，必须是对原始参数的完整替换，不是局部 merge
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:338-340">agui.md:338-340</span>。
+          这比「传一个 partial patch」更安全，也更符合「参数整体可审计」的要求。
+        </p>
+
+        <h2 id="security">安全边界：CORS、forwardedProps 与任务目录</h2>
+        <p>
+          AG-UI 默认 <code>cors-enabled=true</code> 且允许 <code>*</code>，适合本地开发；生产应显式收窄到前端域名
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-agui-spring-boot-starter/src/main/java/io/agentscope/spring/boot/agui/common/AguiProperties.java:52-56">AguiProperties.java:52-56</span>。
+          <code>forwardedProps</code> 来自客户端请求体，不能当身份来源；身份应由认证链路或服务端 resolver 注入
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:252">agui.md:252</span>。
+        </p>
+        <p>
+          Agent Protocol 的 <code>context.attributes</code> 也是调用方数据，整体挂在命名空间键下，避免覆盖框架自身读取的
+          <code>agentId</code> / <code>outboundAddress</code> 等保留键；这些属性不会写进系统提示词
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agent-protocol.md:116-127">agent-protocol.md:116-127</span>。
+          需要提升为顶层键时，用显式白名单的 <code>RuntimeContextCustomizer</code>。
+        </p>
+        <p>
+          A2A 服务端默认的 TaskStore / QueueManager 都是内存实现，进程重启就丢；生产要换成持久化实现，
+          否则「任务提交成功」只在当前进程生命周期内成立
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:241-287">AgentScopeA2aServer.java:241-287</span>。
+        </p>
+
+        <h2 id="concurrency">并发与会话：同一个 agent 实例可以服务多个任务</h2>
+        <p>
+          Agent Protocol 的 Agent 在调用之间是无状态的，单例即可服务多个并发任务；每个任务通过 <code>RuntimeContext</code>
+          携带独立的 <code>(userId, sessionId)</code>，同 session 的并发请求会串行化，不同 session 并行
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agent-protocol.md:66-80">agent-protocol.md:66-80</span>。
+          但 <code>AgentFactory</code> 在并发任务下应返回独立实例，返回 <code>null</code> 会让任务以错误状态结束
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agent-protocol.md:112-114">agent-protocol.md:112-114</span>。
+        </p>
+        <p>
+          AG-UI 把 <code>threadId</code> 映射成 <code>sessionId</code>，同一个 Agent 实例在不同 thread 之间保持会话隔离
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:188-205">agui.md:188-205</span>。
+          默认 <code>server-side-memory=false</code>：不按 threadId 保留 Agent 实例，历史是否连续取决于你传入的消息与状态。
+        </p>
+
+        <h2 id="selection">选型：先看调用方，再看事件消费方式</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>场景</th><th>优先</th><th>理由</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>多个 Agent / 外部 Agent 系统互调</td><td>A2A</td><td>AgentCard 发现 + 标准 transport，客户端可包成本地 Agent</td></tr>
+              <tr><td>CI / 业务系统按任务提交并轮询</td><td>Agent Protocol</td><td><code>/tasks</code> + wait + cancel + SSE + HITL</td></tr>
+              <tr><td>浏览器前端实时渲染文本 / 工具 / 推理</td><td>AG-UI</td><td>事件语义完整，支持前端工具与 interrupt</td></tr>
+              <tr><td>已有 OpenAI 客户端</td><td>Chat Completions Web</td><td>兼容层，不是这三种协议之一</td></tr>
+              <tr><td>平台自己的同步 / 异步调用</td><td>Endpoint（第 20 章）</td><td>不需要引入外部协议</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="deployment">部署：谁监听端口，谁管任务存储</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>协议</th><th>端口 / 路径</th><th>持久化重点</th><th>典型部署</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>A2A</td><td>无内置监听；交给你接入的 Web 框架</td><td>TaskStore / QueueManager / push config</td><td>Spring / Quarkus / Vert.x 控制器转发 wrapper</td></tr>
+              <tr><td>Agent Protocol</td><td><code>/tasks</code>，需 <code>enabled=true</code></td><td><code>ProtocolTaskRepository</code> 与执行 workspace 分离</td><td>Spring Boot 自动配置</td></tr>
+              <tr><td>AG-UI</td><td><code>/agui/run</code>，可加 path/header 路由</td><td>server-side memory 默认关；threadId 即 session</td><td>Spring MVC / WebFlux starter</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          对外暴露前先决定认证放在哪一层：A2A 的 wrapper 前面、Agent Protocol 的 <code>/tasks</code> 前面、AG-UI 的
+          <code>/agui</code> 前面。三者都不替你做用户身份认证；协议只定义交互格式。
+        </p>
+
+        <h2 id="failure">故障边界：先确认协议是否真的启用</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>症状</th><th>更可能的原因</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Agent Protocol 404</td><td><code>enabled</code> 默认 false</td><td>配置项与自动配置是否生效</td></tr>
+              <tr><td>A2A 启动报没有 transport</td><td>未指定 properties，且默认 JSONRPC 不可用</td><td><code>withTransport(...)</code> 与 SPI 实现</td></tr>
+              <tr><td>A2A starter 依赖解析失败</td><td>用了文档里的旧 artifact 名</td><td>改成 <code>agentscope-a2a-spring-boot-starter</code></td></tr>
+              <tr><td>AG-UI 流结束但没有 <code>RUN_FINISHED</code></td><td>上游没有发 <code>AgentEndEvent</code>，adapter 不补</td><td>Agent 事件流与 <code>emitRunFinishedAfterError</code></td></tr>
+              <tr><td>AG-UI 看不到推理 / token</td><td><code>enable-reasoning</code> / <code>emit-token-usage</code> 默认 false</td><td>starter 配置</td></tr>
+              <tr><td>Agent Protocol 任务一直 running</td><td>工具确认未 resume，或 SSE 客户端断开</td><td>快照是否 <code>awaiting_confirm</code>、<code>decisions</code></td></tr>
+              <tr><td>任务记录与 workspace 混在一起</td><td>把 task-store-path 指到了执行工作区</td><td>两者是否独立目录</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cheatsheet">速查：入口、默认值与 artifact</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>值 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>A2A 默认 transport</td><td>无指定时尝试 <code>JSONRPC</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:383-395">AgentScopeA2aServer.java:383-395</span></td></tr>
+              <tr><td>A2A starter</td><td><code>agentscope-a2a-spring-boot-starter</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-a2a-spring-boot-starter/pom.xml:28">pom.xml:28</span></td></tr>
+              <tr><td>Agent Protocol 默认</td><td><code>enabled=false</code>；streaming / hitl true</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolProperties.java:25-32">AgentProtocolProperties.java:25-32</span></td></tr>
+              <tr><td>等待默认</td><td><code>timeout_seconds=7200</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolController.java:86-90">AgentProtocolController.java:86-90</span></td></tr>
+              <tr><td>SSE 回放 / 超时</td><td>256 条 / 10,800,000 ms</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolProperties.java:34-38">AgentProtocolProperties.java:34-38</span></td></tr>
+              <tr><td>AG-UI 入口</td><td><code>/agui/run</code> 与 <code>/agui/run/{agentId}</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-agui-spring-boot-starter/src/main/java/io/agentscope/spring/boot/agui/mvc/AguiRestController.java:84-110">AguiRestController.java:84-110</span></td></tr>
+              <tr><td>AG-UI 默认 CORS</td><td><code>true</code>，origin <code>*</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-agui-spring-boot-starter/src/main/java/io/agentscope/spring/boot/agui/common/AguiProperties.java:52-56">AguiProperties.java:52-56</span></td></tr>
+              <tr><td>AG-UI run timeout</td><td>10 分钟</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-agui-spring-boot-starter/src/main/java/io/agentscope/spring/boot/agui/common/AguiProperties.java:58-59">AguiProperties.java:58-59</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">六个坑：把协议当框架</h2>
+        <p>
+          <strong>坑一：以为 A2A Server 会自己监听端口。</strong>它只组装处理器，端口由你的 Web 框架负责
+          <span class="src" data-src="docs/v2/zh/integration/protocol/a2a.md:100">a2a.md:100</span>。
+        </p>
+        <p>
+          <strong>坑二：照文档写 A2A starter 名。</strong>实际 artifact 是 <code>agentscope-a2a-spring-boot-starter</code>，不是文档里的
+          <code>agentscope-spring-boot-starter-a2a-server</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-a2a-spring-boot-starter/pom.xml:28">pom.xml:28</span>。
+        </p>
+        <p>
+          <strong>坑三：Agent Protocol 没开 enabled。</strong>默认 false，不配置就不会有 <code>/tasks</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolProperties.java:25-26">AgentProtocolProperties.java:25-26</span>。
+        </p>
+        <p>
+          <strong>坑四：假设 AG-UI 一定补 RUN_FINISHED。</strong>正常流结束但上游没发 <code>AgentEndEvent</code> 时，adapter 不会补
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:85">agui.md:85</span>。
+        </p>
+        <p>
+          <strong>坑五：把 forwardedProps 当身份。</strong>它来自客户端请求体，不能作为可信身份来源
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agui.md:252">agui.md:252</span>。
+        </p>
+        <p>
+          <strong>坑六：把任务 Store 指到执行 workspace。</strong>协议任务元数据与 Agent workspace 必须分开，清理 workspace 不应删任务记录
+          <span class="src" data-src="docs/v2/zh/integration/protocol/agent-protocol.md:52-64">agent-protocol.md:52-64</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>A2A Server 构建完成后，是否已经在监听端口？</summary>
+          <p>
+            没有。它只构建组件与请求处理链，具体监听由你的 Web 框架完成；<code>postEndpointReady()</code> 只是在服务就绪后触发注册
+            <span class="src" data-src="docs/v2/zh/integration/protocol/a2a.md:100">a2a.md:100</span>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:161-162">AgentScopeA2aServer.java:161-162</span>。
+          </p>
+        </details>
+        <details>
+          <summary>引入 Agent Protocol 依赖后，<code>/tasks</code> 会自动出现吗？</summary>
+          <p>
+            不会。它默认 <code>enabled=false</code>，必须在配置里显式打开，才会注册 REST 接口
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolProperties.java:25-26">AgentProtocolProperties.java:25-26</span>。
+          </p>
+        </details>
+        <details>
+          <summary>AG-UI 默认会把 reasoning 和 token usage 发给前端吗？</summary>
+          <p>
+            不会。两者默认都关闭，需要显式设置 <code>enable-reasoning=true</code> 与 <code>emit-token-usage=true</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-agui-spring-boot-starter/src/main/java/io/agentscope/spring/boot/agui/common/AguiProperties.java:70-80">AguiProperties.java:70-80</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：给三个调用方各选一条协议</h2>
+        <p>目标不是把三个协议都跑通，而是能说清「谁调用、怎么等结果、断线怎么办」。建议 50 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">列三个调用方</span>
+            <div>浏览器聊天 UI、CI 任务系统、另一个 Agent 平台；分别写下它们要同步结果还是事件流。</div>
+          </li>
+          <li>
+            <span class="sh">选协议</span>
+            <div>分别映射到 AG-UI、Agent Protocol、A2A，并写一句为什么不是另外两个。</div>
+          </li>
+          <li>
+            <span class="sh">配 AG-UI</span>
+            <div>打开 starter，设置 path、agent-id-header 与 CORS 白名单；发一次 run，确认收到 RUN_STARTED / TEXT / RUN_FINISHED。</div>
+          </li>
+          <li>
+            <span class="sh">配 Agent Protocol</span>
+            <div>设置 <code>enabled=true</code>，提交一个 task，轮询快照，再用 <code>wait</code> 等终态。</div>
+          </li>
+          <li>
+            <span class="sh">测 SSE 续传</span>
+            <div>在事件流中途断开，用 <code>from_seq</code> 或 <code>Last-Event-ID</code> 重连，确认补发范围。</div>
+          </li>
+          <li>
+            <span class="sh">测 A2A 客户端</span>
+            <div>用 AgentCard 或 well-known resolver 连接一个远端 Agent，像本地 Agent 一样 <code>call</code>。</div>
+          </li>
+          <li>
+            <span class="sh">记录默认值</span>
+            <div>把三个协议的关键默认值抄进一张表：端口 / 入口、等待时间、CORS、超时、存储。</div>
+          </li>
+          <li>
+            <span class="sh">写三行结论</span>
+            <div>分别写「谁调用谁」「结果怎么拿」「断线/重启后什么会丢」，确保每行都能在配置或源码里找到证据。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          协议讲完，下一章进入渠道：钉钉、飞书、企业微信、GitHub、GitLab。它们不是「另一个 HTTP 入口」，
+          而是把平台认证、签名、消息解析、去重与回复投递都塞进入站适配器；重点会落在 webhook 校验与多副本共享状态。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="32-rag-integration.html">32 RAG</a></td><td>知识检索与协议无关，但会出现在同一条 Agent 链路里</td></tr>
+              <tr><td><a href="20-endpoints-sse.html">20 Endpoint、Job 与 SSE</a></td><td>平台自己的调用契约，和三种标准协议的边界</td></tr>
+              <tr><td>第 34 章 · 渠道</td><td>Webhook 校验、消息路由与多副本去重</td></tr>
+              <tr><td>官方「协议概览」</td><td>三种协议的分层与选型<span class="src" data-src="docs/v2/zh/integration/protocol/overview.md:6-22">overview.md:6-22</span></td></tr>
+              <tr><td><a href="../appendix/errata.html">附录 E · 勘误汇总</a></td><td>A2A starter 名这类文档与仓库差异的核对方式</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的协议文档在 2.0.4 仓库里仍带预览提示；凡文档与实现有出入的地方，正文以源码与 POM 为准，
+          端点、默认值、artifact 名都标了具体出处。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
