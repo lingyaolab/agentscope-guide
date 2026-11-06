@@ -1,0 +1,18 @@
+CHANGELOG.md
+  h_000d6d73c03ff5 39
+agentscope-java-learn/assets/base.css
+  h_000d6d73c03ff5 7,34,60-73,579
+tools/check-site.cjs
+  h_000d6d73c03ff5 538,553-557
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "36501da51fd17a8b1d232160738d2cc5814e70fe",
+  "prompts": {},
+  "humans": {
+    "h_000d6d73c03ff5": {
+      "author": "lingyao <lingyao@tianmagroup.com>"
+    }
+  }
+}
