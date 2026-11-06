@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 34 章拆 AgentScope Java 2.0.4 的渠道适配器：钉钉 Stream / HTTP、飞书事件订阅、企微加密回调、GitHub / GitLab Webhook，以及签名、去重、防循环、access token 与多副本共享状态。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="34 渠道：钉钉 / 飞书 / 企微 / GitHub / GitLab · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 34 章拆 AgentScope Java 2.0.4 的渠道适配器：钉钉 Stream / HTTP、飞书事件订阅、企微加密回调、GitHub / GitLab Webhook，以及签名、去重、防循环、access token 与多副本共享状态。"
+    />
+    <title>34 渠道：钉钉 / 飞书 / 企微 / GitHub / GitLab · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="34-channels" data-root="..">
+    <main>
+      <article class="article">
+        <h1>34 · 渠道：钉钉 / 飞书 / 企微 / GitHub / GitLab</h1>
+        <p class="lede">
+          第 33 章的协议是「标准接口」，这一章的渠道是「平台适配」。钉钉、飞书、企微、GitHub、GitLab 各有自己的认证、
+          签名、事件格式、去重键与回复 API；<code>Channel</code> 的职责就是把这些差异吃掉，让 Agent 只看到统一的入站消息与出站回复。
+          真正容易出事的不是模型调用，而是 webhook 验签、重复投递和多副本下的 JVM 内状态。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 <code>Channel</code> 的入站 / 出站管线，以及平台差异由哪一层吸收</li>
+          <li>解释 <code>IdempotencyStore</code>、<code>BotLoopGuard</code>、<code>AccessTokenStore</code> 三个共享组件各防什么</li>
+          <li>按平台选择 Stream 还是 HTTP 回调，并配置签名、加密与回调路径</li>
+          <li>识别 GitHub / GitLab 的评论事件过滤与 bot 自身过滤，避免自激循环</li>
+          <li>说清多副本下默认 JVM 内去重 / token 缓存的失效边界，以及怎么注入共享实现</li>
+          <li>按症状判断是验签失败、事件被过滤、重复投递还是 token 刷新问题</li>
+        </ul>
+
+        <h2 id="why">渠道不是「另一个 HTTP 入口」</h2>
+        <p>
+          官方把 Channel 定义为「把 Agent 接入真实消息平台」的适配器：每个适配器负责平台特有的认证、webhook 签名校验、
+          消息解析和回复投递，Agent 代码不需要感知平台差异
+          <span class="src" data-src="docs/v2/zh/integration/channel/index.md:6">index.md:6</span>。
+          这和 A2A / Agent Protocol 的区别在于：协议定义「怎么互操作」，渠道定义「某个平台的消息怎么进、回复怎么出」。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>平台</th><th>入站方式</th><th>回复方式</th><th>主要差异</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>钉钉</td><td>Stream WebSocket（默认）或加签 HTTP</td><td>OpenAPI batchSend</td><td>Stream 无需公网入口；HTTP 模式有重放风险</td></tr>
+              <tr><td>飞书</td><td>事件订阅 v2 HTTP 回调</td><td>IM API 发消息</td><td>可选 AES 加密；当前仅文本消息</td></tr>
+              <tr><td>企微</td><td>加密 HTTP 回调</td><td>应用消息 / 群聊 API</td><td>所有回调都加密；文本消息</td></tr>
+              <tr><td>GitHub</td><td>Webhook（issue / PR 评论）</td><td>新建 issue comment</td><td>HMAC-SHA256；bot 自身评论过滤</td></tr>
+              <tr><td>GitLab</td><td>Note hook</td><td>新建 note</td><td>Secret token 可选；bot 自身 note 过滤</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pipeline">入站管线：解析、去重、防循环、交给 Gateway</h2>
+        <p>
+          所有适配器遵循同一模式：入站从平台接收消息（webhook、WebSocket 等），解析成统一的 <code>InboundMessage</code>，
+          去重、防循环，再通过 Gateway 分发；出站调用平台发送 API 把回复投递回去
+          <span class="src" data-src="docs/v2/zh/integration/channel/index.md:18-21">index.md:18-21</span>。
+        </p>
+        <div class="loop">
+          <div class="lp">平台事件<small>Webhook / Stream</small></div>
+          <span class="lp-arrow">→</span>
+          <div class="lp model">验签 / 解密<small>平台适配器</small></div>
+          <span class="lp-arrow">→</span>
+          <div class="lp tool">去重 / 防循环<small>共享组件</small></div>
+          <span class="lp-arrow">→</span>
+          <div class="lp stop">Gateway<small>Agent 执行</small></div>
+        </div>
+        <p>
+          这条管线里，Agent 只收到「一条已经通过认证与去重的入站消息」；平台签名、加密、事件 id、回复地址都在适配器内解决。
+          所以排障时先问「消息有没有过验签和去重」，再问「Agent 为什么没回」。
+        </p>
+
+        <h2 id="common">三个共享组件：去重、防循环、token 缓存</h2>
+        <p>
+          所有适配器共享 <code>agentscope-extensions-channel-common</code> 的三个组件：<code>IdempotencyStore</code>
+          按消息 id 去重，<code>BotLoopGuard</code> 按 peer 限速防止 bot 之间死循环，<code>AccessTokenStore</code>
+          缓存出站调用平台 API 的 access token
+          <span class="src" data-src="docs/v2/zh/integration/channel/index.md:23-27">index.md:23-27</span>。
+        </p>
+        <div class="table-wrap">
+          <thead>
+            <tr><th>组件</th><th>默认实现 / 默认值</th><th>状态在哪</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>IdempotencyStore</code></td><td>TTL 5 分钟、最多 10,000 条</td><td>JVM 堆<span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-common/src/main/java/io/agentscope/extensions/channel/common/IdempotencyStore.java:40-43">IdempotencyStore.java:40-43</span></td></tr>
+            <tr><td><code>BotLoopGuard</code></td><td>20 条 / 60 秒窗口，触发后冷却 60 秒</td><td>JVM 堆<span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-common/src/main/java/io/agentscope/extensions/channel/common/BotLoopGuard.java:23-49">BotLoopGuard.java:23-49</span></td></tr>
+            <tr><td><code>AccessTokenStore</code></td><td><code>InMemoryAccessTokenStore</code>，一个实例只服务一个凭据</td><td>JVM 堆<span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-common/src/main/java/io/agentscope/extensions/channel/common/AccessTokenStore.java:18-37">AccessTokenStore.java:18-37</span></td></tr>
+          </tbody>
+        </table>
+        <p>
+          <code>AccessTokenStore</code> 的约束要特别注意：它不按 key 分组，一个实例只保存一个凭据的 token；
+          把同一个 store 实例共享给不同凭据的 provider，会静默混用 token
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-common/src/main/java/io/agentscope/extensions/channel/common/AccessTokenStore.java:21-31">AccessTokenStore.java:21-31</span>。
+          多实例部署时，应该用按 channel id 分 key 的共享存储实现，并通过 channel 工厂注入。
+        </p>
+
+        <h2 id="security">安全边界：签名、加密与重放</h2>
+        <p>
+          五家平台的认证方式不同，但共同点是：webhook 请求必须先在适配器内通过验签或解密，才会进入 Gateway。
+          不要自己写「先解析 JSON 再验签」的中间件，那等于把未认证输入交给解析器。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>平台</th><th>认证 / 加密</th><th>失败时</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>钉钉 HTTP</td><td><code>timestamp</code> / <code>sign</code> 头做 HMAC-SHA256；可选 <code>aesKey</code> 解密</td><td>签名错或时间戳过期拒绝</td></tr>
+              <tr><td>飞书</td><td><code>X-Lark-Signature</code> + 可选 AES-256-CBC 解密</td><td>验签失败拒绝</td></tr>
+              <tr><td>企微</td><td><code>token</code> + <code>timestamp</code> + <code>nonce</code> + 加密体</td><td>解密 / 验签失败拒绝</td></tr>
+              <tr><td>GitHub</td><td><code>X-Hub-Signature-256</code> 对 body 做 HMAC-SHA256</td><td>签名不匹配拒绝</td></tr>
+              <tr><td>GitLab</td><td>Secret token（可选）</td><td>配置后不匹配拒绝</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout danger">
+          <span class="ct">钉钉 HTTP 回调：不加密就有重放窗口</span>
+          <p>
+            钉钉文档明确提醒：请求签名只认证 <code>timestamp</code> 请求头；不开启消息体加密时，被截获的签名对在有效时间窗口内仍可重放
+            <span class="src" data-src="docs/v2/zh/integration/channel/dingtalk.md:78">dingtalk.md:78</span>。
+            面向公网的 HTTP 回调应开启 <code>aesKey</code>，或者优先用 Stream 模式。
+          </p>
+        </div>
+
+        <h2 id="dingtalk">钉钉：Stream 默认，HTTP 可选</h2>
+        <p>
+          钉钉适配器支持两种接收模式：Stream 是默认的持久 WebSocket，不需要公网 webhook；HTTP 回调由钉钉以 App Secret 加签后
+          POST 到你的 Spring 应用
+          <span class="src" data-src="docs/v2/zh/integration/channel/dingtalk.md:6">dingtalk.md:6</span>。
+          Stream 断线后以指数退避重连，间隔从 1 秒增长到 60 秒上限
+          <span class="src" data-src="docs/v2/zh/integration/channel/dingtalk.md:88-90">dingtalk.md:88-90</span>。
+        </p>
+        <pre data-lang="java" data-file="钉钉 Stream（示意）">DingTalkChannel channel = DingTalkChannel.fromProperties(
+    "my-dingtalk",
+    ChannelConfig.of("my-dingtalk", "main"),
+    Map.of(
+        "appKey", "your-app-key",
+        "appSecret", "your-app-secret",
+        "robotCode", "your-robot-code"
+    ));</pre>
+        <p>
+          HTTP 模式需要额外设置 <code>"mode": "http"</code>，开启消息体加密时还要 43 位 base64 的 <code>aesKey</code>；
+          回调地址是 <code>/api/channels/dingtalk/{channelId}/callback</code>
+          <span class="src" data-src="docs/v2/zh/integration/channel/dingtalk.md:51-76">dingtalk.md:51-76</span>。
+          回复走 OpenAPI 的 <code>batchSend</code>（单聊）或 <code>groupMessages/send</code>（群聊），不通过 HTTP 响应返回
+          <span class="src" data-src="docs/v2/zh/integration/channel/dingtalk.md:84-86">dingtalk.md:84-86</span>。
+        </p>
+
+        <h2 id="feishu">飞书：事件订阅 v2 + 可选加密</h2>
+        <p>
+          飞书通过事件订阅 v2 回调接入，<code>FeishuCallbackController</code> 自动注册在
+          <code>/api/channels/feishu/{channelId}/callback</code>，并自动处理 URL 验证握手
+          <span class="src" data-src="docs/v2/zh/integration/channel/feishu.md:6">feishu.md:6</span>
+          <span class="src" data-src="docs/v2/zh/integration/channel/feishu.md:50">feishu.md:50</span>。
+          必填只有 <code>appId</code> 与 <code>appSecret</code>；<code>encryptKey</code> 与 <code>verificationToken</code> 可选
+          <span class="src" data-src="docs/v2/zh/integration/channel/feishu.md:52-61">feishu.md:52-61</span>。
+        </p>
+        <pre data-lang="java" data-file="飞书（示意）">FeishuChannel channel = FeishuChannel.fromProperties(
+    "my-feishu",
+    ChannelConfig.of("my-feishu", "main"),
+    Map.of(
+        "appId", "cli_xxxxx",
+        "appSecret", "your-app-secret"
+    ));</pre>
+        <p>
+          配置 <code>encryptKey</code> 后，回调 body 以 <code>{"encrypt":"&lt;base64&gt;"}</code> 到达，适配器自动解密并校验
+          <code>X-Lark-Signature</code>
+          <span class="src" data-src="docs/v2/zh/integration/channel/feishu.md:63-65">feishu.md:63-65</span>。
+          入站按 <code>event_id</code> 去重，当前只支持文本消息；出站用 tenant access token，token 缓存并在约 80% TTL 时主动刷新
+          <span class="src" data-src="docs/v2/zh/integration/channel/feishu.md:67-71">feishu.md:67-71</span>。
+        </p>
+
+        <h2 id="wecom">企业微信：所有回调都加密</h2>
+        <p>
+          企微通过加密回调接入，控制器注册在 <code>/api/channels/wecom/{channelId}/callback</code>；
+          必填 <code>corpId</code>、<code>agentId</code>、<code>secret</code>、<code>token</code>、<code>encodingAesKey</code>
+          <span class="src" data-src="docs/v2/zh/integration/channel/wecom.md:6">wecom.md:6</span>
+          <span class="src" data-src="docs/v2/zh/integration/channel/wecom.md:52-62">wecom.md:52-62</span>。
+          它用 <code>WeComCrypto</code> 按企微规范处理解密与签名校验，没有「明文回调」模式
+          <span class="src" data-src="docs/v2/zh/integration/channel/wecom.md:64-66">wecom.md:64-66</span>。
+        </p>
+        <pre data-lang="java" data-file="企微（示意）">WeComChannel channel = WeComChannel.fromProperties(
+    "my-wecom",
+    ChannelConfig.of("my-wecom", "main"),
+    Map.of(
+        "corpId", "your-corp-id",
+        "agentId", "1000002",
+        "secret", "your-secret",
+        "token", "your-callback-token",
+        "encodingAesKey", "your-encoding-aes-key"
+    ));</pre>
+        <p>
+          入站先做 URL 验证（echostr），再解密、按 <code>MsgId</code> 去重、映射文本消息、防循环，最后交给 Gateway
+          <span class="src" data-src="docs/v2/zh/integration/channel/wecom.md:68-70">wecom.md:68-70</span>。
+          出站走 <code>/cgi-bin/message/send</code>（单聊）或 <code>/cgi-bin/appchat/send</code>（群聊）。
+        </p>
+
+        <h2 id="github">GitHub：评论线程 + 自激过滤</h2>
+        <p>
+          GitHub 适配器响应 issue / PR 评论，Agent 以新评论形式回复。它要求 PAT 具备 <code>issues:write</code> 与
+          <code>pull_requests:write</code>，webhook 需要 Secret 用于 <code>X-Hub-Signature-256</code> 校验
+          <span class="src" data-src="docs/v2/zh/integration/channel/github.md:6-30">github.md:6-30</span>。
+        </p>
+        <pre data-lang="java" data-file="GitHub（示意）">GitHubChannel channel = GitHubChannel.fromProperties(
+    "my-github",
+    ChannelConfig.of("my-github", "main"),
+    Map.of(
+        "token", "ghp_xxxxxxxxxxxx",
+        "webhookSecret", "your-webhook-secret"
+    ));</pre>
+        <p>
+          入站管线是：HMAC 验签 → 事件类型过滤（只收 <code>issue_comment</code> 与
+          <code>pull_request_review_comment</code>）→ <code>comment.id</code> 去重 → bot 自身评论过滤 → 只处理
+          <code>action=created</code> → 防循环 → Gateway
+          <span class="src" data-src="docs/v2/zh/integration/channel/github.md:65-69">github.md:65-69</span>。
+          启动时通过 <code>GET /user</code> 解析 bot 用户 id；来自该 id 的评论会被静默丢弃
+          <span class="src" data-src="docs/v2/zh/integration/channel/github.md:61-63">github.md:61-63</span>。
+        </p>
+        <p>
+          每个 issue / PR 线程建模为 <code>THREAD</code> peer，id 形如 <code>owner/repo#number</code>，
+          因此同一线程共享一个 session，Agent 能看到线程内的历史
+          <span class="src" data-src="docs/v2/zh/integration/channel/github.md:71-73">github.md:71-73</span>。
+        </p>
+
+        <h2 id="gitlab">GitLab：Note hook + bot 自身过滤</h2>
+        <p>
+          GitLab 适配器响应 issue / merge request 评论（Note），Agent 以新 note 回复。PAT 需要 <code>api</code> 权限，
+          webhook 勾选 <strong>Note events</strong>；Secret token 是可选的
+          <span class="src" data-src="docs/v2/zh/integration/channel/gitlab.md:6-29">gitlab.md:6-29</span>。
+        </p>
+        <pre data-lang="java" data-file="GitLab（示意）">GitLabChannel channel = GitLabChannel.fromProperties(
+    "my-gitlab",
+    ChannelConfig.of("my-gitlab", "main"),
+    Map.of("token", "glpat-xxxxxxxxxxxx"));</pre>
+        <p>
+          入站管线是：<code>note.id</code> 去重 → bot 自身 note 过滤 → 映射 → 防循环 → Gateway
+          <span class="src" data-src="docs/v2/zh/integration/channel/gitlab.md:61-65">gitlab.md:61-65</span>。
+          启动时通过 <code>GET /api/v4/user</code> 解析 bot 用户 id，来自该 id 的 note 会被丢弃
+          <span class="src" data-src="docs/v2/zh/integration/channel/gitlab.md:57-59">gitlab.md:57-59</span>。
+          生产环境应配置 Secret token；文档标注它是可选的，但不配就等于少一层来源校验。
+        </p>
+
+        <h2 id="compare">横向对比：事件、去重键与文本限制</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>平台</th><th>去重键</th><th>事件过滤</th><th>消息类型</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>钉钉</td><td>平台消息 id</td><td>机器人消息（单聊 / 群 @）</td><td>文本 / Markdown 自动识别</td></tr>
+              <tr><td>飞书</td><td><code>event_id</code></td><td>事件订阅回调</td><td>当前仅文本</td></tr>
+              <tr><td>企微</td><td><code>MsgId</code></td><td>应用消息回调</td><td>文本</td></tr>
+              <tr><td>GitHub</td><td><code>comment.id</code></td><td><code>issue_comment</code> / <code>pull_request_review_comment</code>，仅 <code>created</code></td><td>评论正文</td></tr>
+              <tr><td>GitLab</td><td><code>note.id</code></td><td>Note events</td><td>Note 正文</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          飞书与企微当前只映射文本消息；图片、文件、卡片等类型不会自动变成 Agent 可读文本
+          <span class="src" data-src="docs/v2/zh/integration/channel/feishu.md:69">feishu.md:69</span>
+          <span class="src" data-src="docs/v2/zh/integration/channel/wecom.md:70">wecom.md:70</span>。
+          需要多模态时，要自己在适配器外补下载与转换。
+        </p>
+
+        <h2 id="routing">路由：channelId、agentId 与 peer</h2>
+        <p>
+          每个渠道用 <code>ChannelConfig.of(channelId, defaultAgentId)</code> 指定路由，
+          <code>GatewayBootstrap</code> 再把 agent 与 channel 组装起来
+          <span class="src" data-src="docs/v2/zh/integration/channel/dingtalk.md:33-48">dingtalk.md:33-48</span>。
+          不同平台的 peer 模型不同：GitHub 把 issue / PR 线程当 <code>THREAD</code> peer；其他平台按用户 / 会话 / 群组划分。
+        </p>
+        <div class="callout">
+          <span class="ct">peer 决定 session</span>
+          <p>
+            Agent 是否「记得上一句」取决于 peer 如何映射到 session。GitHub 的线程共享 session；
+            如果你把每个评论都当独立 peer，就会得到「每句都失忆」的行为。排障时先看 peer id，而不是先改提示词。
+          </p>
+        </div>
+
+        <h2 id="multi">多副本：默认状态只在 JVM 里</h2>
+        <p>
+          三个共享组件默认都把状态放在 JVM 内：<code>IdempotencyStore</code>、<code>InMemoryAccessTokenStore</code>，
+          以及 <code>BotLoopGuard</code>。单进程没问题；多副本负载均衡后，平台重试可能落到不同 Pod，
+          每个 Pod 都认为「第一次见」，于是重复处理
+          <span class="src" data-src="docs/v2/zh/integration/channel/index.md:29-38">index.md:29-38</span>.
+        </p>
+        <p>
+          适配器工厂提供了注入入口：传共享 <code>InboundEventDeduplicator</code> 让所有副本识别同一事件，
+          传共享 <code>AccessTokenStore</code> 让一个副本的刷新服务整个部署
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-feishu/src/main/java/io/agentscope/extensions/channel/feishu/FeishuChannel.java:142-147">FeishuChannel.java:142-147</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-github/src/main/java/io/agentscope/extensions/channel/github/GitHubChannel.java:106-110">GitHubChannel.java:106-110</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">BotLoopGuard 没有共享注入入口</span>
+          <p>
+            当前工厂方法里 <code>BotLoopGuard</code> 是直接 <code>new</code> 的，它防的是单进程内的失控循环，不是跨副本总速率。
+            多副本要限制总流量，得在网关 / 平台侧另做，或自己包装 channel 层。
+          </p>
+        </div>
+
+        <h2 id="errors">故障边界：先看验签，再看过滤</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>症状</th><th>更可能的原因</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>平台显示 401 / 403</td><td>签名、token、secret 或时间戳不对</td><td>平台 Secret、回调路径、服务器时间</td></tr>
+              <tr><td>回调 200 但 Agent 不回</td><td>事件类型被过滤、bot 自身过滤、peer 路由错</td><td>事件类型、comment / note 作者 id</td></tr>
+              <tr><td>同一条消息处理两次</td><td>多副本各用 JVM 内去重</td><td>是否注入共享 <code>InboundEventDeduplicator</code></td></tr>
+              <tr><td>两个 bot 互相回复</td><td>防循环失效或未识别 bot 自身</td><td>BotLoopGuard、bot 用户 id 解析</td></tr>
+              <tr><td>token 频繁刷新 / 限流</td><td>每个副本各自缓存</td><td>共享 <code>AccessTokenStore</code></td></tr>
+              <tr><td>飞书 / 企微只有文本</td><td>消息类型未映射</td><td>平台事件类型与适配器支持范围</td></tr>
+              <tr><td>钉钉 HTTP 回调被重放</td><td>只验签未加密</td><td>是否配置 <code>aesKey</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="selection">选型：平台已定，模式可选</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>场景</th><th>选择</th><th>注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>钉钉、无公网入口</td><td>Stream</td><td>持久 WebSocket；断线指数退避 1s→60s</td></tr>
+              <tr><td>钉钉、已有公网回调 / 多租户动态凭据</td><td>HTTP</td><td>必须评估重放；建议开启 <code>aesKey</code></td></tr>
+              <tr><td>飞书</td><td>事件订阅 v2</td><td>Spring 应用；可选加密；当前仅文本</td></tr>
+              <tr><td>企微</td><td>加密回调</td><td>必须配齐 token 与 encodingAesKey</td></tr>
+              <tr><td>GitHub / GitLab</td><td>Webhook</td><td>评论事件；PAT 权限与 bot 过滤</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="deployment">部署：回调路径、公网与多副本</h2>
+        <p>
+          所有 HTTP 渠道都要求你的应用可达平台回调地址：钉钉 <code>/api/channels/dingtalk/{channelId}/callback</code>、
+          飞书 <code>/api/channels/feishu/{channelId}/callback</code>、企微 <code>/api/channels/wecom/{channelId}/callback</code>、
+          GitHub <code>/api/channels/github/{channelId}/webhook</code>、GitLab
+          <code>/api/channels/gitlab/{channelId}/webhook</code>。路径要完整保留 <code>{channelId}</code>，否则控制器无法路由。
+        </p>
+        <p>
+          多副本时，负载均衡只保证「有一个副本收到」，不保证「只有一个副本处理」；共享去重与 token 缓存是生产必选项。
+          钉钉 Stream 则要确认每个副本的 WebSocket 连接都被平台正确分配消息，避免重复消费。
+        </p>
+
+        <h2 id="cheatsheet">速查：默认值、路径与事件</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>值 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>去重默认</td><td>5 分钟 / 10,000 条</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-common/src/main/java/io/agentscope/extensions/channel/common/IdempotencyStore.java:40-43">IdempotencyStore.java:40-43</span></td></tr>
+              <tr><td>防循环默认</td><td>20 条 / 60 秒，冷却 60 秒</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-common/src/main/java/io/agentscope/extensions/channel/common/BotLoopGuard.java:23-49">BotLoopGuard.java:23-49</span></td></tr>
+              <tr><td>钉钉 Stream 重连</td><td>1s → 60s 指数退避</td><td><span class="src" data-src="docs/v2/zh/integration/channel/dingtalk.md:90">dingtalk.md:90</span></td></tr>
+              <tr><td>钉钉 HTTP 回调路径</td><td><code>/api/channels/dingtalk/{channelId}/callback</code></td><td><span class="src" data-src="docs/v2/zh/integration/channel/dingtalk.md:29">dingtalk.md:29</span></td></tr>
+              <tr><td>飞书 token 刷新</td><td>约 80% TTL 主动刷新</td><td><span class="src" data-src="docs/v2/zh/integration/channel/feishu.md:71">feishu.md:71</span></td></tr>
+              <tr><td>GitHub 事件</td><td><code>issue_comment</code> / <code>pull_request_review_comment</code>，仅 created</td><td><span class="src" data-src="docs/v2/zh/integration/channel/github.md:65-69">github.md:65-69</span></td></tr>
+              <tr><td>GitLab 事件</td><td>Note events</td><td><span class="src" data-src="docs/v2/zh/integration/channel/gitlab.md:23-29">gitlab.md:23-29</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">六个坑：把渠道当普通 Controller</h2>
+        <p>
+          <strong>坑一：先解析 JSON 再验签。</strong>验签应使用平台约定的原始请求字节；先反序列化再重新序列化通常会改变字节，
+          GitHub 的 HMAC 会直接失败。
+        </p>
+        <p>
+          <strong>坑二：多副本用默认去重。</strong><code>IdempotencyStore</code> 只在 JVM 内有效；平台重试落到另一个 Pod 就会重复处理
+          <span class="src" data-src="docs/v2/zh/integration/channel/index.md:29-38">index.md:29-38</span>。
+        </p>
+        <p>
+          <strong>坑三：多个凭据共用一个 token store。</strong><code>AccessTokenStore</code> 不按 key 分组，会混用 token
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-common/src/main/java/io/agentscope/extensions/channel/common/AccessTokenStore.java:21-31">AccessTokenStore.java:21-31</span>。
+        </p>
+        <p>
+          <strong>坑四：飞书 / 企微期待图片和卡片。</strong>当前映射只覆盖文本；其他类型需要自己下载与转换。
+        </p>
+        <p>
+          <strong>坑五：GitHub / GitLab 不配 bot 过滤。</strong>bot 自己的评论会再次触发自己，形成自激循环；适配器会解析 bot 用户 id 并丢弃
+          <span class="src" data-src="docs/v2/zh/integration/channel/github.md:61-63">github.md:61-63</span>
+          <span class="src" data-src="docs/v2/zh/integration/channel/gitlab.md:57-59">gitlab.md:57-59</span>。
+        </p>
+        <p>
+          <strong>坑六：钉钉 HTTP 只验签不加密。</strong>签名对在有效时间窗口内可重放；公网回调应开 <code>aesKey</code>
+          <span class="src" data-src="docs/v2/zh/integration/channel/dingtalk.md:78">dingtalk.md:78</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>飞书和企微适配器会把图片、文件、卡片都转成文本给 Agent 吗？</summary>
+          <p>
+            不会。当前飞书与企微只映射文本消息；图片、文件、卡片需要自己下载与转换
+            <span class="src" data-src="docs/v2/zh/integration/channel/feishu.md:69">feishu.md:69</span>
+            <span class="src" data-src="docs/v2/zh/integration/channel/wecom.md:70">wecom.md:70</span>。
+          </p>
+        </details>
+        <details>
+          <summary>多副本部署时，默认的 <code>IdempotencyStore</code> 能跨 Pod 去重吗？</summary>
+          <p>
+            不能。它把状态放在 JVM 堆，只在单进程内生效；多副本要注入共享 <code>InboundEventDeduplicator</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-common/src/main/java/io/agentscope/extensions/channel/common/IdempotencyStore.java:31-33">IdempotencyStore.java:31-33</span>。
+          </p>
+        </details>
+        <details>
+          <summary>GitHub 的回复是通过 webhook 请求的 HTTP 响应返回吗？</summary>
+          <p>
+            不是。入站 webhook 只负责收消息；回复通过 GitHub REST API 新建一条 issue comment
+            <span class="src" data-src="docs/v2/zh/integration/channel/github.md:69">github.md:69</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：接一个「评论即回复」的 GitHub 渠道</h2>
+        <p>目标不是让 webhook 返回 200，而是能证明「验签、去重、bot 过滤、回复、多副本」五段都成立。建议 50 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">准备 PAT 与 webhook</span>
+            <div>创建具备 <code>issues:write</code> / <code>pull_requests:write</code> 的 PAT，配置 webhook Secret 与评论事件。</div>
+          </li>
+          <li>
+            <span class="sh">启动 channel</span>
+            <div>用 <code>GitHubChannel.fromProperties</code> 启动，确认日志里解析出了 bot login。</div>
+          </li>
+          <li>
+            <span class="sh">发一条评论</span>
+            <div>在 issue 里评论，观察 webhook 验签、<code>comment.id</code> 去重与 Agent 回复。</div>
+          </li>
+          <li>
+            <span class="sh">制造重复投递</span>
+            <div>用相同 <code>comment.id</code> 重放 webhook，确认第二次被去重，不产生第二条回复。</div>
+          </li>
+          <li>
+            <span class="sh">制造自激</span>
+            <div>让 bot 回复后再触发一次评论事件，确认 bot 自身评论被过滤，不会无限循环。</div>
+          </li>
+          <li>
+            <span class="sh">换一个 peer</span>
+            <div>在另一个 PR 线程评论，确认 peer id 为 <code>owner/repo#number</code> 且 session 独立。</div>
+          </li>
+          <li>
+            <span class="sh">模拟多副本</span>
+            <div>启动两个实例，用共享去重存储替换默认 <code>IdempotencyStore</code>，再重放一次事件。</div>
+          </li>
+          <li>
+            <span class="sh">写三行结论</span>
+            <div>分别写「谁验签」「谁去重」「回复走哪个 API」，确保每行都能在日志或源码里找到证据。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          渠道讲完，下一章进入技能仓库：<code>AgentSkillRepository</code> 的 Git / MySQL / PostgreSQL 三种实现，
+          以及「技能到底该版本化还是在线编辑」的选型边界。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="33-protocols.html">33 协议</a></td><td>标准互操作与平台适配的边界</td></tr>
+              <tr><td>第 35 章 · 技能仓库</td><td>Git / MySQL / PostgreSQL 的存储布局与同步</td></tr>
+              <tr><td>官方「Channel 适配器」</td><td>五个平台的配置与消息流<span class="src" data-src="docs/v2/zh/integration/channel/index.md:6-42">index.md:6-42</span></td></tr>
+              <tr><td><a href="30-distributed-store.html">30 分布式存储</a></td><td>共享去重 / token 缓存可以落在哪</td></tr>
+              <tr><td><a href="../appendix/errata.html">附录 E · 勘误汇总</a></td><td>平台文档与适配器行为的差异核对</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的渠道文档在 2.0.4 仓库里仍带预览提示；平台签名、事件类型、默认值与路径都标了具体出处，
+          适配器没有覆盖的能力会在正文中明确标出。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
