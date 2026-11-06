@@ -1,0 +1,28 @@
+CHANGELOG.md
+  h_000d6d73c03ff5 7,13,17,21
+DEPLOY.md
+  h_000d6d73c03ff5 73,98
+README.md
+  h_000d6d73c03ff5 17
+agentscope-java-learn/assets/nav.js
+  h_000d6d73c03ff5 778-780,782-807
+agentscope-java-learn/assets/search-index.js
+  h_000d6d73c03ff5 2
+agentscope-java-learn/chapters/24-team-collaboration.html
+  h_000d6d73c03ff5 789
+agentscope-java-learn/chapters/25-workflow-automation-issue.html
+  h_000d6d73c03ff5 1-850
+agentscope-java-learn/index.html
+  h_000d6d73c03ff5 101,161,204-205,207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "63faf7d79907b9aec837c08855088c8fd12a0d18",
+  "prompts": {},
+  "humans": {
+    "h_000d6d73c03ff5": {
+      "author": "lingyao <lingyao@tianmagroup.com>"
+    }
+  }
+}
