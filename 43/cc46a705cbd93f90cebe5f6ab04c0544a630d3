@@ -1,0 +1,38 @@
+CHANGELOG.md
+  h_000d6d73c03ff5 16-17
+DEPLOY.md
+  h_000d6d73c03ff5 73,98
+agentscope-java-learn/appendix/errata.html
+  h_000d6d73c03ff5 29,33-41
+agentscope-java-learn/assets/nav.js
+  h_000d6d73c03ff5 757
+agentscope-java-learn/assets/search-index.js
+  h_000d6d73c03ff5 2
+agentscope-java-learn/chapters/00-study-map.html
+  h_000d6d73c03ff5 159-175,246,276-279
+agentscope-java-learn/chapters/22-external-agent.html
+  h_000d6d73c03ff5 53,98-99,215-220
+agentscope-java-learn/chapters/23-hosted-agent.html
+  h_000d6d73c03ff5 371-375
+agentscope-java-learn/chapters/24-team-collaboration.html
+  h_000d6d73c03ff5 134-139,235,337-339
+agentscope-java-learn/chapters/25-workflow-automation-issue.html
+  h_000d6d73c03ff5 632
+agentscope-java-learn/chapters/26-production-operations.html
+  h_000d6d73c03ff5 435-437
+agentscope-java-learn/chapters/27-extension-ecosystem.html
+  h_000d6d73c03ff5 141,143-144,149-150,284-286,302
+agentscope-java-learn/index.html
+  h_000d6d73c03ff5 161,207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "43cc46a705cbd93f90cebe5f6ab04c0544a630d3",
+  "prompts": {},
+  "humans": {
+    "h_000d6d73c03ff5": {
+      "author": "lingyao <lingyao@tianmagroup.com>"
+    }
+  }
+}
