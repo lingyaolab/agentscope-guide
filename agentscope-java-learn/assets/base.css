@@ -4,6 +4,7 @@
 */
 
 :root {
+  color-scheme: light;
   --bg: #ffffff;
   --bg-soft: #f7f8fa;
   --bg-panel: #f2f4f7;
@@ -30,6 +31,7 @@
 }
 
 html[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #0e1116;
   --bg-soft: #141a21;
   --bg-panel: #1a212a;
@@ -54,6 +56,20 @@ html[data-theme="dark"] {
 html[data-read-size="s"] { --read-scale: 0.94; }
 html[data-read-size="l"] { --read-scale: 1.09; }
 html[data-read-width="wide"] { --content-w: 1040px; }
+
+/* 滚动条：暗色主题不再使用浏览器默认的亮色轨道 */
+* { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+html[data-theme="dark"] * { scrollbar-color: #3a4655 transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: #3a4655; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--fg-faint); background-clip: padding-box; }
 
 /* 代码自动换行：长命令不再横向滚动，复制出来仍是原样一行 */
 html[data-code-wrap="on"] .codeblock pre { white-space: pre-wrap; word-break: break-word; }
@@ -560,17 +576,7 @@ kbd {
   font-weight: 600;
 }
 
-/* 没有 h3 的页面：目录已经只有二级，用静态标签说明，不显示无效开关 */
-.toc-compact-note {
-  margin-left: auto;
-  border: 1px solid var(--line);
-  color: var(--fg-faint);
-  font-size: 11px;
-  line-height: 1;
-  padding: 3px 7px;
-  border-radius: 999px;
-  white-space: nowrap;
-}
+/* 没有 h3 的页面不显示「精简」开关：目录本来就只有二级标题。 */
 
 .toc-close {
   display: none;

@@ -535,18 +535,13 @@ async function browserChecks() {
     );
     check("browser", "目录精简只留二级标题", /^(list-item|block)\|none\|compact\|true$/.test(String(compact)), compact);
 
-    // 没有 h3 的页面：不再出现无效的「精简」按钮，而是显示静态「仅二级」标签
+    // 导航到无 h3 的章节：既验证侧栏自动定位，也确认不出现无效的「精简」开关
     await send(
       "Page.navigate",
       { url: pathToFileURL(path.join(SITE, "chapters", "36-infrastructure-ecosystem.html")).href },
       sessionId
     );
     await sleep(250);
-    const tocNote = await ev(
-      `(function(){var n=document.querySelector('.toc-compact-note');return n?n.textContent.trim():'none';})()`
-    );
-    check("browser", "无 h3 页面显示「仅二级」提示", tocNote === "仅二级", tocNote);
-
     const sideCur = await ev(
       `(function(){var n=document.getElementById('sidebar');if(!n)return 'no-sidebar';
         var c=n.querySelector('a.current');if(!c)return 'no-current';
@@ -554,6 +549,11 @@ async function browserChecks() {
         return (cr.top>=nr.top&&cr.bottom<=nr.bottom)?'ok':[cr.top,cr.bottom,nr.top,nr.bottom].join('|');})()`
     );
     check("browser", "侧栏自动定位当前章", sideCur === "ok", sideCur);
+
+    const noCompact = await ev(
+      `document.getElementById('toc-compact')?'found':'none'`
+    );
+    check("browser", "无 h3 页面不显示精简按钮", noCompact === "none", noCompact);
 
     // XML 高亮：属性替换不能把刚插入的 <span class="tk-k"> 再当成属性改写
     await send(

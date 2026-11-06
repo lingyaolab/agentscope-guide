@@ -794,10 +794,6 @@
         if (tocUpdate) tocUpdate();
       });
       top.appendChild(compact);
-    } else {
-      var note = el("span", "toc-compact-note", "仅二级");
-      note.title = "本页目录已经只有二级标题";
-      top.appendChild(note);
     }
     var close = el("button", "toc-close", "✕");
     close.type = "button";

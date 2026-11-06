@@ -36,4 +36,4 @@
 
 - 404 页、favicon、robots.txt、`.nojekyll`、仓库根跳转入口
 - GitHub Pages 工作流：重建索引 → 静态检查 → 发布
-- `check-site` 44 项（静态结构 + headless Edge 回归）全过，含首页分组卡与 nav 组名对齐、nav 小节标题与页面 h2 对齐、无 h3 页面的「仅二级」提示、侧栏自动定位当前章、XML 高亮不破坏标签、预计阅读时间与信息流实验室交互
+- `check-site` 44 项（静态结构 + headless Edge 回归）全过，含首页分组卡与 nav 组名对齐、nav 小节标题与页面 h2 对齐、侧栏自动定位当前章、无 h3 页面不显示精简按钮、XML 高亮不破坏标签、预计阅读时间与信息流实验室交互
