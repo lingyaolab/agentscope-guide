@@ -547,6 +547,14 @@ async function browserChecks() {
     );
     check("browser", "无 h3 页面显示「仅二级」提示", tocNote === "仅二级", tocNote);
 
+    const sideCur = await ev(
+      `(function(){var n=document.getElementById('sidebar');if(!n)return 'no-sidebar';
+        var c=n.querySelector('a.current');if(!c)return 'no-current';
+        var nr=n.getBoundingClientRect(),cr=c.getBoundingClientRect();
+        return (cr.top>=nr.top&&cr.bottom<=nr.bottom)?'ok':[cr.top,cr.bottom,nr.top,nr.bottom].join('|');})()`
+    );
+    check("browser", "侧栏自动定位当前章", sideCur === "ok", sideCur);
+
     // XML 高亮：属性替换不能把刚插入的 <span class="tk-k"> 再当成属性改写
     await send(
       "Page.navigate",

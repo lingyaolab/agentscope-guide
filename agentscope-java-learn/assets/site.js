@@ -754,6 +754,15 @@
     return nav;
   }
 
+  // 刷新后把当前章滚到侧栏中间；否则长目录每次都从「开始」回到顶部，
+  // 切换下面章节还得重新往下拉。
+  function revealCurrentChapter(nav) {
+    var cur = nav.querySelector("a.current");
+    if (!cur) return;
+    var target = cur.offsetTop - Math.max(0, (nav.clientHeight - cur.offsetHeight) / 2);
+    nav.scrollTop = Math.max(0, target);
+  }
+
   function stripHref(href) {
     return href.replace(/^chapters\/|^appendix\//, "").replace(/\.html$/, "");
   }
@@ -1852,7 +1861,11 @@
       mainEl.parentNode.insertBefore(layout, mainEl);
       layout.appendChild(mainEl);
     }
-    layout.insertBefore(buildSidebar(), layout.firstChild);
+    var nav = buildSidebar();
+    layout.insertBefore(nav, layout.firstChild);
+    requestAnimationFrame(function () {
+      revealCurrentChapter(nav);
+    });
     var toc = buildToc();
     if (toc) layout.appendChild(toc);
     // 首页/没有小节的页面上，目录按钮点了也没内容，直接藏掉
