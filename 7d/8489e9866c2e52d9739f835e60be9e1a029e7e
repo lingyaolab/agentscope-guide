@@ -1,0 +1,30 @@
+CHANGELOG.md
+  h_000d6d73c03ff5 16-17,21,37
+DEPLOY.md
+  h_000d6d73c03ff5 73,97-98
+README.md
+  h_000d6d73c03ff5 23
+agentscope-java-learn/appendix/errata.html
+  h_000d6d73c03ff5 6,11,29,31,34,36,38-39,112,538-715,718,731
+agentscope-java-learn/assets/nav.js
+  h_000d6d73c03ff5 670,672-674,676,691,706,1289
+agentscope-java-learn/assets/search-index.js
+  h_000d6d73c03ff5 2
+agentscope-java-learn/index.html
+  h_000d6d73c03ff5 207-208
+tools/check-site.cjs
+  h_000d6d73c03ff5 8,61-78,190-222
+tools/check-sources.cjs
+  h_000d6d73c03ff5 14-15,86-107,137-138,164-167,236,247-251,265
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7d8489e9866c2e52d9739f835e60be9e1a029e7e",
+  "prompts": {},
+  "humans": {
+    "h_000d6d73c03ff5": {
+      "author": "lingyao <lingyao@tianmagroup.com>"
+    }
+  }
+}
