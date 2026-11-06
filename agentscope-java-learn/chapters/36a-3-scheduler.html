@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 36A-3 章深挖 Scheduler：Quartz 的 CRON / 固定速率 / 固定延迟与 pause / resume、XXL-Job 只注册 JobHandler 并在控制台排程、集群与 NONE 模式陷阱，以及一次触发与一次暂停的验收。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="36A-3 Scheduler：Quartz 与 XXL-Job 落地 · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 36A-3 章深挖 Scheduler：Quartz 的 CRON / 固定速率 / 固定延迟与 pause / resume、XXL-Job 只注册 JobHandler 并在控制台排程、集群与 NONE 模式陷阱，以及一次触发与一次暂停的验收。"
+    />
+    <title>36A-3 Scheduler：Quartz 与 XXL-Job 落地 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="36a-3-scheduler" data-root="..">
+    <main>
+      <article class="article">
+        <h1>36A-3 · Scheduler：Quartz 与 XXL-Job 落地</h1>
+        <p class="lede">
+          Scheduler 的难点不是写 CRON，而是分清「谁持有调度状态」。Quartz 把 Trigger 放在 Java 进程 / Quartz 数据库；
+          XXL-Job 只把 Agent 注册成 JobHandler，真正的 CRON 在 admin 控制台。选错模型，代码看起来一样，行为完全不同。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>用 Quartz 跑通 CRON、固定速率与固定延迟，并正确 pause / resume</li>
+          <li>知道 Quartz 的默认 <code>NONE</code> 为什么会让任务「注册成功但从不触发」</li>
+          <li>用 XXL-Job 注册 JobHandler，并在控制台完成排程</li>
+          <li>说清 XXL-Job 为什么不支持 cancel / pause，以及替代操作</li>
+          <li>按「不触发 / 重复触发 / 停不下来」三类现象排查</li>
+        </ul>
+
+        <h2 id="quartz">Quartz：显式模式，显式启动</h2>
+        <p>
+          <code>QuartzAgentScheduler.builder().build()</code> 默认 <code>autoStart=true</code>、
+          <code>schedulerId=default-scheduler</code>，build 时启动 Quartz
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/src/main/java/io/agentscope/extensions/scheduler/quartz/QuartzAgentScheduler.java:626-629">QuartzAgentScheduler.java:626-629</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/src/main/java/io/agentscope/extensions/scheduler/quartz/QuartzAgentScheduler.java:671-689">:671-689</span>。
+          Job 统一放在 <code>agentscope-quartz</code> 组里，按 Agent 名做 JobKey
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/src/main/java/io/agentscope/extensions/scheduler/quartz/QuartzAgentScheduler.java:224-231">:224-231</span>。
+        </p>
+        <pre data-lang="java" data-file="Quartz：每天 8 点 + 暂停 / 恢复">QuartzAgentScheduler scheduler = QuartzAgentScheduler.builder()
+    .schedulerId("daily")
+    .autoStart(true)
+    .build();
+
+ScheduleConfig cfg = ScheduleConfig.builder()
+    .cron("0 0 8 * * ?")
+    .zoneId("Asia/Shanghai")
+    .build();
+
+scheduler.schedule(agentConfig, cfg);
+scheduler.pause("DailyReportAgent");
+scheduler.resume("DailyReportAgent");</pre>
+        <p>
+          CRON / FIXED_RATE / FIXED_DELAY 分别映射为 CronTrigger、重复 SimpleTrigger、执行完再排下一次的固定延迟
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/src/main/java/io/agentscope/extensions/scheduler/quartz/QuartzAgentScheduler.java:246-305">QuartzAgentScheduler.java:246-305</span>。
+          <code>pause</code> / <code>resume</code> 只在具体 <code>QuartzAgentScheduler</code> 类型上，不在
+          <code>AgentScheduler</code> 接口
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-common/src/main/java/io/agentscope/extensions/scheduler/AgentScheduler.java:77-190">AgentScheduler.java:77-190</span>。
+        </p>
+        <div class="callout danger">
+          <span class="ct">默认 <code>schedule(agentConfig)</code> 用 NONE，不会触发</span>
+          <p>
+            便利方法内部是 <code>ScheduleConfig.builder().build()</code>，模式默认 <code>NONE</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/src/main/java/io/agentscope/extensions/scheduler/quartz/QuartzAgentScheduler.java:154-156">QuartzAgentScheduler.java:154-156</span>。
+            在 Quartz 实现里 NONE 不会走进任何 <code>scheduleJob</code> 分支，但任务句柄仍会被放进 map 并返回
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/src/main/java/io/agentscope/extensions/scheduler/quartz/QuartzAgentScheduler.java:272-315">:272-315</span>。
+            表面注册成功，实际永远不会跑。
+          </p>
+        </div>
+
+        <h2 id="xxl">XXL-Job：只注册 JobHandler</h2>
+        <p>
+          <code>XxlJobAgentScheduler</code> 不负责 Java 内排程，只把 Agent 名注册成 XXL-Job 的 JobHandler；
+          CRON、并发、路由、日志都在控制台配置
+          <span class="src" data-src="docs/v2/zh/integration/infrastructure/scheduler.md:101-108">scheduler.md:101-108</span>。
+          因此它只接受 <code>ScheduleMode.NONE</code>，传其他模式会抛 <code>UnsupportedOperationException</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-xxl-job/src/main/java/io/agentscope/extensions/scheduler/xxljob/XxlJobAgentScheduler.java:148-161">XxlJobAgentScheduler.java:148-161</span>。
+        </p>
+        <pre data-lang="java" data-file="XXL-Job：注册 JobHandler">XxlJobSpringExecutor executor = new XxlJobSpringExecutor();
+executor.setAdminAddresses("http://localhost:8080/xxl-job-admin");
+executor.setAppname("agentscope-demo");
+executor.setAccessToken("xxxxxxxx");
+executor.start();
+
+AgentScheduler scheduler = new XxlJobAgentScheduler(executor);
+scheduler.schedule(agentConfig, ScheduleConfig.builder().build());</pre>
+        <p>
+          XXL-Job 实现不支持 <code>cancel</code>，调用即抛异常，提示去控制台暂停或删除 Job
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-xxl-job/src/main/java/io/agentscope/extensions/scheduler/xxljob/XxlJobAgentScheduler.java:289-304">XxlJobAgentScheduler.java:289-304</span>；
+          也没有 pause / resume
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-xxl-job/src/main/java/io/agentscope/extensions/scheduler/xxljob/XxlJobAgentScheduler.java:106-108">:106-108</span>。
+        </p>
+
+        <h2 id="console">XXL-Job 控制台：注册之后还要排程</h2>
+        <ol class="steps">
+          <li><span class="sh">确认执行器</span><div>控制台「执行器管理」里能看到 <code>appname</code>，且地址在线。</div></li>
+          <li><span class="sh">确认 JobHandler</span><div>新建任务时，JobHandler 填 Agent 名，例如 <code>DailyReportAgent</code>。</div></li>
+          <li><span class="sh">配置调度</span><div>CRON、路由策略、阻塞处理、失败重试都在控制台；Java 侧不参与。</div></li>
+          <li><span class="sh">手动触发一次</span><div>先「执行一次」看日志，再启用 CRON，避免表达式写错后等一天。</div></li>
+        </ol>
+
+        <h2 id="cluster">集群：Quartz 共享数据库，XXL-Job 靠 admin 路由</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>维度</th><th>Quartz</th><th>XXL-Job</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>调度状态在哪</td><td>Quartz 数据库（集群时共享）</td><td>XXL-Job admin</td></tr>
+              <tr><td>多副本</td><td>共享 JobStore，靠 Quartz 集群锁</td><td>admin 路由到某个执行器</td></tr>
+              <tr><td>控制台</td><td>无内置，需自己接</td><td>自带任务、日志、重试</td></tr>
+              <tr><td>暂停 / 取消</td><td>代码内 pause / resume / cancel</td><td>控制台操作</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Quartz 集群需要共享的 Quartz 数据库；XXL-Job 则要确认执行器注册成功、admin 能回调到执行器。
+          两者都不是「多副本就自动只跑一次」，业务侧仍要准备幂等键。
+        </p>
+
+        <h2 id="control">运行时控制：谁能停、停到什么程度</h2>
+        <p>
+          <code>ScheduleAgentTask</code> 只有 <code>cancel()</code> 这类最小控制；Quartz 额外提供
+          <code>pause</code> / <code>resume</code>。暂停不冻结已经开始的外部进程，取消也不自动回滚已经产生的副作用。
+          真正需要「停止 + 回滚」时，幂等与补偿仍在业务侧。
+        </p>
+
+        <h2 id="verify">验收：一次触发 + 一次暂停</h2>
+        <ol class="steps">
+          <li><span class="sh">Quartz 触发</span><div>用 FIXED_RATE 5 秒跑一次，日志至少出现两次执行。</div></li>
+          <li><span class="sh">Quartz 暂停</span><div>pause 后等一个周期不再触发；resume 后恢复。</div></li>
+          <li><span class="sh">NONE 对照</span><div>故意用默认 <code>schedule(agentConfig)</code>，确认任务从不触发。</div></li>
+          <li><span class="sh">XXL-Job 注册</span><div>控制台出现 JobHandler，手动执行一次成功。</div></li>
+          <li><span class="sh">控制台排程</span><div>配置 CRON 后到点触发，日志能在控制台看到。</div></li>
+        </ol>
+
+        <h2 id="selection">选型：先问谁持有状态</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>优先</th><th>注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>本地 / 小集群、不想引入外部调度服务</td><td>Quartz</td><td>共享 Quartz 数据库；显式模式，别用 NONE</td></tr>
+              <tr><td>需要控制台、跨节点路由、任务日志</td><td>XXL-Job</td><td>Java 只注册；调度与停用都在控制台</td></tr>
+              <tr><td>要接别的调度框架</td><td>自己实现 <code>AgentScheduler</code></td><td>接口没有 pause / resume，别照文档设计</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="next">继续读什么</h2>
+        <p>
+          回到 <a href="36a-integration-playbooks.html">36A 集成落地手册</a>；
+          依赖坐标见 <a href="../appendix/artifacts.html">附录 F</a>；
+          Scheduler 的文档差异见 <a href="../appendix/errata.html">附录 E</a>。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

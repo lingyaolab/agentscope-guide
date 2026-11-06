@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 36A-1 章深挖 Nacos A2A：AgentCard 注册、Endpoint 发布、NacosAgentRegistry 与 AgentScopeA2aServer 的正确组装、客户端解析与缓存、starter 配置，以及注册成功但发现不到的排查顺序。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="36A-1 Nacos A2A 端到端：注册、发现与验收 · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 36A-1 章深挖 Nacos A2A：AgentCard 注册、Endpoint 发布、NacosAgentRegistry 与 AgentScopeA2aServer 的正确组装、客户端解析与缓存、starter 配置，以及注册成功但发现不到的排查顺序。"
+    />
+    <title>36A-1 Nacos A2A 端到端：注册、发现与验收 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="36a-1-nacos-a2a" data-root="..">
+    <main>
+      <article class="article">
+        <h1>36A-1 · Nacos A2A 端到端：注册、发现与验收</h1>
+        <p class="lede">
+          这一页只做一件事：把 A2A Agent 注册进 Nacos，并让另一个进程按名字发现它。
+          「注册成功」和「能被发现」是两件事；中间任何一段没接上，控制台都可能只显示一张孤立的 AgentCard。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 Nacos 里到底存了什么：AgentCard、Transport Endpoint，还是 Agent 实例</li>
+          <li>用 <code>NacosAgentRegistry</code> + <code>AgentScopeA2aServer</code> 完成服务端注册</li>
+          <li>用 <code>NacosAgentCardResolver</code> 在客户端按名字解析远端 Agent</li>
+          <li>配好 <code>agentscope-nacos-spring-boot-starter</code> 的 A2A 前缀</li>
+          <li>按「卡是否发布 → 端点是否可达 → resolver 是否命中」三段排查</li>
+        </ul>
+
+        <h2 id="boundary">边界：注册的是卡与端点，不是进程</h2>
+        <p>
+          Nacos A2A 子模块负责两段：服务端把 <code>AgentCard</code> 与服务端点写进 Nacos，客户端按名字解析出卡
+          <span class="src" data-src="docs/v2/zh/integration/infrastructure/nacos.md:26-53">nacos.md:26-53</span>。
+          Nacos 不代理一次 A2A 调用，也不证明对端进程还活着；它只保存「这张卡 + 这些端点」。
+        </p>
+        <p>
+          <code>NacosA2aRegistryProperties</code> 是一个四字段 record：<code>isSetAsLatest</code>、
+          <code>enabledRegisterEndpoint</code>、<code>overwritePreferredTransport</code>、<code>transportProperties</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/registry/NacosA2aRegistryProperties.java:34-38">NacosA2aRegistryProperties.java:34-38</span>。
+          builder 默认 <code>enabledRegisterEndpoint=true</code>、<code>setAsLatest=false</code>、覆盖 transport 为 null
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/registry/NacosA2aRegistryProperties.java:83-92">NacosA2aRegistryProperties.java:83-92</span>。
+          关掉 <code>enabledRegisterEndpoint</code> 就只发布卡，不发布端点。
+        </p>
+
+        <h2 id="server">服务端：NacosAgentRegistry + AgentScopeA2aServer</h2>
+        <p>
+          <code>NacosAgentRegistry</code> 是 A2A 服务端与 Nacos 之间的适配器。它的 builder 接受
+          <code>AiService</code> 或 Nacos <code>Properties</code>，<code>nacosA2aProperties</code> 可选；不传时用默认 properties
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/registry/NacosAgentRegistry.java:250-306">NacosAgentRegistry.java:250-306</span>。
+        </p>
+        <pre data-lang="java" data-file="注册：NacosAgentRegistry">NacosAgentRegistry registry = NacosAgentRegistry.builder(nacosProperties)
+    .nacosA2aProperties(NacosA2aRegistryProperties.builder()
+        .enabledRegisterEndpoint(true)
+        .build())
+    .build();</pre>
+        <p>
+          然后把它交给 <code>AgentScopeA2aServer</code>。builder 必须传 <code>ReActAgent.Builder</code> 或
+          <code>AgentRunner</code>，注册方法叫 <code>withAgentRegistry(...)</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:174-184">AgentScopeA2aServer.java:174-184</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:333">:333</span>。
+        </p>
+        <pre data-lang="java" data-file="注册：AgentScopeA2aServer">AgentScopeA2aServer server = AgentScopeA2aServer.builder(agentBuilder)
+    .agentCard(agentCard)                 // ConfigurableAgentCard
+    .withAgentRegistry(registry)
+    .deploymentProperties(8080)
+    .build();</pre>
+        <div class="callout danger">
+          <span class="ct">文档写法会编译失败</span>
+          <p>
+            官方页写 <code>AgentScopeA2aServer.builder().agentRegistry(...)</code>
+            <span class="src" data-src="docs/v2/zh/integration/infrastructure/nacos.md:107-110">nacos.md:107-110</span>。
+            实际没有无参 builder，方法也叫 <code>withAgentRegistry</code>。照抄会直接卡在编译期。
+          </p>
+        </div>
+
+        <h2 id="client">客户端：resolver 只认 Properties / AiService</h2>
+        <p>
+          <code>NacosAgentCardResolver</code> 只有 <code>(Properties)</code> 与 <code>(AiService)</code> 两个构造器；
+          Agent 名不是构造参数，而是 <code>A2aAgent.builder().name(...)</code> 提供的
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/discovery/NacosAgentCardResolver.java:75-88">NacosAgentCardResolver.java:75-88</span>。
+        </p>
+        <pre data-lang="java" data-file="发现：NacosAgentCardResolver">NacosAgentCardResolver resolver = new NacosAgentCardResolver(nacosProperties);
+
+A2aAgent translator = A2aAgent.builder()
+    .name("translator")
+    .agentCardResolver(resolver)
+    .build();</pre>
+        <p>
+          解析器内部有 <code>agentCardCaches</code> 与 <code>agentCardUpdaters</code>：第一次按名取时订阅，
+          后续命中缓存，Nacos 侧更新通过监听器回写
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/discovery/NacosAgentCardResolver.java:90-98">NacosAgentCardResolver.java:90-98</span>。
+          所以改了卡不必重启 resolver，但你的 <code>A2aAgent</code> 什么时候重新读卡仍取决于它自己的调用时机。
+        </p>
+
+        <h2 id="starter">Spring Boot：前缀与自动装配</h2>
+        <p>
+          <code>agentscope-nacos-spring-boot-starter</code> 使用两组前缀：
+          <code>agentscope.nacos.*</code> 与 <code>agentscope.a2a.nacos.*</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-nacos-spring-boot-starter/src/main/java/io/agentscope/spring/boot/nacos/constants/NacosConstants.java:29-38">NacosConstants.java:29-38</span>。
+          A2A 的注册 / 发现分别有独立开关，不要只配一个 <code>serverAddr</code> 就假设两段都启用。
+        </p>
+        <pre data-lang="yaml" data-file="application.yml：Nacos A2A">agentscope:
+  nacos:
+    server-addr: 127.0.0.1:8848
+  a2a:
+    nacos:
+      registry:
+        enabled: true
+      discovery:
+        enabled: true</pre>
+
+        <h2 id="verify">验收：三段都要过</h2>
+        <ol class="steps">
+          <li><span class="sh">卡发布</span><div>Nacos 控制台能看到 AgentCard，名字与版本和代码一致。</div></li>
+          <li><span class="sh">端点可达</span><div>Endpoint 的 URL 从调用方机器能直接访问；不要只在本机 curl <code>localhost</code>。</div></li>
+          <li><span class="sh">resolver 命中</span><div>另一个进程用 <code>A2aAgent</code> 按名字解析，拿到同一张卡，并能发出一次真实调用。</div></li>
+        </ol>
+        <p>
+          注册是显式动作，不是类加载时自动完成。新版本或新实例上线时，要重新调用注册流程；不要把「Nacos 里还留着旧卡」当成「新实例已经可用」。
+        </p>
+
+        <h2 id="failure">失败边界</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>现象</th><th>更可能的原因</th><th>先查</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>编译失败</td><td>用了无参 builder / <code>agentRegistry</code></td><td>改成 <code>builder(agentBuilder)</code> + <code>withAgentRegistry</code></td></tr>
+              <tr><td>控制台只有卡，没有端点</td><td><code>enabledRegisterEndpoint=false</code></td><td>properties 与 transport 列表</td></tr>
+              <tr><td>resolver 拿不到卡</td><td>名字 / 版本 / 命名空间不一致</td><td>Agent 名、Nacos namespace、group</td></tr>
+              <tr><td>能解析但调用失败</td><td>Endpoint 不可达或 transport 选错</td><td>Endpoint URL、防火墙、preferredTransport</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="next">继续读什么</h2>
+        <p>
+          回到 <a href="36a-integration-playbooks.html">36A 集成落地手册</a> 看 Prompt / Skill 与其余链路；
+          依赖坐标见 <a href="../appendix/artifacts.html">附录 F</a>；文档差异见
+          <a href="../appendix/errata.html">附录 E</a>。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

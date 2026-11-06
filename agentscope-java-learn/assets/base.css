@@ -560,6 +560,18 @@ kbd {
   font-weight: 600;
 }
 
+/* 没有 h3 的页面：目录已经只有二级，用静态标签说明，不显示无效开关 */
+.toc-compact-note {
+  margin-left: auto;
+  border: 1px solid var(--line);
+  color: var(--fg-faint);
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
 .toc-close {
   display: none;
   border: 0;

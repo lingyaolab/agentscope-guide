@@ -529,6 +529,21 @@ async function browserChecks() {
         return [before,after,document.documentElement.getAttribute('data-toc'),tc.getAttribute('aria-pressed')].join('|');})()`
     );
     check("browser", "目录精简只留二级标题", /^(list-item|block)\|none\|compact\|true$/.test(String(compact)), compact);
+
+    // 没有 h3 的页面：不再出现无效的「精简」按钮，而是显示静态「仅二级」标签
+    await send(
+      "Page.navigate",
+      { url: pathToFileURL(path.join(SITE, "chapters", "36-infrastructure-ecosystem.html")).href },
+      sessionId
+    );
+    await sleep(250);
+    const tocNote = await ev(
+      `(function(){var n=document.querySelector('.toc-compact-note');return n?n.textContent.trim():'none';})()`
+    );
+    check("browser", "无 h3 页面显示「仅二级」提示", tocNote === "仅二级", tocNote);
+    await send("Page.navigate", { url: pathToFileURL(p02).href }, sessionId);
+    await sleep(250);
+
     await viewport(1200, 900, false);
 
     const prog = await ev(

@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 36A-2 章深挖 Higress MCP：SSE 与 StreamableHTTP 的差异、buildAsync / buildSync、工具搜索 Top K、HigressToolkit 注册与白名单、网关治理边界，以及工具不可见的排查顺序。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="36A-2 Higress MCP：工具搜索、注册与白名单 · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 36A-2 章深挖 Higress MCP：SSE 与 StreamableHTTP 的差异、buildAsync / buildSync、工具搜索 Top K、HigressToolkit 注册与白名单、网关治理边界，以及工具不可见的排查顺序。"
+    />
+    <title>36A-2 Higress MCP：工具搜索、注册与白名单 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="36a-2-higress" data-root="..">
+    <main>
+      <article class="article">
+        <h1>36A-2 · Higress MCP：工具搜索、注册与白名单</h1>
+        <p class="lede">
+          Higress 的重点不是「再接一个 MCP 客户端」，而是把工具治理留在网关，Agent 侧只拿一个已经鉴权、限流、可观测的工具面。
+          这一页把传输、构建、工具搜索、注册与白名单串起来，并给出「注册了但工具不可见」的排查顺序。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>在 SSE 与 StreamableHTTP 之间按部署形态选择</li>
+          <li>用 <code>buildAsync()</code> / <code>buildSync()</code> 正确构建客户端</li>
+          <li>开启工具搜索并控制 Top K，避免一次把所有工具塞进上下文</li>
+          <li>把客户端注册进 <code>HigressToolkit</code>，用 group / 白名单裁剪工具面</li>
+          <li>分清哪些治理属于 Higress，哪些必须在 Java 侧做</li>
+        </ul>
+
+        <h2 id="transport">传输：SSE 与 StreamableHTTP</h2>
+        <p>
+          builder 支持两种端点：<code>sseEndpoint(...)</code> 与 <code>streamableHttpEndpoint(...)</code>。
+          无状态 HTTP 流式场景优先 StreamableHTTP；需要长连接 SSE 时再用 SSE。
+          默认请求超时 120 秒，初始化超时 30 秒
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientBuilder.java:71-82">HigressMcpClientBuilder.java:71-82</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>端点</th><th>适合</th><th>注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>sseEndpoint</code></td><td>网关提供长连接 SSE</td><td>连接保持与重连由客户端负责</td></tr>
+              <tr><td><code>streamableHttpEndpoint</code></td><td>无状态、可水平扩展</td><td>每次请求独立，推荐优先</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>HigressMcpClientBuilder</code> 没有 <code>build()</code>：只有返回 <code>Mono</code> 的
+          <code>buildAsync()</code> 和阻塞式 <code>buildSync()</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientBuilder.java:311">HigressMcpClientBuilder.java:311</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientBuilder.java:357">:357</span>。
+        </p>
+        <pre data-lang="java" data-file="同步构建 StreamableHTTP 客户端">HigressMcpClientWrapper client = HigressMcpClientBuilder
+    .create("higress")
+    .streamableHttpEndpoint("http://gateway/mcp-servers/union-tools-search")
+    .buildSync();</pre>
+
+        <h2 id="toolsearch">工具搜索：默认关闭，开启后只回 Top K</h2>
+        <p>
+          工具搜索默认关闭。开启后 <code>listTools()</code> 不再返回全部工具，而是先调
+          <code>x_higress_tool_search</code>，只返回语义相关的 Top K，默认 10 个
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientWrapper.java:64">HigressMcpClientWrapper.java:64</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientWrapper.java:156-204">HigressMcpClientWrapper.java:156-204</span>。
+        </p>
+        <pre data-lang="java" data-file="开启工具搜索">HigressMcpClientWrapper client = HigressMcpClientBuilder
+    .create("higress")
+    .streamableHttpEndpoint(endpoint)
+    .toolSearch("退款", 8)      // 查询词 + Top 8
+    .buildSync();</pre>
+        <p>
+          Top K 太小会漏工具，太大又回到「工具太多」；按业务场景选 8–12 通常比默认 10 更可控。
+          工具搜索返回的结果会缓存到本地，后续 <code>callTool</code> 直接复用
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientWrapper.java:186-204">HigressMcpClientWrapper.java:186-204</span>。
+        </p>
+
+        <h2 id="register">注册：Toolkit 是最终生效点</h2>
+        <p>
+          客户端只是传输层；真正让 Agent 看到工具的是 <code>HigressToolkit</code>。
+          <code>registerMcpClient</code> 返回 <code>Mono&lt;Void&gt;</code>，注册成功后才会缓存客户端引用
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressToolkit.java:99-120">HigressToolkit.java:99-120</span>。
+        </p>
+        <pre data-lang="java" data-file="注册并裁剪工具面">HigressToolkit toolkit = new HigressToolkit();
+toolkit.registerMcpClient(client).block();
+
+toolkit.registration()
+    .mcpClient(client)
+    .enableTools(List.of("search-doc", "fetch-url"))
+    .group("knowledge")
+    .apply();</pre>
+        <p>
+          <code>enableTools</code> 是白名单，不是「额外推荐」；写了它，未列出的工具不会进入这个 group。
+          <code>group</code> 影响模型看到的工具分组，也影响后续按组启停。
+        </p>
+
+        <h2 id="governance">治理边界：网关做什么，Java 做什么</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>事项</th><th>Higress 网关</th><th>Java / Agent 侧</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>鉴权</td><td>统一校验调用方身份</td><td>不重复实现 token 校验</td></tr>
+              <tr><td>限流 / 配额</td><td>按路由或工具限流</td><td>只处理 429 / 超时</td></tr>
+              <tr><td>工具路由</td><td>决定请求落到哪个 MCP 服务</td><td>只持有 endpoint</td></tr>
+              <tr><td>可观测</td><td>网关侧日志、指标、链路</td><td>记录工具名与业务结果</td></tr>
+              <tr><td>工具白名单</td><td>可做粗粒度暴露</td><td>用 <code>enableTools</code> 做 Agent 级裁剪</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「网关做了鉴权」不等于「Agent 不需要权限」。工具能不能被这个 Agent 看见、调用前要不要人工确认，仍由 Toolkit 与权限引擎决定。
+        </p>
+
+        <h2 id="verify">验收：工具真的进了 Toolkit</h2>
+        <ol class="steps">
+          <li><span class="sh">客户端可用</span><div><code>toolkit.getHigressMcpClient()</code> 非空。</div></li>
+          <li><span class="sh">工具可见</span><div><code>listTools()</code> 返回的名字与 <code>enableTools</code> 白名单一致。</div></li>
+          <li><span class="sh">调用成功</span><div>让 Agent 调一个只读工具，拿到真实结果，而不是 schema 回显。</div></li>
+          <li><span class="sh">治理生效</span><div>在网关侧关掉一个工具或触发限流，Agent 侧看到明确错误，而不是静默空结果。</div></li>
+        </ol>
+
+        <h2 id="failure">失败边界</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>现象</th><th>更可能的原因</th><th>处理</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>编译失败</td><td>用了 <code>.build()</code></td><td>改 <code>buildSync()</code> 或 <code>buildAsync()</code></td></tr>
+              <tr><td>工具列表为空</td><td>工具搜索查询词不匹配 / Top K 太小</td><td>放宽查询词或调大 Top K</td></tr>
+              <tr><td>注册后仍不可见</td><td>没 <code>block()</code> / 没走 <code>apply()</code></td><td>检查注册链与白名单</td></tr>
+              <tr><td>调用 401 / 403</td><td>网关鉴权失败</td><td>检查网关侧路由与凭据</td></tr>
+              <tr><td>调用超时</td><td>请求超时 120 秒太短</td><td>显式 <code>timeout(...)</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="next">继续读什么</h2>
+        <p>
+          回到 <a href="36a-integration-playbooks.html">36A 集成落地手册</a> 看其他链路；
+          artifact 坐标见 <a href="../appendix/artifacts.html">附录 F</a>；
+          Higress 文档差异见 <a href="../appendix/errata.html">附录 E</a>。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

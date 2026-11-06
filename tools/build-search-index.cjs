@@ -1,4 +1,5 @@
-/* 生成站点全文搜索索引：agentscope-java-learn/assets/search-index.js
+/* 生成站点全文搜索索引：agentscope-java-learn/assets/search-index.js（manifest）
+ * 以及按 nav 分组拆分的 search-index-NN.js（正文分块）
  *
  * 为什么需要它：nav.js 里的 sections 只有节标题，搜不到报错原文、方法名、
  * 表格里的结论。这里把 nav 里所有 ready 页面的正文按 h2 切段抽成纯文本，供 site.js
@@ -31,6 +32,8 @@ const AS = sandbox.window.AS_SITE;
 
 const flat = [];
 AS.groups.forEach((g) => g.items.forEach((it) => flat.push(Object.assign({ group: g.title }, it))));
+const groupOrder = AS.groups.map((g) => g.title);
+const byGroup = new Map();
 
 const ENTITIES = {
   "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
@@ -124,7 +127,9 @@ for (const it of flat) {
       x: text,
     };
     if (kind) row.k = kind;
-    out.push(row);
+    const bucket = byGroup.get(it.group) || [];
+    bucket.push(row);
+    byGroup.set(it.group, bucket);
   };
 
   heads.forEach((h, i) => {
@@ -147,7 +152,8 @@ for (const it of flat) {
     const chunk = html.slice(p.start, pfRanges[i][1]);
     const head = chunk.match(/<div class="pf-h">([\s\S]*?)<\/div>/);
     const text = toText(chunk);
-    out.push({
+    const bucket = byGroup.get(it.group) || [];
+    bucket.push({
       p: it.href,
       n: it.num + " " + it.title,
       s: p.id,
@@ -155,15 +161,49 @@ for (const it of flat) {
       x: text.slice(0, 1500),
       k: "err",
     });
+    byGroup.set(it.group, bucket);
   });
 }
 
 const banner =
   "/* 自动生成，勿手改：node tools/build-search-index.cjs（源：各页 h2 之间的正文）。 */\n";
-fs.writeFileSync(OUT, banner + "window.AS_SEARCH_INDEX=" + JSON.stringify(out) + ";\n", "utf8");
 
-const bytes = fs.statSync(OUT).size;
+// 按 nav 分组拆块：搜索框首次聚焦时先拿 manifest，再并行加载各块；
+// 任何一块先到就先出结果，不必等整个 1 MB 索引下载完。
+const ASSETS = path.join(SITE, "assets");
+for (const f of fs.readdirSync(ASSETS)) {
+  if (/^search-index-\d+\.js$/.test(f)) fs.unlinkSync(path.join(ASSETS, f));
+}
+const chunks = [];
+let chunkBytes = 0;
+let seq = 0;
+for (const group of groupOrder) {
+  const rows = byGroup.get(group);
+  if (!rows || !rows.length) continue;
+  seq++;
+  const name = "search-index-" + String(seq).padStart(2, "0") + ".js";
+  const content =
+    banner +
+    "/* " + group + " */\n" +
+    "window.AS_SEARCH_INDEX=(window.AS_SEARCH_INDEX||[]).concat(" +
+    JSON.stringify(rows) +
+    ");\n";
+  fs.writeFileSync(path.join(ASSETS, name), content, "utf8");
+  chunkBytes += fs.statSync(path.join(ASSETS, name)).size;
+  chunks.push(name);
+}
+fs.writeFileSync(
+  OUT,
+  banner + "window.AS_SEARCH_CHUNKS=" + JSON.stringify(chunks) + ";\n",
+  "utf8"
+);
+
+const totalRows = [...byGroup.values()].reduce((a, b) => a + b.length, 0);
+const bytes = chunkBytes + fs.statSync(OUT).size;
 const ready = flat.filter((it) => it.status === "ready").length;
-console.log(`ready 页 ${ready} 个，索引 ${pages} 个，索引段 ${out.length} 条，输出 ${(bytes / 1024).toFixed(0)} KB`);
+console.log(
+  `ready 页 ${ready} 个，索引 ${pages} 个，索引段 ${totalRows} 条，` +
+    `${chunks.length} 块，共 ${(bytes / 1024).toFixed(0)} KB`
+);
 if (pages !== ready) console.warn(`[warn] 有 ${ready - pages} 个 ready 页面没进索引，检查上面的 skip/warn`);
-console.log(`→ ${path.relative(ROOT, OUT)}`);
+console.log(`→ ${path.relative(ROOT, OUT)} + ${chunks.length} 个分块`);

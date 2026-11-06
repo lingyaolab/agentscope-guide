@@ -297,6 +297,34 @@
           </table>
         </div>
 
+        <h2 id="coverage">覆盖矩阵：官方文档 → 本站章节 → 源码入口</h2>
+        <p>
+          这一张表用来回答「我该从哪进」和「有没有漏」：左边是官方集成目录，中间是本站章节，右边是源码入口。
+          官方集成总览覆盖模型、记忆、分布式、会话、RAG、协议、渠道、技能、基础设施与生态
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:8-113">overview.md:8-113</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方文档</th><th>本站章节</th><th>源码入口</th><th>边界 / 备注</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>integration/model/**</code></td><td>28</td><td><code>ModelRegistry</code> / <code>ModelProvider</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:44">ModelRegistry.java:44</span><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/spi/ModelProvider.java:22">ModelProvider.java:22</span></td><td>10 个 id / 6 个 artifact；id 不等于 artifact</td></tr>
+              <tr><td><code>integration/memory/**</code></td><td>29</td><td><code>LongTermMemory</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:66-71">LongTermMemory.java:66-71</span></td><td>接口从 2.0.0 起弃用，适配器仍可运行</td></tr>
+              <tr><td><code>integration/distributed/**</code></td><td>30</td><td><code>DistributedStore</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:30-73">DistributedStore.java:30-73</span></td><td>JDBC 是当前关系型主线；旧 MySQL 类兼容</td></tr>
+              <tr><td><code>integration/session/**</code></td><td>31</td><td><code>AgentStateStore</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:22-38">AgentStateStore.java:22-38</span></td><td>状态不是聊天记录；版本与冲突策略分开选</td></tr>
+              <tr><td><code>integration/rag/**</code></td><td>32</td><td><code>Knowledge</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/Knowledge.java:30-34">Knowledge.java:30-34</span></td><td>整条内置 RAG 管线是 legacy</td></tr>
+              <tr><td><code>integration/protocol/**</code></td><td>33</td><td>A2A / Agent Protocol / AG-UI<span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:83">AgentScopeA2aServer.java:83</span><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/src/main/java/io/agentscope/extensions/agentprotocol/AgentProtocolController.java:42">AgentProtocolController.java:42</span></td><td>三个方向，不是三个 endpoint</td></tr>
+              <tr><td><code>integration/channel/**</code></td><td>34</td><td><code>Channel</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/channel/Channel.java:20">Channel.java:20</span></td><td>入站适配器；去重 / 防循环默认在 JVM 内</td></tr>
+              <tr><td><code>integration/skill/**</code></td><td>35</td><td><code>AgentSkillRepository</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/skill/repository/AgentSkillRepository.java:35">AgentSkillRepository.java:35</span></td><td>Git 只读；数据库可写；Nacos 是只读 ZIP</td></tr>
+              <tr><td><code>integration/infrastructure/**</code></td><td>36 / <a href="../chapters/36a-1-nacos-a2a.html">36A-1</a> / <a href="../chapters/36a-2-higress.html">36A-2</a> / <a href="../chapters/36a-3-scheduler.html">36A-3</a></td><td>Nacos / Higress / Scheduler<span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/registry/NacosA2aRegistry.java:39">NacosA2aRegistry.java:39</span><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressToolkit.java:56">HigressToolkit.java:56</span></td><td>治理在网关；调度状态在 Quartz / XXL-Job</td></tr>
+              <tr><td><code>integration/ecosystem/**</code></td><td>36 / <a href="../chapters/36a-4-studio.html">36A-4</a> / <a href="../chapters/36a-5-training.html">36A-5</a></td><td>Studio / Training / Chat Completions<span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioManager.java:53">StudioManager.java:53</span><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRunner.java:83">TrainingRunner.java:83</span></td><td>Studio 开发期；Training 影子流量；Chat 是协议适配</td></tr>
+              <tr><td><code>service/**</code></td><td>19–26 / 22</td><td><code>Aistio</code> / Helm<span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/Aistio.java:57">Aistio.java:57</span></td><td>调用 Endpoint 不需要运行时 SDK</td></tr>
+              <tr><td><code>docs/**</code>（核心 / Harness）</td><td>00–18</td><td><code>ReActAgent</code> / <code>HarnessAgent</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:218">ReActAgent.java:218</span></td><td>本站的地基；扩展都建立在这些契约上</td></tr>
+            </tbody>
+          </table>
+        </div>
+
         <h2 id="version">版本与选型提醒</h2>
         <ul class="goals">
           <li><strong>版本统一</strong>：所有 artifact 跟根 <code>revision</code> 走，当前是 <code>2.0.4</code><span class="src" data-src="agentscope-java-2.0.4/pom.xml:30">pom.xml:30</span>；不要给单个扩展写别的版本。</li>

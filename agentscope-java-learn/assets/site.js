@@ -453,24 +453,39 @@
         closeSearch(true);
       });
 
-    // 正文兜底：assets/search-index.js 由 tools/build-search-index.cjs 生成。
-    // 654 KB，首次聚焦搜索框才加载，不拖慢普通阅读。
+    // 正文兜底：search-index.js 只是 manifest，正文按 nav 分组拆成多个
+    // search-index-NN.js；首次聚焦搜索框才加载，任何一块先到就先出结果。
     var FULL = [];
     var fullLoading = false;
     function ensureFullIndex() {
       if (fullLoading) return;
       fullLoading = true;
-      var s = document.createElement("script");
-      s.src = ROOT + "/assets/search-index.js";
-      s.async = true;
-      s.onload = function () {
-        FULL = window.AS_SEARCH_INDEX || [];
-        if (input.value.trim()) run();
+      var manifest = document.createElement("script");
+      manifest.src = ROOT + "/assets/search-index.js";
+      manifest.async = true;
+      manifest.onload = function () {
+        var chunks = window.AS_SEARCH_CHUNKS || [];
+        if (!chunks.length) {
+          fullLoading = false;
+          return;
+        }
+        window.AS_SEARCH_INDEX = [];
+        chunks.forEach(function (name) {
+          var s = document.createElement("script");
+          s.src = ROOT + "/assets/" + name;
+          s.async = true;
+          s.onload = function () {
+            FULL = window.AS_SEARCH_INDEX || [];
+            if (input.value.trim()) run();
+          };
+          s.onerror = function () {};
+          document.head.appendChild(s);
+        });
       };
-      s.onerror = function () {
+      manifest.onerror = function () {
         fullLoading = false;
       };
-      document.head.appendChild(s);
+      document.head.appendChild(manifest);
     }
     input.addEventListener("focus", ensureFullIndex);
     input.addEventListener("input", ensureFullIndex);
@@ -770,6 +785,10 @@
         if (tocUpdate) tocUpdate();
       });
       top.appendChild(compact);
+    } else {
+      var note = el("span", "toc-compact-note", "仅二级");
+      note.title = "本页目录已经只有二级标题";
+      top.appendChild(note);
     }
     var close = el("button", "toc-close", "✕");
     close.type = "button";

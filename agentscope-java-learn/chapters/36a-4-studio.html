@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 36A-4 章深挖 Studio HITL：StudioManager 初始化、自动 system hook 与 trace、最终消息推送范围、StudioUserAgent / requestUserInput 的真人输入、生产关闭与连接释放。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="36A-4 Studio HITL：消息、trace 与真人输入 · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 36A-4 章深挖 Studio HITL：StudioManager 初始化、自动 system hook 与 trace、最终消息推送范围、StudioUserAgent / requestUserInput 的真人输入、生产关闭与连接释放。"
+    />
+    <title>36A-4 Studio HITL：消息、trace 与真人输入 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="36a-4-studio" data-root="..">
+    <main>
+      <article class="article">
+        <h1>36A-4 · Studio HITL：消息、trace 与真人输入</h1>
+        <p class="lede">
+          Studio 有三个容易混的能力：消息推送、trace、Human-in-the-Loop。它们不是同一条通道：
+          <code>StudioMessageHook</code> 只推一次调用的最终消息，trace 由 telemetry 负责，HITL 由
+          <code>StudioUserAgent</code> / <code>requestUserInput</code> 等真人输入。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>正确初始化 Studio，知道它自动挂了什么</li>
+          <li>说清消息 Hook 究竟推哪些消息，哪些要看 trace</li>
+          <li>用 <code>StudioUserAgent</code> 做一次真人输入并设置超时</li>
+          <li>在生产环境按开关关闭 Studio，并释放连接</li>
+          <li>识别重复消息、HITL 超时、连接泄漏三类问题</li>
+        </ul>
+
+        <h2 id="init">初始化：一次 init，自动挂 Hook + Tracer</h2>
+        <p>
+          <code>StudioManager.init()</code> 是单例入口：建 HTTP / WebSocket 客户端、注册 run、连接 WebSocket；
+          成功后自动 <code>AgentBase.addSystemHook(new StudioMessageHook(...))</code>，并注册一个
+          <code>TelemetryTracer</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioManager.java:214-260">StudioManager.java:214-260</span>。
+        </p>
+        <pre data-lang="java" data-file="初始化 Studio">StudioManager.init()
+    .studioUrl("http://localhost:3000")
+    .project("MyProject")
+    .runName("experiment_001")
+    .initialize()
+    .block();</pre>
+        <p>
+          <code>StudioConfig</code> 默认 URL 是 <code>http://localhost:3000</code>，项目名
+          <code>UnnamedProject</code>，runName 是 <code>run_&lt;时间戳&gt;</code>，runId 是随机 UUID，
+          最大重试 3 次，WebSocket 重连 3 次，重连间隔 1 秒、上限 5 秒
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioConfig.java:149-158">StudioConfig.java:149-158</span>。
+          文档示例里的 8000 只是示例端口，不是默认值。
+        </p>
+        <div class="callout danger">
+          <span class="ct">不要再手动挂一次 Hook</span>
+          <p>
+            文档第 2 步让你 <code>.hook(new StudioMessageHook(...))</code>
+            <span class="src" data-src="docs/v2/zh/integration/ecosystem/studio.md:37-42">studio.md:37-42</span>，
+            但 initialize 已经挂过 system hook；两条路径都生效时，同一条最终消息会被推两次。
+          </p>
+        </div>
+
+        <h2 id="message">消息：Hook 只推 PostCall 的最终消息</h2>
+        <p>
+          <code>StudioMessageHook</code> 只处理 <code>PostCallEvent</code>：取 <code>getFinalMessage()</code>，
+          调 <code>StudioClient.pushMessage</code>；失败只记日志，不让 Agent 调用失败
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioMessageHook.java:66-95">StudioMessageHook.java:66-95</span>。
+          所以它不覆盖每条 token、每次工具调用或中间推理。
+        </p>
+        <p>
+          要看完整的工具与推理过程，用 trace / telemetry，而不是这个消息 Hook。文档说「每条 user / assistant / tool
+          消息都被同步」是过度概括
+          <span class="src" data-src="docs/v2/zh/integration/ecosystem/studio.md:48-52">studio.md:48-52</span>。
+        </p>
+
+        <h2 id="hitl">HITL：让真人扮演一个 Agent</h2>
+        <p>
+          <code>StudioUserAgent</code> 继承 <code>AgentBase</code>，通过 WebSocket 等 Studio 侧输入；
+          它调用 <code>requestUserInput</code>，把输入包装成 <code>Msg</code> 返回给调用方
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioUserAgent.java:74-82">StudioUserAgent.java:74-82</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioUserAgent.java:120-186">:120-186</span>。
+        </p>
+        <pre data-lang="java" data-file="StudioUserAgent：真人输入">StudioUserAgent reviewer = StudioUserAgent.builder()
+    .name("Reviewer")
+    .studioClient(StudioManager.getClient())
+    .webSocketClient(StudioManager.getWebSocketClient())
+    .inputTimeout(Duration.ofMinutes(10))   // 默认 30 分钟
+    .build();
+
+Msg answer = reviewer.call(inputMsg).block();</pre>
+        <p>
+          <code>studioClient</code> 与 <code>webSocketClient</code> 必须同时设置，否则 Studio 通道不完整；
+          <code>inputTimeout</code> 默认 30 分钟
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioUserAgent.java:244-327">StudioUserAgent.java:244-327</span>。
+        </p>
+
+        <h2 id="prod">生产：用开关关掉，并释放连接</h2>
+        <p>
+          生产一般不在每次调用时向 Studio 写一份数据。用 Profile 或
+          <code>@ConditionalOnProperty</code> 控制初始化
+          <span class="src" data-src="docs/v2/zh/integration/ecosystem/studio.md:65-75">studio.md:65-75</span>；
+          关闭时调用 <code>StudioManager.shutdown()</code>，释放 WebSocket 与 OkHttp 连接。
+        </p>
+        <pre data-lang="java" data-file="按开关创建 Studio Hook">@Bean
+@ConditionalOnProperty("agentscope.studio.enabled")
+StudioMessageHook studioHook() {
+    StudioManager.init().studioUrl(url).project(project).initialize().block();
+    return new StudioMessageHook(StudioManager.getClient());
+}</pre>
+        <p>
+          注意：如果 initialize 已经自动挂 Hook，这个 bean 只适合「手动接管」的场景；否则会重复。
+          最稳妥的做法是只调 <code>initialize()</code>，不额外注册 Hook。
+        </p>
+
+        <h2 id="verify">验收：最终消息、trace、HITL 分开看</h2>
+        <ol class="steps">
+          <li><span class="sh">最终消息</span><div>一次 <code>agent.call()</code> 后，Studio 只出现一条最终回复。</div></li>
+          <li><span class="sh">trace</span><div>工具调用与推理链路能在 trace / telemetry 里看到，而不是消息列表。</div></li>
+          <li><span class="sh">HITL</span><div>Studio 弹出输入框，<code>StudioUserAgent.call()</code> 暂停；提交后继续。</div></li>
+          <li><span class="sh">超时</span><div>不输入时，达到 <code>inputTimeout</code> 后返回中断结果，不永久挂起。</div></li>
+          <li><span class="sh">关闭</span><div>关闭开关后不再推送；shutdown 后进程能正常退出。</div></li>
+        </ol>
+
+        <h2 id="failure">失败边界</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>现象</th><th>更可能的原因</th><th>处理</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>同一条消息出现两次</td><td>initialize 自动 Hook + 手动 Hook</td><td>去掉手动 <code>.hook(...)</code></td></tr>
+              <tr><td>Studio 只有最终回复</td><td>消息 Hook 只处理 PostCall</td><td>工具/推理看 trace</td></tr>
+              <tr><td>HITL 一直等</td><td>WebSocket 没连上 / 没配 client</td><td>检查两个 client 与 Studio 服务</td></tr>
+              <tr><td>HITL 很快中断</td><td>inputTimeout 太短</td><td>显式设置更长的超时</td></tr>
+              <tr><td>进程退出卡住</td><td>没 shutdown WebSocket / OkHttp</td><td>停机钩子调 <code>StudioManager.shutdown()</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="next">继续读什么</h2>
+        <p>
+          回到 <a href="36a-integration-playbooks.html">36A 集成落地手册</a>；
+          依赖见 <a href="../appendix/artifacts.html">附录 F</a>；
+          Studio 的文档差异见 <a href="../appendix/errata.html">附录 E</a>。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

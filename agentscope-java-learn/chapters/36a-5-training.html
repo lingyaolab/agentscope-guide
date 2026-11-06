@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 36A-5 章深挖 Training：影子流量、SamplingRateStrategy 与 ExplicitMarkingStrategy、RewardCalculator、TrainingContext 标记、300 秒 commit 与 stop 的最后一次提交。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="36A-5 Training：影子流量、奖励与 commit · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 36A-5 章深挖 Training：影子流量、SamplingRateStrategy 与 ExplicitMarkingStrategy、RewardCalculator、TrainingContext 标记、300 秒 commit 与 stop 的最后一次提交。"
+    />
+    <title>36A-5 Training：影子流量、奖励与 commit · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="36a-5-training" data-root="..">
+    <main>
+      <article class="article">
+        <h1>36A-5 · Training：影子流量、奖励与 commit</h1>
+        <p class="lede">
+          Training 不是「把生产模型换掉」，而是把命中采样的请求复制一份，在异步线程池里用 Trinity 模型再跑一遍，
+          算奖励、回 feedback，再周期 commit。这一页把采样、标记、奖励、提交四段拆开，并给出最小验收。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清生产调用与影子调用的关系，不再把 Training 当模型替换</li>
+          <li>在按比例采样与显式标记之间选择</li>
+          <li>实现一个可解释的 <code>RewardCalculator</code></li>
+          <li>设置 commit 周期，并知道 <code>stop()</code> 会做最后一次提交</li>
+          <li>按「没有样本 / 没有奖励 / 没提交」三类现象排查</li>
+        </ul>
+
+        <h2 id="shadow">影子流量：生产响应不等影子</h2>
+        <p>
+          <code>TrainingRunner.start()</code> 把 <code>TrainingRouter</code> 注册成全局 system hook
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRunner.java:115-133">TrainingRunner.java:115-133</span>。
+          命中采样后，路由器不会改动生产调用，而是克隆 Agent、把模型换成 <code>TrinityModelAdapter</code>，
+          在异步线程池里再跑一遍
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRouter.java:221-249">TrainingRouter.java:221-249</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRouter.java:277-298">:277-298</span>。
+        </p>
+        <p>
+          所以「采样命中」只意味着多跑一次影子，不意味着用户看到 Trinity 的结果。影子 Agent 的名字里带
+          <code>-shadow</code> 时会被跳过，避免递归训练。
+        </p>
+
+        <h2 id="strategy">采样：按比例还是显式标记</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>策略</th><th>行为</th><th>适合</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>SamplingRateStrategy.of(0.1)</code></td><td>按比例随机采样，10% 流量进训练</td><td>普通在线流量</td></tr>
+              <tr><td><code>ExplicitMarkingStrategy.create()</code></td><td>只训练带 <code>TrainingContext.mark</code> 的调用</td><td>人工挑高质量样本</td></tr>
+              <tr><td>自定义 <code>TrainingSelectionStrategy</code></td><td>按业务规则决定</td><td>按租户 / 工具 / 评分筛选</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          不传策略时默认 10% 采样
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingConfig.java:251-254">TrainingConfig.java:251-254</span>。
+          <code>ExplicitMarkingStrategy.create()</code> 的标记 TTL 是 1 分钟
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/strategy/ExplicitMarkingStrategy.java:58-70">ExplicitMarkingStrategy.java:58-70</span>。
+        </p>
+
+        <h2 id="marking">显式标记：通过 Reactor Context 传播</h2>
+        <pre data-lang="java" data-file="标记一条样本">agent.call(msg)
+    .contextWrite(TrainingContext.mark("prod", "high-quality"))
+    .block();</pre>
+        <p>
+          <code>TrainingContext.mark(...)</code> 返回一个 Reactor Context 写入函数，必须通过
+          <code>.contextWrite(...)</code> 使用；标记会跨线程传播
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/strategy/TrainingContext.java:81-137">TrainingContext.java:81-137</span>。
+          如果标记写在 <code>call()</code> 之后或没有进入响应式链，策略会当作「未标记」拒绝。
+        </p>
+
+        <h2 id="reward">奖励：实现 RewardCalculator，不是 Function</h2>
+        <p>
+          <code>rewardCalculator</code> 的实际类型是 <code>RewardCalculator</code>，方法是
+          <code>double calculate(Agent agent)</code>；Lambda 能写，是因为它是函数式接口
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/reward/RewardCalculator.java:26-34">RewardCalculator.java:26-34</span>。
+        </p>
+        <pre data-lang="java" data-file="自定义奖励">TrainingRunner runner = TrainingRunner.builder()
+    .trinityEndpoint("http://localhost:8080")
+    .modelName("/path/to/model")
+    .selectionStrategy(ExplicitMarkingStrategy.create())
+    .rewardCalculator(new RewardCalculator() {
+        @Override
+        public double calculate(Agent agent) {
+            return scoreByToolCallsAndLength(agent);
+        }
+    })
+    .commitIntervalSeconds(300)
+    .build();</pre>
+        <p>
+          奖励值通常落在 -1 到 1；不要只按回答长度打分，否则训练会奖励啰嗦。工具调用次数、任务是否完成、人工评分都可以进公式。
+        </p>
+
+        <h2 id="commit">commit：默认 300 秒，stop 再提交一次</h2>
+        <p>
+          <code>commitIntervalSeconds</code> 默认 300；<code>&lt;= 0</code> 会关闭定时 commit
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingConfig.java:125-137">TrainingConfig.java:125-137</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRunner.java:185-214">TrainingRunner.java:185-214</span>。
+          <code>stop()</code> 不是简单关线程：先关 commit 调度器，再做一次最终 <code>commit()</code>，
+          最后移除 TrainingRouter
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRunner.java:139-168">:139-168</span>。
+        </p>
+        <p>
+          进程被强制 kill 时，最后一次 commit 不会发生；对训练数据完整性要求高时，优雅停机比刷日志更重要。
+          也可以显式调 <code>runner.commit()</code> 做手动提交。
+        </p>
+
+        <h2 id="verify">验收：只训练该训练的样本</h2>
+        <ol class="steps">
+          <li><span class="sh">策略</span><div>不标记的调用不产生样本；标记的调用产生一条。</div></li>
+          <li><span class="sh">影子</span><div>生产响应不等待影子完成；日志能看到 shadow Agent 执行。</div></li>
+          <li><span class="sh">奖励</span><div>反馈日志出现 reward 值，且不是固定常数（除非你故意用常数）。</div></li>
+          <li><span class="sh">commit</span><div>周期到达时出现 commit 成功；stop 后还有最后一次提交。</div></li>
+          <li><span class="sh">递归</span><div>影子 Agent 不再触发训练；名字含 <code>-shadow</code> 的会被跳过。</div></li>
+        </ol>
+
+        <h2 id="failure">失败边界</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>现象</th><th>更可能的原因</th><th>处理</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>完全没有样本</td><td>采样未命中 / 未标记</td><td>换 Explicit 策略并检查 <code>contextWrite</code></td></tr>
+              <tr><td>有样本没奖励</td><td>RewardCalculator 抛错 / 返回常数</td><td>看日志与实现</td></tr>
+              <tr><td>一直不 commit</td><td>interval &lt;= 0 / 线程被阻塞</td><td>检查配置与 commit 日志</td></tr>
+              <tr><td>影子拖慢生产</td><td>误以为同步执行</td><td>它应异步；检查线程池与阻塞点</td></tr>
+              <tr><td>训练递归</td><td>影子 Agent 名不含 <code>-shadow</code></td><td>保留命名约定</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="next">继续读什么</h2>
+        <p>
+          回到 <a href="36a-integration-playbooks.html">36A 集成落地手册</a>；
+          依赖见 <a href="../appendix/artifacts.html">附录 F</a>；
+          Training 的文档差异见 <a href="../appendix/errata.html">附录 E</a>。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
