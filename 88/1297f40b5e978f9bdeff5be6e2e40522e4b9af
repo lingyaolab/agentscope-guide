@@ -1,0 +1,28 @@
+CHANGELOG.md
+  h_000d6d73c03ff5 7,14,17,21
+DEPLOY.md
+  h_000d6d73c03ff5 73,98
+README.md
+  h_000d6d73c03ff5 17
+agentscope-java-learn/assets/nav.js
+  h_000d6d73c03ff5 1034-1036,1038-1063
+agentscope-java-learn/assets/search-index.js
+  h_000d6d73c03ff5 2
+agentscope-java-learn/chapters/28-model-providers.html
+  h_000d6d73c03ff5 605
+agentscope-java-learn/chapters/29-memory-integration.html
+  h_000d6d73c03ff5 1-585
+agentscope-java-learn/index.html
+  h_000d6d73c03ff5 101,204,206,208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "881297f40b5e978f9bdeff5be6e2e40522e4b9af",
+  "prompts": {},
+  "humans": {
+    "h_000d6d73c03ff5": {
+      "author": "lingyao <lingyao@tianmagroup.com>"
+    }
+  }
+}
