@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 32 章拆 AgentScope Java 2.0.4 的 RAG：Knowledge 的两个方法、GENERIC / AGENTIC / NONE 三种模式、RetrieveConfig 两层参数、Simple / 百炼 / Dify / HayStack / RAGFlow 的差异，以及整条 RAG 路径从 2.0.0 起被弃用后的迁移。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="32 RAG：Simple / 百炼 / Dify / Haystack / RAGFlow · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 32 章拆 AgentScope Java 2.0.4 的 RAG：Knowledge 的两个方法、GENERIC / AGENTIC / NONE 三种模式、RetrieveConfig 两层参数、Simple / 百炼 / Dify / HayStack / RAGFlow 的差异，以及整条 RAG 路径从 2.0.0 起被弃用后的迁移。"
+    />
+    <title>32 RAG：Simple / 百炼 / Dify / Haystack / RAGFlow · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="32-rag-integration" data-root="..">
+    <main>
+      <article class="article">
+        <h1>32 · RAG：Simple / 百炼 / Dify / Haystack / RAGFlow</h1>
+        <p class="lede">
+          第 29 章的长期记忆解决「记住用户偏好」，这一章的 RAG 解决「回答前先查资料」。两者都叫检索，但语义不同：
+          记忆按用户写事实，RAG 按 query 从知识库找片段。AgentScope 把 RAG 收在 <code>Knowledge</code> 接口下，
+          只有 <code>addDocuments</code> 与 <code>retrieve</code> 两个方法；和记忆一样，这条路径也从 2.0.0 起被标记弃用。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 <code>Knowledge</code> 的两个方法，以及 <code>GENERIC</code>、<code>AGENTIC</code>、<code>NONE</code> 三种模式各装了什么</li>
+          <li>区分调用点 <code>RetrieveConfig</code> 与 provider 配置两层参数，知道哪一层真正生效</li>
+          <li>按「是否自己管索引」选择 Simple、百炼、Dify、HayStack 或 RAGFlow</li>
+          <li>解释为什么只有 Simple 支持 <code>addDocuments</code>，其余四家只读</li>
+          <li>识别 2.0.4 里 RAG 包的弃用状态，以及文档里的 <code>STATIC</code> / <code>metadata</code> 两处旧说法</li>
+          <li>把检索失败、空结果、阈值过高与索引未完成分开排查</li>
+        </ul>
+
+        <h2 id="why">RAG 的两个动作：写入与检索</h2>
+        <p>
+          <code>Knowledge</code> 的契约非常小：<code>addDocuments(List&lt;Document&gt;)</code> 把文档嵌入并写入知识库，
+          <code>retrieve(query, RetrieveConfig)</code> 按 query 返回相关文档列表
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/Knowledge.java:34-57">Knowledge.java:34-57</span>。
+          RAG 的效果由两段共同决定：写入时怎么切块、怎么 embedding、索引是否最新；检索时用什么 query、topK、阈值与过滤。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>阶段</th><th>要做的事</th><th>典型故障</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>写入</td><td>读取文档、切块、embedding、写向量库</td><td>切块太大/太小、维度不匹配、索引没跑完</td></tr>
+              <tr><td>检索</td><td>query embedding、相似度搜索、阈值过滤、排序</td><td>阈值过高、topK 太小、过滤条件写错</td></tr>
+              <tr><td>注入</td><td>把命中的文档片段交给模型</td><td>片段太长挤占上下文、角色/顺序不符合预期</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          外部 RAG 平台（百炼、Dify、HayStack、RAGFlow）把「写入」留在平台侧，Java 只做「检索」；
+          Simple 则把三段都交给你。选型的第一步不是比模型，而是决定「索引由谁管」。
+        </p>
+
+        <h2 id="truth">文档与源码的分叉：整条 RAG 路径都是 legacy</h2>
+        <p>
+          官方 RAG 概览仍按 <code>Knowledge</code> 接口介绍五种实现，并给出
+          <code>.knowledge(...)</code> + <code>.ragMode(...)</code> 的接入方式
+          <span class="src" data-src="docs/v2/zh/integration/rag/overview.md:6-25">overview.md:6-25</span>。
+          但 2.0.4 源码里，<code>Knowledge</code>、<code>RAGMode</code> 与 <code>RetrieveConfig</code> 都带
+          <code>@Deprecated(forRemoval = true, since = "2.0.0")</code>，注释写明 rag 包已移除，检索应在应用层集成
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/Knowledge.java:30-34">Knowledge.java:30-34</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/RAGMode.java:28-32">RAGMode.java:28-32</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/model/RetrieveConfig.java:28-32">RetrieveConfig.java:28-32</span>。
+        </p>
+        <div class="callout danger">
+          <span class="ct">Legacy 能用，但别当新地基</span>
+          <p>
+            五个适配器仍然实现 <code>Knowledge</code>，<code>ReActAgent</code> 也仍会在
+            <code>knowledgeBases</code> 非空时装配 Hook 或工具
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5600-5605">ReActAgent.java:5600-5605</span>。
+            新项目应把检索放在应用层，通过工具或显式上下文交给 Agent；第 32 章会同时讲清「现在怎么跑」与「以后往哪搬」。
+          </p>
+        </div>
+
+        <h2 id="modes">三种模式：自动注入、主动检索、关闭</h2>
+        <p>
+          <code>RAGMode</code> 只有三个值：<code>GENERIC</code> 用 Hook 在推理前自动检索并注入，
+          <code>AGENTIC</code> 注册一个 <code>retrieve_knowledge</code> 工具让 Agent 自己决定，
+          <code>NONE</code> 什么都不装
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/RAGMode.java:18-55">RAGMode.java:18-55</span>。
+          builder 默认是 <code>GENERIC</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4844-4851">ReActAgent.java:4844-4851</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模式</th><th>注册什么</th><th>Agent 侧表现</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>GENERIC</code>（默认）</td><td><code>GenericRAGHook</code></td><td>每次推理前自动取最后一条用户消息检索，命中就注入</td></tr>
+              <tr><td><code>AGENTIC</code></td><td><code>KnowledgeRetrievalTools</code></td><td>Agent 通过 <code>retrieve_knowledge</code> 工具主动检索</td></tr>
+              <tr><td><code>NONE</code></td><td>什么都不注册</td><td>知识库挂载但不参与本轮推理</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="ct">文档写 STATIC，源码是 GENERIC</span>
+          <p>
+            RAG 概览的示例注释写「或 STATIC、NONE」
+            <span class="src" data-src="docs/v2/zh/integration/rag/overview.md:23">overview.md:23</span>，
+            但 2.0.4 的枚举只有 <code>GENERIC</code>、<code>AGENTIC</code>、<code>NONE</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/RAGMode.java:40-55">RAGMode.java:40-55</span>。
+            照着文档写 <code>RAGMode.STATIC</code> 会直接编译失败。
+          </p>
+        </div>
+
+        <h2 id="retrieval-config">两层参数：RetrieveConfig 与 provider 配置</h2>
+        <p>
+          <code>RetrieveConfig</code> 是调用点参数：<code>limit</code>、<code>scoreThreshold</code>、
+          <code>vectorName</code> 与可选的 <code>conversationHistory</code>；builder 默认 <code>limit=5</code>、
+          <code>scoreThreshold=0.5</code>，阈值必须在 0–1
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/model/RetrieveConfig.java:34-44">RetrieveConfig.java:34-44</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/model/RetrieveConfig.java:110-136">RetrieveConfig.java:110-136</span>。
+          Agent 的默认值同样是 5 / 0.5
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4849-4851">ReActAgent.java:4849-4851</span>。
+        </p>
+        <p>
+          但 provider 配置里还有一套默认值：Dify 的 <code>topK=10</code>、<code>scoreThreshold=0.0</code>；
+          RAGFlow 的 <code>topK=1024</code>、<code>similarityThreshold=0.2</code>；HayStack 的 <code>topK=3</code>。
+          这些值在「直接调 <code>knowledge.retrieve(query, config)</code>」时才可能作为 fallback；一旦走 Agent，
+          <code>RetrieveConfig</code> 的 limit / threshold 会传给适配器并覆盖它们
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-dify/src/main/java/io/agentscope/core/rag/integration/dify/DifyRAGConfig.java:47-53">DifyRAGConfig.java:47-53</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-ragflow/src/main/java/io/agentscope/core/rag/integration/ragflow/RAGFlowConfig.java:35-47">RAGFlowConfig.java:35-47</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-haystack/src/main/java/io/agentscope/core/rag/integration/haystack/HayStackConfig.java:35-41">HayStackConfig.java:35-41</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">文档里的 metadata 字段不在 RetrieveConfig 里</span>
+          <p>
+            Simple 文档的检索参数表列了 <code>metadata</code>
+            <span class="src" data-src="docs/v2/zh/integration/rag/simple.md:97-101">simple.md:97-101</span>，
+            但 2.0.4 的 <code>RetrieveConfig</code> 只有 limit、scoreThreshold、vectorName、conversationHistory，没有 metadata
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/model/RetrieveConfig.java:34-37">RetrieveConfig.java:34-37</span>。
+            需要 metadata 过滤时，用 provider 自己的配置：Dify 的 <code>MetadataFilter</code>、RAGFlow 的 metadata 字段，
+            或 Simple 在向量库层自己做。
+          </p>
+        </div>
+
+        <h2 id="simple">Simple：自己管读取、切块、embedding 与向量库</h2>
+        <p>
+          Simple 是唯一负责写入链路的实现：它自带文档 Reader、<code>TextChunker</code> / <code>SplitStrategy</code>、
+          四种 embedding 适配，以及 InMemory、PgVector、Milvus、Qdrant、Elasticsearch 五种向量库适配
+          <span class="src" data-src="docs/v2/zh/integration/rag/simple.md:6">simple.md:6</span>
+          <span class="src" data-src="docs/v2/zh/integration/rag/simple.md:55-91">simple.md:55-91</span>。
+          <code>SimpleKnowledge</code> 的 builder 只要求 embedding 模型与向量库两个依赖，缺一个就抛异常
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-simple/src/main/java/io/agentscope/core/rag/knowledge/SimpleKnowledge.java:85-93">SimpleKnowledge.java:85-93</span>。
+        </p>
+        <pre data-lang="java" data-file="Simple 最小链路（示意）">SimpleKnowledge knowledge = SimpleKnowledge.builder()
+    .embeddingModel(embeddingModel)
+    .embeddingStore(InMemoryStore.builder().dimensions(1024).build())
+    .build();
+
+knowledge.addDocuments(new TikaReader().read(input).block()).block();</pre>
+        <p>
+          写入时它逐条文档生成 embedding，再批量写入向量库
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-simple/src/main/java/io/agentscope/core/rag/knowledge/SimpleKnowledge.java:97-132">SimpleKnowledge.java:97-132</span>。
+          检索时它把 <code>scoreThreshold</code> 先置空交给向量库，再在 Java 侧按阈值过滤、按分数倒序，最后应用 limit
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-simple/src/main/java/io/agentscope/core/rag/knowledge/SimpleKnowledge.java:135-173">SimpleKnowledge.java:135-173</span>。
+          这也解释了为什么阈值改变会直接影响返回条数，而不是「让向量库少查一点」。
+        </p>
+
+        <h2 id="bailian">百炼：托管索引，Java 只检索</h2>
+        <p>
+          百炼适合「文档已经在控制台上传并解析完成」的团队。配置需要 AccessKey、workspaceId 与 indexId，
+          可选 rerank 与 rewrite；后者会基于对话历史改写 query
+          <span class="src" data-src="docs/v2/zh/integration/rag/bailian.md:6-45">bailian.md:6-45</span>
+          <span class="src" data-src="docs/v2/zh/integration/rag/bailian.md:67-80">bailian.md:67-80</span>。
+          默认 endpoint 是 <code>bailian.cn-beijing.aliyuncs.com</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-bailian/src/main/java/io/agentscope/core/rag/integration/bailian/BailianConfig.java:52">BailianConfig.java:52</span>。
+        </p>
+        <pre data-lang="java" data-file="百炼知识库（示意）">BailianConfig config = BailianConfig.builder()
+    .accessKeyId(System.getenv("ALIBABA_CLOUD_ACCESS_KEY_ID"))
+    .accessKeySecret(System.getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET"))
+    .workspaceId("llm-xxxxxx")
+    .indexId("kb-xxxxxx")
+    .build();
+
+BailianKnowledge knowledge = BailianKnowledge.builder().config(config).build();</pre>
+        <p>
+          <code>BailianKnowledge.addDocuments</code> 直接返回 <code>UnsupportedOperationException</code>，
+          文档管理必须走百炼控制台或平台 SDK
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-bailian/src/main/java/io/agentscope/core/rag/integration/bailian/BailianKnowledge.java:131-133">BailianKnowledge.java:131-133</span>。
+          它会把 <code>RetrieveConfig.conversationHistory</code> 转成百炼的 query history，供 rewrite 使用
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-bailian/src/main/java/io/agentscope/core/rag/integration/bailian/BailianKnowledge.java:184-208">BailianKnowledge.java:184-208</span>。
+        </p>
+
+        <h2 id="dify">Dify：数据集 + 四种检索模式</h2>
+        <p>
+          Dify 适合内容运营已经在 Dify 上维护知识库的团队。它支持关键词、语义、混合与全文四种检索模式，默认是
+          <code>HYBRID_SEARCH</code>；还能通过 <code>MetadataFilter</code> 按数据集元数据过滤
+          <span class="src" data-src="docs/v2/zh/integration/rag/dify.md:48-57">dify.md:48-57</span>
+          <span class="src" data-src="docs/v2/zh/integration/rag/dify.md:72-89">dify.md:72-89</span>。
+          base URL 默认 <code>https://api.dify.ai/v1</code>，自托管改 <code>baseUrl</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-dify/src/main/java/io/agentscope/core/rag/integration/dify/DifyRAGConfig.java:47-53">DifyRAGConfig.java:47-53</span>
+          <span class="src" data-src="docs/v2/zh/integration/rag/dify.md:59-70">dify.md:59-70</span>。
+        </p>
+        <pre data-lang="java" data-file="Dify 知识库（示意）">DifyRAGConfig config = DifyRAGConfig.builder()
+    .apiKey(System.getenv("DIFY_RAG_API_KEY"))
+    .datasetId("your-dataset-id")
+    .retrievalMode(RetrievalMode.HYBRID_SEARCH)
+    .enableRerank(true)
+    .build();</pre>
+        <p>
+          和百炼一样，Dify 的 <code>addDocuments</code> 返回 <code>UnsupportedOperationException</code>，
+          文档上传与索引在 Dify 控制台完成
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-dify/src/main/java/io/agentscope/core/rag/integration/dify/DifyKnowledge.java:124-131">DifyKnowledge.java:124-131</span>。
+          检索结果会按 <code>scoreThreshold</code> 过滤、按分数倒序、再按 limit 截断
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-dify/src/main/java/io/agentscope/core/rag/integration/dify/DifyKnowledge.java:183-199">DifyKnowledge.java:183-199</span>。
+        </p>
+
+        <h2 id="haystack">HayStack：复用已有索引流水线</h2>
+        <p>
+          HayStack 适合已经有一整套索引流水线（分块、ChromaDB、Reranker 等）的团队。Java 侧只配置服务地址、topK 与过滤策略，
+          其余交给 HayStack
+          <span class="src" data-src="docs/v2/zh/integration/rag/haystack.md:6-42">haystack.md:6-42</span>。
+          配置默认 topK 是 3、超时 30 秒、最多 3 次重试、成功码 0
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-haystack/src/main/java/io/agentscope/core/rag/integration/haystack/HayStackConfig.java:35-41">HayStackConfig.java:35-41</span>。
+        </p>
+        <pre data-lang="java" data-file="HayStack 知识库（示意）">HayStackConfig config = HayStackConfig.builder()
+    .baseUrl("http://localhost:8080")
+    .topK(10)
+    .build();
+HayStackKnowledge knowledge = HayStackKnowledge.builder().config(config).build();</pre>
+        <p>
+          <code>addDocuments</code> 抛 <code>UnsupportedOperationException</code>，文档更新要回到 HayStack 的 source 目录并重跑索引流水线
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-haystack/src/main/java/io/agentscope/core/rag/integration/haystack/HayStackKnowledge.java:109-113">HayStackKnowledge.java:109-113</span>。
+          检索失败会记录日志后重新抛错，不会静默返回空
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-haystack/src/main/java/io/agentscope/core/rag/integration/haystack/HayStackKnowledge.java:209-213">HayStackKnowledge.java:209-213</span>。
+        </p>
+
+        <h2 id="ragflow">RAGFlow：复杂文档解析与可配置重排</h2>
+        <p>
+          RAGFlow 适合扫描件、复杂排版 PDF、含图片表格比例高的知识库。它调用
+          <code>POST /api/v1/datasets/{dataset_id}/retrieve-chunks</code>，支持向量相似度、topK、服务端相似度阈值、
+          metadata 过滤与可选 rerank
+          <span class="src" data-src="docs/v2/zh/integration/rag/ragflow.md:6-58">ragflow.md:6-58</span>。
+          配置自身默认 topK 是 1024、相似度阈值 0.2、向量权重 0.3、分页 30、超时 30 秒
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-ragflow/src/main/java/io/agentscope/core/rag/integration/ragflow/RAGFlowConfig.java:35-47">RAGFlowConfig.java:35-47</span>。
+        </p>
+        <pre data-lang="java" data-file="RAGFlow 知识库（示意）">RAGFlowConfig config = RAGFlowConfig.builder()
+    .apiKey("ragflow-xxxxxxxx")
+    .baseUrl("http://localhost:9380")
+    .knowledgeBaseId("kb-xxxxx")
+    .topK(10)
+    .similarityThreshold(0.5)
+    .build();</pre>
+        <p>
+          <code>addDocuments</code> 同样不可用；文档上传与索引走 RAGFlow 控制台或它自己的 API
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-ragflow/src/main/java/io/agentscope/core/rag/integration/ragflow/RAGFlowKnowledge.java:182-184">RAGFlowKnowledge.java:182-184</span>。
+          RAGFlow 的 retrieve-chunks 接口不支持把对话历史传过去做上下文感知检索；需要时只能自己在 query 前拼指令
+          <span class="src" data-src="docs/v2/zh/integration/rag/ragflow.md:58">ragflow.md:58</span>。
+        </p>
+
+        <h2 id="compare">对比：谁管索引，谁支持写入</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>实现</th><th>写入 <code>addDocuments</code></th><th>索引由谁管</th><th>特点</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Simple</td><td>支持</td><td>你自己</td><td>Reader + Chunker + Embedding + 向量库全链路</td></tr>
+              <tr><td>百炼</td><td>不支持</td><td>百炼控制台</td><td>rerank / rewrite、结构化 / 非结构化 / 图片知识库</td></tr>
+              <tr><td>Dify</td><td>不支持</td><td>Dify 控制台</td><td>关键词 / 语义 / 混合 / 全文四种模式，metadata 过滤</td></tr>
+              <tr><td>HayStack</td><td>不支持</td><td>HayStack 流水线</td><td>复用已有 ChromaDB / Reranker / 索引流水线</td></tr>
+              <tr><td>RAGFlow</td><td>不支持</td><td>RAGFlow 控制台 / API</td><td>OCR、复杂表格、知识图谱增强</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          四家外部实现的 <code>addDocuments</code> 都返回 <code>UnsupportedOperationException</code>，这是刻意的「管控分离」：
+          避免 Java 侧与平台侧各维护一份索引状态
+          <span class="src" data-src="docs/v2/zh/integration/rag/overview.md:45">overview.md:45</span>。
+        </p>
+
+        <h2 id="add-docs">写入链路：Simple 要自己保证「切块与索引一致」</h2>
+        <p>
+          Simple 的 <code>addDocuments</code> 不做切块，它假定你传进来的 <code>Document</code> 已经是切好的片段；
+          它只负责逐条 embedding、写入向量库
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-simple/src/main/java/io/agentscope/core/rag/knowledge/SimpleKnowledge.java:97-132">SimpleKnowledge.java:97-132</span>。
+          所以 Simple 的写入质量取决于三件事：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">切块</span>
+            <div>用 <code>TextChunker</code> / <code>SplitStrategy</code> 控制片段大小与重叠；块太大检索不精准，太小丢上下文。</div>
+          </li>
+          <li>
+            <span class="sh">Embedding 维度</span>
+            <div>embedding 模型维度必须与向量库 <code>dimensions</code> 一致；换模型要重建索引，不能只改配置。</div>
+          </li>
+          <li>
+            <span class="sh">更新语义</span>
+            <div>文档更新是新增、覆盖还是删除旧片段，要由你的写入流程决定；<code>addDocuments</code> 不做去重。</div>
+          </li>
+        </ol>
+        <p>
+          外部四家的写入在平台侧，Java 侧无法保证「上传完成」与「索引完成」同时发生；检索为空时先确认平台索引状态，
+          而不是先调 Java 阈值。
+        </p>
+
+        <h2 id="multi">多知识库：合并、去重、排序</h2>
+        <p>
+          <code>ReActAgent</code> 允许挂多个 <code>Knowledge</code>。多个知识库会被聚合成一个：分别检索，
+          按文档 id 去重（同 id 取分数更高的），再按分数倒序，最后用 <code>RetrieveConfig.limit</code> 截断
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5513-5551">ReActAgent.java:5513-5551</span>。
+          这意味着：
+        </p>
+        <ul class="goals">
+          <li>不同知识库返回相同 id 的文档会被合并，不会重复占用 topK</li>
+          <li>排序只按分数，不按来源权重；要加权只能在 provider 侧或拿到结果后自己做</li>
+          <li><code>limit</code> 是合并后的总上限，不是每个知识库各取 limit</li>
+        </ul>
+
+        <h2 id="errors">失败边界：Hook 会静默，工具会返回字符串</h2>
+        <p>
+          <code>GENERIC</code> 的 Hook 在检索失败时只打日志，不打断主流程
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/GenericRAGHook.java:161-166">GenericRAGHook.java:161-166</span>；
+          <code>AGENTIC</code> 的工具失败时返回 <code>"Failed to retrieve knowledge for query: ..."</code> 字符串
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/KnowledgeRetrievalTools.java:162-166">KnowledgeRetrievalTools.java:162-166</span>。
+          直接调 <code>Knowledge.retrieve(...).block()</code> 则可能收到 provider 抛出的异常（HayStack 会重新抛，Dify / Bailian 会记录后抛）。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>症状</th><th>更可能的原因</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Agent 回答完全没引用知识</td><td>命中为空、阈值过高、模式是 NONE</td><td>RetrieveConfig、ragMode、命中分数</td></tr>
+              <tr><td>检索结果很少</td><td>topK 小、阈值高、metadata 过滤过严</td><td>limit / scoreThreshold / provider filter</td></tr>
+              <tr><td>知识库更新后搜不到</td><td>平台索引未完成，或 Simple 没重跑写入</td><td>平台索引状态、文档 id</td></tr>
+              <tr><td>报 <code>UnsupportedOperationException</code></td><td>对外部平台调了 <code>addDocuments</code></td><td>写入应走平台控制台 / API</td></tr>
+              <tr><td>编译找不到 <code>RAGMode.STATIC</code></td><td>照旧文档写错枚举</td><td>用 <code>GENERIC</code> / <code>AGENTIC</code> / <code>NONE</code></td></tr>
+              <tr><td>metadata 过滤不生效</td><td><code>RetrieveConfig</code> 没有 metadata 字段</td><td>用 provider 的 MetadataFilter / searchFilters</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="selection">选型：先决定索引归谁，再比检索质量</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>优先</th><th>注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>完全掌控切块、embedding、向量库</td><td>Simple</td><td>自己保证索引一致性与维度</td></tr>
+              <tr><td>已有阿里云百炼知识库</td><td>百炼</td><td>rerank / rewrite 增加延迟与费用；写入在平台</td></tr>
+              <tr><td>团队已用 Dify 做内容运营</td><td>Dify</td><td>四种检索模式；metadata 过滤用 Dify 配置</td></tr>
+              <tr><td>已有 HayStack 索引流水线</td><td>HayStack</td><td>Java 侧只读；失败会抛错</td></tr>
+              <tr><td>扫描件、复杂 PDF、表格、知识图谱</td><td>RAGFlow</td><td>无对话历史检索；写入在平台</td></tr>
+              <tr><td>检索要在 Agent 外部做成工具</td><td>任意 HTTP 知识库 + 自定义 <code>@Tool</code></td><td>不依赖 legacy RAG 包</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="operations">运维：索引、阈值、延迟与权限</h2>
+        <p>
+          <strong>索引一致性是第一位。</strong>外部平台写完文档不等于索引完成；Simple 写完向量库也不等于旧文档已删除。
+          检索为空时先看平台索引状态或向量库条数，再调阈值。
+        </p>
+        <p>
+          <strong>阈值是精度与召回的直接旋钮。</strong>默认 0.5 只是起点；不同 embedding / 平台的分数分布不同，
+          拿一组真实问题测召回，比照搬默认值可靠。RAGFlow 自身默认阈值是 0.2，Dify 是 0.0，不能混用。
+        </p>
+        <p>
+          <strong>延迟与费用。</strong>百炼 rerank / rewrite、Dify rerank、RAGFlow rerank 都会增加一次远程调用；
+          topK 越大，注入 prompt 的 token 越多。先测命中率，再开增强。
+        </p>
+
+        <h2 id="migration">弃用之后：RAG 该往哪搬</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>路径</th><th>怎么做</th><th>适合</th><th>代价</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>冻结 legacy</td><td>保留 <code>Knowledge</code> 适配器，外面包一层自己的检索接口</td><td>已有生产流量</td><td>仍受弃用 API 约束</td></tr>
+              <tr><td>检索工具化</td><td>把知识库检索写成 <code>@Tool</code>，Agent 按需调用</td><td>想控制何时检索、返回多少</td><td>要自己写工具与错误处理</td></tr>
+              <tr><td>提示注入</td><td>应用层先检索，再把片段作为上下文传给 Agent</td><td>固定流程、需要严格控 token</td><td>检索与 Agent 解耦，需自己做编排</td></tr>
+              <tr><td>保留平台索引</td><td>百炼 / Dify / HayStack / RAGFlow 继续管索引，只换 Java 侧接入方式</td><td>内容运营在平台</td><td>平台与 Agent 两套权限要打通</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          和记忆一样，弃用的是「Agent 内置 RAG 管线」，不是「不要做 RAG」。把检索做成应用层工具，反而更容易控制权限、阈值、
+          缓存与评测。
+        </p>
+
+        <h2 id="cheatsheet">速查：默认值、模式与写入能力</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>值 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>默认模式</td><td><code>GENERIC</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4846-4851">ReActAgent.java:4846-4851</span></td></tr>
+              <tr><td>默认检索参数</td><td><code>limit=5</code>，<code>scoreThreshold=0.5</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/model/RetrieveConfig.java:110-114">RetrieveConfig.java:110-114</span></td></tr>
+              <tr><td>工具名 / 默认 limit</td><td><code>retrieve_knowledge</code> / 5</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/KnowledgeRetrievalTools.java:119-143">KnowledgeRetrievalTools.java:119-143</span></td></tr>
+              <tr><td>注入标签</td><td><code>&lt;retrieved_knowledge&gt;</code>，role=USER，追加到末尾</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/GenericRAGHook.java:194-216">GenericRAGHook.java:194-216</span></td></tr>
+              <tr><td>只有谁支持写入</td><td>Simple；其余四家抛 <code>UnsupportedOperationException</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-dify/src/main/java/io/agentscope/core/rag/integration/dify/DifyKnowledge.java:124-131">DifyKnowledge.java:124-131</span></td></tr>
+              <tr><td>弃用起点</td><td><code>@Deprecated(forRemoval = true, since = "2.0.0")</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/Knowledge.java:30-34">Knowledge.java:30-34</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">六个坑：把「检索」当成「插入 prompt」</h2>
+        <p>
+          <strong>坑一：把 <code>RetrieveConfig</code> 当万能过滤。</strong>它没有 metadata 字段；metadata 过滤要用
+          provider 配置或自己包一层
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/model/RetrieveConfig.java:34-37">RetrieveConfig.java:34-37</span>。
+        </p>
+        <p>
+          <strong>坑二：照文档写 <code>RAGMode.STATIC</code>。</strong>源码枚举是 <code>GENERIC</code> / <code>AGENTIC</code> / <code>NONE</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/RAGMode.java:40-55">RAGMode.java:40-55</span>。
+        </p>
+        <p>
+          <strong>坑三：对外部平台调 <code>addDocuments</code>。</strong>百炼 / Dify / HayStack / RAGFlow 都只读；
+          写入走平台控制台或 API
+          <span class="src" data-src="docs/v2/zh/integration/rag/overview.md:45">overview.md:45</span>。
+        </p>
+        <p>
+          <strong>坑四：以为改了 provider topK 就生效。</strong>Agent 走 <code>RetrieveConfig</code>，limit 会覆盖 provider 默认；
+          provider 的 10 / 1024 / 3 只在直接调用且没传 limit 时才有意义。
+        </p>
+        <p>
+          <strong>坑五：索引没完成就调阈值。</strong>外部平台的文档需要解析与索引时间；空结果先查平台状态。
+        </p>
+        <p>
+          <strong>坑六：把 RAG 当长期记忆。</strong>RAG 按 query 查文档，记忆按用户存事实；两者的写入、删除与隔离键都不同
+          <span class="src" data-src="docs/v2/zh/integration/rag/overview.md:6">overview.md:6</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary><code>RAGMode</code> 的默认值是什么？</summary>
+          <p>
+            <code>GENERIC</code>：用 Hook 自动检索并注入，不是 <code>AGENTIC</code>，也不是文档里的 <code>STATIC</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4846-4847">ReActAgent.java:4846-4847</span>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/RAGMode.java:40-55">RAGMode.java:40-55</span>。
+          </p>
+        </details>
+        <details>
+          <summary>百炼、Dify、HayStack、RAGFlow 都能通过 <code>addDocuments</code> 上传文档吗？</summary>
+          <p>
+            不能。四家都只负责检索，<code>addDocuments</code> 会抛 <code>UnsupportedOperationException</code>；
+            只有 Simple 支持写入
+            <span class="src" data-src="docs/v2/zh/integration/rag/overview.md:45">overview.md:45</span>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-haystack/src/main/java/io/agentscope/core/rag/integration/haystack/HayStackKnowledge.java:109-113">HayStackKnowledge.java:109-113</span>。
+          </p>
+        </details>
+        <details>
+          <summary>Agent 挂载知识库后，检索失败一定报错吗？</summary>
+          <p>
+            不一定。<code>GENERIC</code> Hook 会记日志后继续；<code>AGENTIC</code> 工具会返回错误字符串。
+            只有直接调用 <code>Knowledge.retrieve</code> 时，provider 才可能把异常抛给你
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/GenericRAGHook.java:161-166">GenericRAGHook.java:161-166</span>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/rag/KnowledgeRetrievalTools.java:162-166">KnowledgeRetrievalTools.java:162-166</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：给「内部文档问答」选一条 RAG 路径</h2>
+        <p>目标不是接通一个知识库，而是能解释「索引归谁、阈值怎么定、失败时谁兜底」。建议 50 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先定索引归属</span>
+            <div>写下文档规模、更新频率、是否需要 OCR；决定用 Simple 自建还是外部平台托管。</div>
+          </li>
+          <li>
+            <span class="sh">选一个实现</span>
+            <div>在五个实现里选一个，记录必填参数、默认 topK / 阈值与索引更新方式。</div>
+          </li>
+          <li>
+            <span class="sh">跑 GENERIC</span>
+            <div>用默认模式发一个能命中知识库的问题，确认注入的 <code>&lt;retrieved_knowledge&gt;</code> 出现在消息列表末尾。</div>
+          </li>
+          <li>
+            <span class="sh">切 AGENTIC</span>
+            <div>改成工具模式，观察模型是否主动调用 <code>retrieve_knowledge</code>，以及 limit 参数是否被使用。</div>
+          </li>
+          <li>
+            <span class="sh">调阈值</span>
+            <div>把 scoreThreshold 从 0.5 调到 0.2 与 0.8，记录命中条数与答案质量的变化。</div>
+          </li>
+          <li>
+            <span class="sh">制造空结果</span>
+            <div>用平台未索引的文档提问，记录 Hook 与工具各自的返回形态。</div>
+          </li>
+          <li>
+            <span class="sh">验证写入边界</span>
+            <div>对选中的后端调用 <code>addDocuments</code>，确认是支持还是 <code>UnsupportedOperationException</code>。</div>
+          </li>
+          <li>
+            <span class="sh">写三行结论</span>
+            <div>分别写「索引谁管」「检索参数怎么生效」「失败谁兜底」，确保每行都能在日志或源码里找到证据。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          RAG 讲完，下一章进入协议：A2A、AG-UI 与 Agent Protocol 分别解决「Agent 之间互调」「前端消费事件流」
+          「业务系统提交任务」三类问题。它们不是同一个对外接口的三种写法，而是三条不同的边界。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="31-agent-state-store.html">31 Agent 状态存储</a></td><td>会话上下文与 CAS，RAG 之外的另一半持久化</td></tr>
+              <tr><td><a href="29-memory-integration.html">29 记忆接入</a></td><td>语义记忆与 RAG 的分界</td></tr>
+              <tr><td>第 33 章 · 协议</td><td>A2A / AG-UI / Agent Protocol 的边界与接入</td></tr>
+              <tr><td>官方「RAG」</td><td>五种知识库的依赖、配置与检索参数<span class="src" data-src="docs/v2/zh/integration/rag/overview.md:6-45">overview.md:6-45</span></td></tr>
+              <tr><td><a href="../appendix/errata.html">附录 E · 勘误汇总</a></td><td>STATIC / metadata 这类文档与源码差异的核对方式</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的 RAG 文档在 2.0.4 仓库里仍按 <code>Knowledge</code> 接口介绍实现；正文以源码为准，
+          枚举、默认值、写入能力与弃用状态都标了具体出处。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
