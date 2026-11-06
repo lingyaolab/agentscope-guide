@@ -754,7 +754,7 @@ window.AS_SITE = {
             ["objects", "对象模型：Issue、Run、Node、Task、Attempt 各记什么"],
             ["create", "建队：一个 Leader，若干有角色的成员"],
             ["roster", "成员字段：角色、指令、能力要求、运行策略"],
-            ["policy", "协作上限：七个策略字段与两种默认值"],
+            ["policy", "协作上限：九个策略字段与三类零值语义"],
             ["runtimes", "混合后端：Managed、Hosted、External 只在 Attempt 以下不同"],
             ["readiness", "就绪度：Ready、Degraded、Unavailable 各查什么"],
             ["start", "从 Issue 启动：冻结快照，只建一个协调节点"],

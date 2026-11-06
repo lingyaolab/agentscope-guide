@@ -368,7 +368,11 @@ agentscope runtime probe</pre>
             class="src"
             data-src="agentscope-service/aistio/internal/controlplane/model/agent_catalog.go:94-134"
             >agent_catalog.go:94-134</span
-          >。自定义参数最多 64 条，单条最长 1024 字符，并按 argv token 传递，不经过 Shell<span
+          >。自定义参数最多 64 条、单条最长 1024 字符<span
+            class="src"
+            data-src="agentscope-service/aistio/internal/controlplane/model/agent_catalog.go:104-121"
+            >agent_catalog.go:104-121</span
+          >；按 argv token 传递、不经过 Shell，并拒绝 Runtime Host 保留参数<span
             class="src"
             data-src="agentscope-service/aistio/internal/runtimehost/provider/provider.go:130-146"
             >provider.go:130-146</span

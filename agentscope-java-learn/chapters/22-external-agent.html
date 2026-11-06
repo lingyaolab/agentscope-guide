@@ -50,7 +50,7 @@
             >external-agent.md:10</span
           >。换句话说，Service 拿到的是「这个 Agent 存在、它能做什么、它的会话长什么样」，不是「这台机器归 Service 调度」。
         </p>
-        <p>把三种运行方式并排放在一张表里，边界立刻清楚<span class="src" data-src="docs/v2/zh/service/AGENTS.md:30-36">AGENTS.md:30-36</span>：</p>
+        <p>把三种运行方式并排放在一张表里，边界立刻清楚<span class="src" data-src="docs/v2/zh/service/agents.md:30-36">agents.md:30-36</span>：</p>
         <div class="table-wrap">
           <table>
             <thead>
@@ -95,8 +95,8 @@
             Managed 是「把 Agent 交给 Service 跑」，Hosted 是「把一台已登录的主机交给 Service 调度」，
             External 是「把身份和会话视图交给 Service，进程仍归你」。三者共享工作入口，但能力边界不同<span
               class="src"
-              data-src="docs/v2/zh/service/AGENTS.md:36"
-              >AGENTS.md:36</span
+              data-src="docs/v2/zh/service/agents.md:36"
+              >agents.md:36</span
             >。
           </p>
         </div>
@@ -211,6 +211,12 @@
             data-src="agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/SessionBridge.java:148-157"
             >SessionBridge.java:148-157</span
           >，不会「注册到一半」。
+        </p>
+        <p>
+          反过来，如果只是<strong>调用</strong> Agent / Team / Workflow 的 Endpoint，不需要引入这个 SDK；普通 HTTP
+          客户端就够。官方「SDK 与组件选择」把「调用能力」和「接入运行时」分成两条路，避免为了调一个 Endpoint
+          把应用也注册进目录
+          <span class="src" data-src="docs/v2/zh/service/integrations.md:10-18">integrations.md:10-18</span>。
         </p>
 
         <h2 id="env">六个环境变量，逐条对号</h2>

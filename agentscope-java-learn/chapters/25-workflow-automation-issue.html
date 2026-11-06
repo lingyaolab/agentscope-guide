@@ -629,7 +629,7 @@
           </li>
           <li>
             <span class="who">执行</span>
-            <span class="what">Automation 创建或复用 Issue，并把工作交给 Agent、Team、Workflow 或 Endpoint；Runbook 与执行快照此时已固定。</span>
+            <span class="what">Automation 创建或复用 Issue（<code>run_only</code> 则只记一次运行），并把工作交给 Agent 或 active Team 的 Leader；Workflow 与 Endpoint 不是 Automation 的执行目标，需要各自触发。Runbook 与执行快照此时已固定<span class="src" data-src="agentscope-service/aistio/internal/automation/service.go:68-93">service.go:68-93</span>。</span>
           </li>
           <li>
             <span class="who">建图</span>

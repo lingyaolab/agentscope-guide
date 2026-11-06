@@ -138,16 +138,16 @@
               <tr><th>组</th><th>核心接口 / 契约</th><th>代表模块或后端</th><th>方向</th><th>下一章</th></tr>
             </thead>
             <tbody>
-              <tr><td>模型</td><td><code>Model</code> + <code>ModelRegistry</code></td><td>OpenAI、DashScope、Gemini、Anthropic、Ollama</td><td>Agent 出站调用</td><td>第 28 章</td></tr>
+              <tr><td>模型</td><td><code>Model</code> + <code>ModelRegistry</code></td><td>OpenAI / OpenAI Official、DashScope、Gemini、Anthropic、Ollama、DeepSeek、GLM、Kimi、MiniMax（10 个 id / 6 个 artifact）</td><td>Agent 出站调用</td><td>第 28 章</td></tr>
               <tr><td>记忆</td><td><code>LongTermMemory</code>（已弃用）</td><td>Mem0、百炼、ReMe</td><td>Agent 出站读写</td><td>第 29 章</td></tr>
-              <tr><td>状态</td><td><code>AgentStateStore</code></td><td>JSON 文件、Redis、MySQL、OSS</td><td>运行时持久化</td><td>第 31 章</td></tr>
-              <tr><td>分布式存储</td><td><code>DistributedStore</code></td><td>Redis、JDBC / MySQL、MongoDB、OSS</td><td>运行时持久化</td><td>第 30 章</td></tr>
+              <tr><td>状态</td><td><code>AgentStateStore</code></td><td>JSON 文件、Redis、JDBC、MongoDB、OSS</td><td>运行时持久化</td><td>第 31 章</td></tr>
+              <tr><td>分布式存储</td><td><code>DistributedStore</code></td><td>Redis、JDBC、MongoDB、OSS</td><td>运行时持久化</td><td>第 30 章</td></tr>
               <tr><td>沙箱</td><td><code>SandboxFilesystemSpec</code></td><td>Docker 内置；Kubernetes / AgentRun / Daytona / E2B<span class="src" data-src="docs/v2/zh/integration/overview.md:44-52">overview.md:44-52</span></td><td>工具执行隔离</td><td>第 13 章</td></tr>
               <tr><td>RAG</td><td><code>Knowledge</code>（已弃用）</td><td>Simple、百炼、Dify、HayStack、RAGFlow</td><td>Agent 出站检索</td><td>第 32 章</td></tr>
               <tr><td>协议</td><td>A2A / AG-UI / Agent Protocol</td><td>a2a-client/server、agui、agent-protocol</td><td>外部入站或互调</td><td>第 33 章</td></tr>
               <tr><td>渠道</td><td><code>Channel</code></td><td>钉钉、飞书、企微、GitHub、GitLab</td><td>外部入站</td><td>第 34 章</td></tr>
-              <tr><td>技能仓库</td><td><code>AgentSkillRepository</code></td><td>Git、MySQL、PostgreSQL、Nacos</td><td>启动时加载</td><td>第 35 章</td></tr>
-              <tr><td>基础设施 / 生态</td><td>Nacos / Higress / Scheduler / Studio / Training</td><td>注册发现、网关工具、定时、调试、训练</td><td>横向治理</td><td>第 36 章</td></tr>
+              <tr><td>技能仓库</td><td><code>AgentSkillRepository</code></td><td>Git、MySQL、PostgreSQL、Nacos</td><td>运行时加载 / 每轮重建</td><td>第 35 章</td></tr>
+              <tr><td>基础设施 / 生态</td><td>Nacos / Higress / Scheduler / Studio / Training / Chat Completions Web</td><td>注册发现、网关工具、定时、调试、训练、协议兼容</td><td>横向治理</td><td>第 36 章</td></tr>
             </tbody>
           </table>
         </div>
@@ -281,7 +281,9 @@ ReActAgent agent = ReActAgent.builder()
               <tr><td><code>InMemoryAgentStateStore</code></td><td><code>agentscope-core</code></td><td>单元测试</td></tr>
               <tr><td><code>JsonFileAgentStateStore</code></td><td><code>agentscope-core</code></td><td>单机开发，HarnessAgent 默认</td></tr>
               <tr><td><code>RedisAgentStateStore</code></td><td><code>agentscope-extensions-redis</code></td><td>多副本生产首选</td></tr>
-              <tr><td><code>MysqlAgentStateStore</code></td><td><code>agentscope-extensions-mysql</code></td><td>已有关系型数据库</td></tr>
+              <tr><td><code>JdbcAgentStateStore</code></td><td><code>agentscope-extensions-jdbc</code></td><td>当前关系型路径，支持 MySQL / PostgreSQL / H2 / SQLite</td></tr>
+              <tr><td><code>MongoAgentStateStore</code></td><td><code>agentscope-extensions-mongodb</code></td><td>已有 MongoDB、需要文档型状态</td></tr>
+              <tr><td><code>MysqlAgentStateStore</code></td><td><code>agentscope-extensions-mysql</code></td><td>旧 MySQL 实现，保留兼容；新代码优先 JDBC</td></tr>
               <tr><td><code>OssAgentStateStore</code></td><td><code>agentscope-extensions-oss</code></td><td>阿里云对象存储生态</td></tr>
             </tbody>
           </table>
@@ -297,7 +299,7 @@ ReActAgent agent = ReActAgent.builder()
           <code>DistributedStore</code> 是 harness 里的一站式门面：它把 Agent 状态、工作区文件系统 KV、沙箱快照和沙箱并发锁
           收在同一组 getter 下
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:30-73">DistributedStore.java:30-73</span>。
-          官方给的能力矩阵很直接：Redis 四项齐全；MySQL 四项齐全；MongoDB 四项齐全；OSS 没有
+          官方给的能力矩阵很直接：Redis 四项齐全；JDBC / MySQL 四项齐全；MongoDB 四项齐全；OSS 没有
           <code>SandboxExecutionGuard</code>，因为对象存储不适合做分布式锁
           <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:24-33">index.md:24-33</span>。
         </p>

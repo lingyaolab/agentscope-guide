@@ -432,8 +432,9 @@ docker compose exec -T db pg_dump -U agentscope -d agentscope -Fc &gt; backup/da
 
         <h2 id="health">可观测性：探针、启动顺序与日志归属</h2>
         <p>
-          Helm 为四个组件都配置了 startup、readiness 和 liveness 探针：Control 用 <code>/healthz</code>，其余用
-          <code>/actuator/health</code>；startup 每 5 秒一次、失败阈值 120，相当于最多给 600 秒启动时间
+          Helm 为四个组件都配置了 startup、readiness 和 liveness 探针：startup 与 readiness 里，Control 用
+          <code>/healthz</code>，其余用 <code>/actuator/health</code>；liveness 则统一走 TCP socket，而不是 HTTP 路径。
+          startup 每 5 秒一次、失败阈值 120，相当于最多给 600 秒启动时间
           <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:113-122">planes.yaml:113-122</span>。
           Compose 的健康检查则是 10 秒间隔、5 秒超时、30 次重试、60 秒启动宽限
           <span class="src" data-src="agentscope-service/deploy/compose.yaml:34-39">compose.yaml:34-39</span>。

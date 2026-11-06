@@ -26,10 +26,19 @@
       <article class="article">
         <h1>附录 E · 勘误汇总：官方文档 vs 2.0.4 源码</h1>
         <p class="lede">
-          这是全站最「不客气」的一页：把 19 章写作时逐条核对出来的偏差集中成一张表。左边是
+          这是全站最「不客气」的一页：把写到第 19 章时逐条核对出来的偏差集中成一张表。左边是
           <code>docs/v2/zh/**</code> 的原话，右边是 <code>agentscope-java-2.0.4</code> 里真正执行的代码，中间那句是「照文档写会怎么坑你」。
           一共 <strong>60 条</strong>，去掉三组跨章重复后是 57 条独立偏差。每条都带文档与源码两套行号，可以自己复核。
         </p>
+        <div class="callout warn">
+          <span class="ct">范围说明：本页是第 1–19 章写作阶段的快照</span>
+          <p>
+            下面的 60 条只覆盖 04、08–10、12–18 等早期章节。第 20–36 章新增的差异——比如 A2A starter 名、RAG 的
+            <code>RAGMode</code> 枚举、MySQL 技能仓库构造器、Nacos A2A 构造器、Scheduler 的
+            <code>pause</code> / <code>resume</code>、Chat Completions 适配器签名——写在各自章节的「文档 vs 源码」框里，没有回填本表。
+            这样处理是为了让这张表保持「当时逐条核对过」的可信度，而不是把没复核的条目混进来。
+          </p>
+        </div>
 
         <h2 id="how">怎么用这一页</h2>
         <ul class="goals">

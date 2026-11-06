@@ -156,6 +156,23 @@
               （状态）与 09（中间件）之上。
             </div>
           </div>
+          <div class="layer in3">
+            <span class="lt">19 服务化 → 26 生产运维</span>
+            <div class="ld">
+              这八章把 11 章的小项目变成可登录、可发布、可编排的服务：19 起站与第一个 Managed Agent，20 把 Agent
+              发布成 Endpoint，21 拆 Agent 定义与四类资源，22 接 External Agent，23 接 Hosted Agent，24 组 Team，
+              25 写 Workflow / Automation / Issue 闭环，26 用 Helm、共享存储与备份把它放进生产。读之前至少完成
+              09（Hook）与 11（综合案例）。
+            </div>
+          </div>
+          <div class="layer in3">
+            <span class="lt">27 扩展地图 → 36 基础设施与生态</span>
+            <div class="ld">
+              这十章按「出站能力 → 入站入口 → 外围设施」展开：27 先画扩展地图，28 模型，29 记忆，30 分布式存储，
+              31 Agent 状态，32 RAG，33 协议，34 渠道，35 技能仓库，36 Nacos / Higress / Scheduler / Studio /
+              Training。它们更像查阅手册，不必顺序读；每章都能单独落到一个接口、一个 artifact 或一条部署边界。
+            </div>
+          </div>
         </div>
         <div class="callout">
           <span class="ct">可以跳的例外</span>
@@ -226,6 +243,7 @@
                 <li>04 消息与事件（结构、类名、生命周期都是本地代码）</li>
                 <li>09 Middleware 与 Hook 的骨架部分（执行顺序）</li>
                 <li>12–18 Harness 工程能力：签名、默认值与判定分支全是本地代码，可以只读源码不跑</li>
+                <li>19–36 的接口、默认值与部署边界：契约层可只读；真正跑通通常还需要控制面、模型或外部中间件</li>
                 <li>附录 A 术语表、附录 D 源码地图</li>
               </ul>
             </div>
@@ -255,7 +273,10 @@
         </div>
 
         <h2 id="how-read">每一章的固定结构与图例</h2>
-        <p>所有章节都是同构的 10 段，认准标题就能随时进场：</p>
+        <p>
+          早期章节基本按同构的 10 段写；19 章之后主题变长，段落名会变，但读法不变：目标 → 为什么 → 最小可跑 →
+          端到端 → 速查 → 陷阱 → 自检 → 练习 → 下一步。认准这些功能，而不是标题字面。
+        </p>
         <ol class="steps">
           <li><span class="sh">读完你能做到</span><div>3 条可验证目标，动词开头。做不到就别往下读。</div></li>
           <li><span class="sh">先说为什么</span><div>这个能力解决什么痛点。不先抛术语。</div></li>

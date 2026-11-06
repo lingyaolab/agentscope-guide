@@ -131,6 +131,12 @@
           AgentTask 状态与终态判定见
           <span class="src" data-src="agentscope-service/aistio/internal/controlplane/model/collaboration.go:220-234">collaboration.go:220-234</span>。
         </p>
+        <p>
+          这里列的是 Team 视角的六类对象；更完整的会话与运行模型——<code>direct</code> / <code>adaptive</code> /
+          <code>declared</code> / <code>subrun</code> 四种模式，以及「新 Attempt → 新 Task → 新 Run」三级重试——在官方
+          <code>sessions.md</code> 里。Team 的每个 AgentTask 最终仍落在某个会话的执行上下文里
+          <span class="src" data-src="docs/v2/zh/service/sessions.md:16-33">sessions.md:16-33</span>。
+        </p>
 
         <h2 id="create">建队：一个 Leader，若干有角色的成员</h2>
         <p>
@@ -226,7 +232,7 @@ policy:
           <span class="src" data-src="docs/v2/zh/service/team-collaboration.md:16">team-collaboration.md:16</span>。
         </p>
 
-        <h2 id="policy">协作上限：七个策略字段与两种默认值</h2>
+        <h2 id="policy">协作上限：九个策略字段与三类零值语义</h2>
         <p>
           策略不是「建议值」，而是服务端在委派、提及和子 Issue 创建时真正检查的预算。零值语义并不统一，
           先看官方表：
@@ -328,8 +334,9 @@ policy:
         <p>
           源码把这三态算得更具体：先默认 <code>ready</code>，Team 非 active 直接 <code>unavailable</code>；
           然后逐个检查 Leader 与成员 Agent 是否在当前范围、是否 active、绑定的 Runtime 候选是否可派发。
-          成员不是 <code>ready</code> 时，Leader 不是 <code>degraded</code> 就把整队判为 <code>unavailable</code>，
-          否则降为 <code>degraded</code>
+          某个成员不是 <code>ready</code> 时：如果它是 Leader 且状态不是 <code>degraded</code>，整队判为
+          <code>unavailable</code>；普通成员不可用，或 Leader 为 <code>degraded</code>，则降为
+          <code>degraded</code>
           <span class="src" data-src="agentscope-service/aistio/internal/httpapi/team_detail_handler.go:73-107">team_detail_handler.go:73-107</span>。
         </p>
         <div class="table-wrap">
