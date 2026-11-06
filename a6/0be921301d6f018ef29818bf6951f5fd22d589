@@ -1,0 +1,22 @@
+CHANGELOG.md
+  h_000d6d73c03ff5 25,38
+DEPLOY.md
+  h_000d6d73c03ff5 97
+agentscope-java-learn/assets/site.js
+  h_000d6d73c03ff5 757-765,1864-1868
+agentscope-java-learn/index.html
+  h_000d6d73c03ff5 209
+tools/check-site.cjs
+  h_000d6d73c03ff5 550-557
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a60be921301d6f018ef29818bf6951f5fd22d589",
+  "prompts": {},
+  "humans": {
+    "h_000d6d73c03ff5": {
+      "author": "lingyao <lingyao@tianmagroup.com>"
+    }
+  }
+}
