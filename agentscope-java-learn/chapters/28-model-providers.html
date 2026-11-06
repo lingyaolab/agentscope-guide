@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 28 章拆 AgentScope Java 2.0.4 的模型接入：ModelRegistry 解析顺序、10 个 provider id 与 6 个 artifact、OpenAI 兼容 formatter 的差异、原生结构化输出、思考参数、重试与 fallbackModel 切换。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="28 模型接入：10 个 provider 的差异与切换 · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 28 章拆 AgentScope Java 2.0.4 的模型接入：ModelRegistry 解析顺序、10 个 provider id 与 6 个 artifact、OpenAI 兼容 formatter 的差异、原生结构化输出、思考参数、重试与 fallbackModel 切换。"
+    />
+    <title>28 模型接入：10 个 provider 的差异与切换 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="28-model-providers" data-root="..">
+    <main>
+      <article class="article">
+        <h1>28 · 模型接入：10 个 provider 的差异与切换</h1>
+        <p class="lede">
+          第 27 章说「10 个模型 id，6 个 artifact」。这一章把这句话拆开：同一个 <code>Model</code> 接口下，
+          provider 在凭证、默认端点、formatter、结构化输出、思考参数和重试策略上并不等价。
+          切换模型不是改 prompt，而是换 id、换装配，必要时再换一个能兜底的 <code>fallbackModel</code>。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 <code>ModelRegistry</code> 的解析顺序，以及解析失败和创建失败分别长什么样</li>
+          <li>列出 10 个 provider id、它们共用的 6 个 artifact，以及各自的标准凭证</li>
+          <li>解释 OpenAI 与 OpenAI Official 为什么不是同一个东西，以及 OpenAI 兼容模块替 DeepSeek / GLM / Kimi / MiniMax 改了什么</li>
+          <li>判断某个 provider 是否支持原生结构化输出，什么时候会退回工具式 fallback</li>
+          <li>用 <code>ModelCreationContext</code> 覆盖 baseUrl、apiKey 与思考参数，并避免租户级缓存串用</li>
+          <li>用 <code>maxRetries</code> 与 <code>fallbackModel</code> 做可控的重试和降级，而不是靠外层无限重试</li>
+        </ul>
+
+        <h2 id="why">为什么「换模型」不等于「改模型名」</h2>
+        <p>
+          AgentScope 把所有模型收在同一个 <code>Model</code> 接口下：一个流式 <code>stream(...)</code>、一个模型名，
+          再加上结构化输出、上下文窗口等带默认实现的能力
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/Model.java:22-33">Model.java:22-33</span>。
+          接口相同，只保证 Agent 的调用方式不变；它不保证两个 provider 对同一条请求理解一致。
+        </p>
+        <p>
+          最典型的是「OpenAI 兼容」：DeepSeek、GLM、Kimi、MiniMax 都走同一套 OpenAI 载荷格式，但各自的 formatter
+          会分别处理 <code>strict</code>、<code>reasoning_content</code>、<code>max_tokens</code> 与 <code>tool_choice</code>
+          <span class="src" data-src="docs/v2/zh/integration/model/deepseek.md:49-53">deepseek.md:49-53</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/glm.md:56-64">glm.md:56-64</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/kimi.md:56-66">kimi.md:56-66</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/minimax.md:49-55">minimax.md:49-55</span>。
+          所以一次真正的切换至少要核对五件事：id、artifact、凭证、端点、能力差异。少一项，问题就会在运行到工具调用或结构化输出时才暴露。
+        </p>
+
+        <h2 id="registry">ModelRegistry：id 怎么变成一个 Model</h2>
+        <p>
+          provider 通过 <code>ModelProvider</code> SPI 暴露三个动作：声明 <code>providerId</code>、
+          判断 <code>supports(modelId)</code>、按完整 id 创建 <code>Model</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/spi/ModelProvider.java:21-44">ModelProvider.java:21-44</span>。
+          <code>ModelRegistry</code> 按固定顺序查找：先看按名字注册的实例，再看解析缓存，再看用户注册的 factory（新的优先），
+          最后才查 SPI provider
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:98-137">ModelRegistry.java:98-137</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>阶段</th><th>发生什么</th><th>失败形态</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>找不到 provider</td><td>没有任何 named / factory / SPI 匹配 id</td><td><code>IllegalArgumentException</code>，提示 id 无法解析</td></tr>
+              <tr><td>provider 创建失败</td><td>例如环境变量缺失、端点非法</td><td>被包装成 <code>IllegalArgumentException</code>，保留 cause<span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:145-166">ModelRegistry.java:145-166</span></td></tr>
+              <tr><td>预检</td><td><code>canResolve(id)</code> 只匹配、不创建</td><td>返回 <code>false</code>，适合启动时检查配置<span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:169-195">ModelRegistry.java:169-195</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          一个 artifact 里可以注册多个 provider。OpenAI 兼容模块的 SPI 文件一次列了五个实现：
+          <code>openai</code>、<code>kimi</code>、<code>minimax</code>、<code>glm</code>、<code>deepseek</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/resources/META-INF/services/io.agentscope.core.model.spi.ModelProvider:1-5">ModelProvider:1-5</span>。
+          这也是第 27 章那个结论的来源：artifact 名描述的是「用哪套客户端与 formatter」，不是「只支持哪个品牌」。
+        </p>
+        <div class="callout warn">
+          <span class="ct">先 canResolve，再发请求</span>
+          <p>
+            启动时用 <code>ModelRegistry.canResolve("dashscope:qwen-plus")</code> 做一次预检，比等第一个用户请求失败更便宜。
+            预检只证明「有 provider 能接这个 id」，不证明凭证有效；凭证错误要等真正创建或调用时才暴露。
+          </p>
+        </div>
+
+        <h2 id="table">十个 id，六种接入面</h2>
+        <p>
+          官方集成表列出 10 个 provider id，但 artifact 只有 6 个：OpenAI 兼容模块承载 5 个 id，
+          OpenAI Official、DashScope、Gemini、Anthropic、Ollama 各一个
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:14-25">overview.md:14-25</span>。
+          下表把「凭证 + 最需要留意的差异」放在一起。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>provider id</th><th>artifact</th><th>标准凭证</th><th>最需要留意的差异</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>openai:</code></td><td><code>agentscope-extensions-model-openai</code></td><td><code>OPENAI_API_KEY</code></td><td>默认 Chat Completions；原生结构化输出默认开</td></tr>
+              <tr><td><code>openai-official:</code></td><td><code>agentscope-extensions-model-openai-official</code></td><td><code>OPENAI_API_KEY</code></td><td>只走 Responses API；无专用 starter；部分参数 fail-fast</td></tr>
+              <tr><td><code>deepseek:</code></td><td><code>agentscope-extensions-model-openai</code></td><td><code>DEEPSEEK_API_KEY</code></td><td>默认端点 <code>https://api.deepseek.com</code>；思考模式；原生结构化关闭</td></tr>
+              <tr><td><code>glm:</code></td><td><code>agentscope-extensions-model-openai</code></td><td><code>ZAI_API_KEY</code> / <code>GLM_API_KEY</code> / <code>ZHIPUAI_API_KEY</code></td><td>只认 <code>max_tokens</code>；<code>tool_choice</code> 只支持 auto</td></tr>
+              <tr><td><code>kimi:</code></td><td><code>agentscope-extensions-model-openai</code></td><td><code>MOONSHOT_API_KEY</code> / <code>KIMI_API_KEY</code></td><td>Kimi-* 采样参数由平台固定（moonshot-v1 例外）；K2 思考控制走 body 参数</td></tr>
+              <tr><td><code>minimax:</code></td><td><code>agentscope-extensions-model-openai</code></td><td><code>MINIMAX_API_KEY</code></td><td><code>max_tokens</code> 映射为 <code>max_completion_tokens</code>；无文档化 tool_choice</td></tr>
+              <tr><td><code>dashscope:</code> / <code>qwen*</code></td><td><code>agentscope-extensions-model-dashscope</code></td><td><code>DASHSCOPE_API_KEY</code></td><td>支持 Qwen 短名；thinking 开启时原生结构化输出返回 false</td></tr>
+              <tr><td><code>gemini:</code></td><td><code>agentscope-extensions-model-gemini</code></td><td><code>GEMINI_API_KEY</code></td><td>Gemini API；Vertex AI 走显式 builder 配置</td></tr>
+              <tr><td><code>anthropic:</code></td><td><code>agentscope-extensions-model-anthropic</code></td><td><code>ANTHROPIC_API_KEY</code> 或 Bearer token</td><td><code>apiKey</code> 与 <code>authToken</code> 互斥，同时配置会抛错</td></tr>
+              <tr><td><code>ollama:</code></td><td><code>agentscope-extensions-model-ollama</code></td><td>无必填密钥</td><td><code>OLLAMA_BASE_URL</code> 可选，默认 <code>http://localhost:11434</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          凭证与端点来自各 provider 文档
+          <span class="src" data-src="docs/v2/zh/integration/model/openai.md:20-27">openai.md:20-27</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/openai-official.md:22-28">openai-official.md:22-28</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/deepseek.md:20-29">deepseek.md:20-29</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/glm.md:20-29">glm.md:20-29</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/kimi.md:20-29">kimi.md:20-29</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/minimax.md:20-29">minimax.md:20-29</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/dashscope.md:20-34">dashscope.md:20-34</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/gemini.md:20-27">gemini.md:20-27</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/anthropic.md:20-27">anthropic.md:20-27</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/ollama.md:20-27">ollama.md:20-27</span>。
+        </p>
+
+        <h2 id="openai-family">OpenAI 与 OpenAI Official：两套客户端，不是一个开关</h2>
+        <p>
+          <code>openai</code> 走通用 Chat Completions 客户端，默认 base URL 是 <code>https://api.openai.com/v1</code>，
+          也用来接各种兼容端点
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/java/io/agentscope/extensions/model/openai/OpenAIClient.java:74-77">OpenAIClient.java:74-77</span>。
+          创建时它优先用 <code>ModelCreationContext</code> 的 apiKey，其次读 <code>OPENAI_API_KEY</code>；
+          原生结构化输出默认开，上下文窗口会按模型名自动查表
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/java/io/agentscope/extensions/model/openai/OpenAIModelProvider.java:57-77">OpenAIModelProvider.java:57-77</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/java/io/agentscope/extensions/model/openai/OpenAIChatModel.java:456-465">OpenAIChatModel.java:456-465</span>。
+        </p>
+        <p>
+          <code>openai-official</code> 走 OpenAI 官方 Java SDK，目前只支持 Responses API，未来才考虑 Chat Completions
+          <span class="src" data-src="docs/v2/zh/integration/model/openai-official.md:6-8">openai-official.md:6-8</span>。
+          它的取舍更「硬」：<code>frequencyPenalty</code>、<code>presencePenalty</code>、<code>topK</code>、<code>seed</code>、
+          <code>cacheControl</code>、<code>thinkingBudget</code>、<code>endpointPath</code> 等选项设置非空会直接 fail-fast；
+          Responses 专有参数只能从白名单键透传
+          <span class="src" data-src="docs/v2/zh/integration/model/openai-official.md:62-68">openai-official.md:62-68</span>。
+          它默认开启原生结构化输出，并且把 SDK 重试关掉（<code>maxRetries=0</code>），把重试交给 AgentScope
+          <span class="src" data-src="docs/v2/zh/integration/model/openai-official.md:70">openai-official.md:70</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai-official/src/main/java/io/agentscope/extensions/model/openaiofficial/OpenAIResponsesChatModel.java:80-83">OpenAIResponsesChatModel.java:80-83</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>维度</th><th><code>openai:</code></th><th><code>openai-official:</code></th></tr>
+            </thead>
+            <tbody>
+              <tr><td>协议</td><td>Chat Completions，兼容端点可用</td><td>Responses API</td></tr>
+              <tr><td>Spring Boot starter</td><td>有</td><td>无专用 starter<span class="src" data-src="docs/v2/zh/integration/model/openai-official.md:43-47">openai-official.md:43-47</span></td></tr>
+              <tr><td>特殊参数</td><td>按 OpenAI 兼容请求发送</td><td>只接受 Responses 白名单；不支持项 fail-fast</td></tr>
+              <tr><td>适用</td><td>通用模型、兼容网关、DeepSeek 等五家</td><td>需要 Responses 特性或官方 SDK 行为</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="java" data-file="两种 OpenAI 接入（示意）">// 通用 Chat Completions
+Model chat = ModelRegistry.resolve("openai:gpt-4.1-mini");
+
+// 官方 Responses API
+Model responses = ModelRegistry.resolve("openai-official:gpt-4o");</pre>
+
+        <h2 id="compat">OpenAI 兼容四家：formatter 在替谁擦屁股</h2>
+        <p>
+          DeepSeek、GLM、Kimi、MiniMax 共用 OpenAI 客户端，但各自有 formatter。它们做的不是「翻译字段」这么简单，
+          而是在请求发出前把不兼容的参数删掉、把等价的参数改名、把历史 reasoning 内容保留或清理。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>provider</th><th>formatter 的关键动作</th><th>对调用方的影响</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>DeepSeek</td><td>去掉 <code>strict</code>；保留兼容的消息字段；清理过期 reasoning，保留工具调用需要的 reasoning<span class="src" data-src="docs/v2/zh/integration/model/deepseek.md:49-53">deepseek.md:49-53</span></td><td>结构化输出走 fallback；工具 schema 的严格校验不会原样送达</td></tr>
+              <tr><td>GLM</td><td>只保留 <code>max_tokens</code>；<code>tool_choice</code> 只允许 auto；钳制 temperature / top_p；移除不支持的惩罚项<span class="src" data-src="docs/v2/zh/integration/model/glm.md:56-64">glm.md:56-64</span></td><td>强制工具选择会降级为 auto；结构化输出走 fallback</td></tr>
+              <tr><td>Kimi</td><td>保留 <code>reasoning_content</code>；移除 Kimi 系列不支持的采样参数；<code>max_tokens</code> 映射为 <code>max_completion_tokens</code><span class="src" data-src="docs/v2/zh/integration/model/kimi.md:56-64">kimi.md:56-64</span></td><td>K2 的思考控制要传 body 参数；required tool_choice 会降级</td></tr>
+              <tr><td>MiniMax</td><td><code>max_tokens</code> 映射为 <code>max_completion_tokens</code>；去掉 <code>strict</code>、<code>tool_choice</code> 与 <code>response_format</code> 等字段<span class="src" data-src="docs/v2/zh/integration/model/minimax.md:49-55">minimax.md:49-55</span></td><td>显式工具选择不会送达；结构化输出走 fallback</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「兼容」的边界也在这里：formatter 能让请求不报 400，但不能让模型突然支持它原本没有的能力。比如 MiniMax 没有文档化
+          <code>tool_choice</code>，formatter 只能移除；GLM 的 <code>response_format</code> 只支持 <code>json_object</code>，
+          原生 schema 约束就不能假设可用
+          <span class="src" data-src="docs/v2/zh/integration/model/glm.md:64">glm.md:64</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/minimax.md:53-55">minimax.md:53-55</span>。
+        </p>
+        <pre data-lang="java" data-file="通过 context 打开 DeepSeek 思考（示意）">Model model = ModelRegistry.resolve(
+    "deepseek:deepseek-v4-flash",
+    ModelCreationContext.builder()
+        .enableThinking(true)
+        .build());</pre>
+
+        <h2 id="dashscope">DashScope：短名、思考与结构化输出的交叉约束</h2>
+        <p>
+          DashScope 既接受 <code>dashscope:&lt;model&gt;</code>，也接受 <code>qwen-plus</code> 这样的短名
+          <span class="src" data-src="docs/v2/zh/integration/model/dashscope.md:20-34">dashscope.md:20-34</span>。
+          provider 的匹配规则是 <code>dashscope:.+</code> 或 <code>qwen.+</code>，所以短名不是特例，而是另一条正则
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeModelProvider.java:41-63">DashScopeModelProvider.java:41-63</span>。
+        </p>
+        <p>
+          DashScope 的 builder 还支持 search、encrypt、endpoint type 等专属选项
+          <span class="src" data-src="docs/v2/zh/integration/model/dashscope.md:36-48">dashscope.md:36-48</span>。
+          结构化输出有一个容易忽略的交叉约束：<code>supportsNativeStructuredOutput()</code> 在开启 thinking 时直接返回
+          <code>false</code>，否则才回落到父类配置
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeChatModel.java:432-438">DashScopeChatModel.java:432-438</span>。
+          也就是说，「用 Qwen 的思考模式」和「用原生 json_schema」不要同时假设成立。
+        </p>
+
+        <h2 id="others">Gemini、Anthropic、Ollama：三种不同的「本地/云端」</h2>
+        <p>
+          Gemini 支持 Gemini API，也可以通过显式 builder 配置走 Vertex AI
+          <span class="src" data-src="docs/v2/zh/integration/model/gemini.md:6-41">gemini.md:6-41</span>。
+          Anthropic 的特殊点在鉴权：<code>apiKey</code> 会设置 <code>X-Api-Key</code>，<code>authToken</code> 会设置
+          <code>Authorization: Bearer</code>，两者只能配一个，同时配置会在创建模型时抛
+          <code>IllegalArgumentException</code>
+          <span class="src" data-src="docs/v2/zh/integration/model/anthropic.md:43-59">anthropic.md:43-59</span>。
+          Ollama 则没有必填密钥，默认连本机 <code>http://localhost:11434</code>，适合离线或私有化部署
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-ollama/src/main/java/io/agentscope/extensions/model/ollama/OllamaHttpClient.java:60">OllamaHttpClient.java:60</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/ollama.md:20-39">ollama.md:20-39</span>。
+        </p>
+        <pre data-lang="java" data-file="Anthropic Bearer 网关（示意）">AnthropicChatModel model = AnthropicChatModel.builder()
+    .baseUrl("https://gateway.example.com/anthropic")
+    .authToken(System.getenv("ANTHROPIC_AUTH_TOKEN"))
+    .modelName("claude-sonnet-4.5")
+    .build();</pre>
+        <p class="footnote">
+          Gemini 的 Vertex 路径需要显式 builder，不是换一个 id 就自动切云；Anthropic 的两个凭据也只能二选一。
+          这两类约束在排障时比模型名更常见。
+        </p>
+
+        <h2 id="structured">结构化输出：原生 json_schema 还是工具式 fallback</h2>
+        <p>
+          <code>Model</code> 接口把「是否支持原生结构化输出」做成能力位，并区分「有工具时是否仍支持」
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/Model.java:42-70">Model.java:42-70</span>。
+          背后是两条完全不同的路径：原生 <code>response_format</code> 直接约束模型输出；不支持时，Agent 注入一个合成的
+          <code>generate_response</code> 工具，让模型通过工具调用返回结构化结果。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>provider</th><th>原生结构化输出</th><th>源码依据</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>OpenAI</td><td>默认开</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/java/io/agentscope/extensions/model/openai/OpenAIChatModel.java:456-465">OpenAIChatModel.java:456-465</span></td></tr>
+              <tr><td>OpenAI Official</td><td>开，且有工具时也开</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai-official/src/main/java/io/agentscope/extensions/model/openaiofficial/OpenAIResponsesChatModel.java:80-83">OpenAIResponsesChatModel.java:80-83</span></td></tr>
+              <tr><td>DeepSeek / GLM / Kimi / MiniMax</td><td>关闭，走 fallback</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/java/io/agentscope/extensions/model/openai/compat/deepseek/DeepSeekModelProvider.java:70-78">DeepSeekModelProvider.java:70-78</span> <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/java/io/agentscope/extensions/model/openai/compat/glm/GLMModelProvider.java:98-104">GLMModelProvider.java:98-104</span> <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/java/io/agentscope/extensions/model/openai/compat/kimi/KimiModelProvider.java:101-107">KimiModelProvider.java:101-107</span> <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/java/io/agentscope/extensions/model/openai/compat/minimax/MiniMaxModelProvider.java:80-86">MiniMaxModelProvider.java:80-86</span></td></tr>
+              <tr><td>DashScope</td><td>可配置；thinking 开启时返回 false</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/src/main/java/io/agentscope/extensions/model/dashscope/DashScopeChatModel.java:432-438">DashScopeChatModel.java:432-438</span></td></tr>
+              <tr><td>Gemini / Anthropic / Ollama</td><td>默认 false（未显式打开）</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ChatModelBase.java:46-60">ChatModelBase.java:46-60</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="ct">结构化输出要在「带工具」时测</span>
+          <p>
+            有些 OpenAI 兼容端点在有 <code>response_format</code> 和工具同时存在时，会优先满足 JSON schema 而跳过工具调用。
+            <code>supportsNativeStructuredOutputWithTools()</code> 就是为这个差异存在的；只看无工具时的表现，会高估兼容性
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/Model.java:55-70">Model.java:55-70</span>。
+          </p>
+        </div>
+
+        <h2 id="thinking">思考模式：每家的开关都不叫同一个名字</h2>
+        <p>
+          「思考」不是一个跨 provider 统一的布尔值。标准入口只有
+          <code>ModelCreationContext.enableThinking</code>，但每个 provider 会把它翻译成不同的请求字段；更细的控制则通过
+          <code>GenerateOptions</code> 的 <code>reasoningEffort</code> 或 <code>additionalBodyParam</code> 透传
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelCreationContext.java:87-110">ModelCreationContext.java:87-110</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>provider</th><th>控制方式</th><th>默认与边界</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>DeepSeek</td><td><code>enableThinking</code> → <code>thinking.type</code></td><td>默认不开；开启后 thinking 输出可单独渲染<span class="src" data-src="docs/v2/zh/integration/model/deepseek.md:31-47">deepseek.md:31-47</span></td></tr>
+              <tr><td>GLM</td><td><code>thinking.type</code> + <code>reasoning_effort</code></td><td>GLM-4.7 / 5 默认开；可显式 disabled<span class="src" data-src="docs/v2/zh/integration/model/glm.md:31-54">glm.md:31-54</span></td></tr>
+              <tr><td>Kimi</td><td>K3 用顶层 <code>reasoning_effort</code>；K2.x 用 body 参数 <code>thinking</code></td><td>K3 与 k2.7-code 始终开；K2.6 / K2.5 可关<span class="src" data-src="docs/v2/zh/integration/model/kimi.md:31-54">kimi.md:31-54</span></td></tr>
+              <tr><td>MiniMax</td><td><code>enableThinking</code> → disabled / adaptive</td><td>M3 省略时默认 adaptive；M2.x 即使请求 disabled 仍保持开<span class="src" data-src="docs/v2/zh/integration/model/minimax.md:31-47">minimax.md:31-47</span></td></tr>
+              <tr><td>OpenAI Official</td><td><code>reasoningEffort</code> + <code>reasoning.summary</code></td><td>要看到推理内容必须显式开启 summary<span class="src" data-src="docs/v2/zh/integration/model/openai-official.md:49-60">openai-official.md:49-60</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="retries">重试与降级：三层预算不要叠成无限重试</h2>
+        <p>
+          AgentScope 的默认执行配置把模型调用设为 5 分钟超时、3 次尝试、指数退避（初始 2 秒、上限 30 秒、倍数 2.0）；
+          工具调用则是 5 分钟超时、只尝试一次
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ExecutionConfig.java:34-38">ExecutionConfig.java:34-38</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ExecutionConfig.java:145-151">ExecutionConfig.java:145-151</span>。
+          HTTP 层面只有 429 与 5xx 默认算可重试，其余状态码不重试；超时与 IO 错误也会重试
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelHttpException.java:24-43">ModelHttpException.java:24-43</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ExecutionConfig.java:99-127">ExecutionConfig.java:99-127</span>。
+        </p>
+        <p>
+          <code>ReActAgent</code> 的 <code>maxRetries</code> 默认是 3；<code>fallbackModel</code> 在主模型耗尽重试后接管，
+          并与主模型共享同一个重试预算；<code>failoverListener</code> 用来观察切换
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/agent/config/ModelConfig.java:21-36">ModelConfig.java:21-36</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5192-5233">ReActAgent.java:5192-5233</span>。
+          流式调用中，主模型发出第一个错误信号时会切到 fallback
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4273-4302">ReActAgent.java:4273-4302</span>。
+        </p>
+        <pre data-lang="java" data-file="主模型 + 兜底模型（示意）">ReActAgent agent = ReActAgent.builder()
+    .name("assistant")
+    .model("dashscope:qwen-plus")
+    .maxRetries(3)
+    .fallbackModel("openai:gpt-4.1-mini")
+    .build();</pre>
+        <div class="callout danger">
+          <span class="ct">小心双重重试</span>
+          <p>
+            如果 provider SDK 自己也在重试，外层 AgentScope 再重试一次，实际请求次数会相乘。OpenAI Official 已经显式设置
+            <code>maxRetries=0</code>，把控制权交给 AgentScope；接入其他 SDK 时也要确认这一层
+            <span class="src" data-src="docs/v2/zh/integration/model/openai-official.md:70">openai-official.md:70</span>。
+          </p>
+        </div>
+
+        <h2 id="context">ModelCreationContext：切换的旋钮，也是缓存的边界</h2>
+        <p>
+          <code>ModelCreationContext</code> 把 provider 无关的标准字段（apiKey、baseUrl、endpointPath、stream、
+          enableThinking）与 provider 专属的 options / components 分开
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelCreationContext.java:22-41">ModelCreationContext.java:22-41</span>。
+          这正是「不改 Agent 代码，换端点或换租户凭据」的入口。
+        </p>
+        <pre data-lang="java" data-file="按租户覆盖端点与凭据（示意）">Model model = ModelRegistry.resolve(
+    "openai:gpt-4.1-mini",
+    ModelCreationContext.builder()
+        .apiKey(tenantKey)
+        .baseUrl(tenantBaseUrl)
+        .stream(true)
+        .build());</pre>
+        <p>
+          缓存规则必须一起看：空 context 的解析结果会缓存；非空 context 默认不缓存，除非显式设置
+          <code>CachePolicy.ENABLED</code>；如果 context 里带 options / components，还必须给出稳定的 <code>cacheId</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:108-137">ModelRegistry.java:108-137</span>。
+          如果为了省创建开销把租户凭据也塞进全局缓存，下一次请求就可能用到上一个租户的 key。
+        </p>
+
+        <h2 id="switching">切换的三种方式：id、builder、fallback</h2>
+        <p>
+          切换模型常见且稳定的做法有三种，分别解决不同问题。把它们混用，最容易出现「配置改了但没生效」或「以为是负载均衡，
+          其实是故障转移」。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方式</th><th>怎么做</th><th>适合</th><th>不解决什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>字符串 id</td><td><code>.model("dashscope:qwen-plus")</code> 或 <code>ModelRegistry.resolve</code></td><td>同一套代码切 provider</td><td>不校验凭证，也不探测能力差异</td></tr>
+              <tr><td>显式 builder</td><td><code>OpenAIChatModel.builder()...</code></td><td>自定义 baseUrl、formatter、transport、thinking</td><td>代码与某个 provider 绑定</td></tr>
+              <tr><td>fallbackModel</td><td><code>.fallbackModel("openai:gpt-4.1-mini")</code></td><td>主模型故障时自动接管</td><td>不是轮询，也不是按成本路由</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          计划内切换用前两种，故障降级用第三种。切换后 Agent 的上下文、工具与权限不会自动迁移；新模型只是换了一套
+          formatter 与 HTTP 端点，会话状态仍由 <code>AgentStateStore</code> 负责。第 31 章会把这条边界接到状态存储上。
+        </p>
+
+        <h2 id="spring">Spring Boot：starter 只替你装配，不替你选模型</h2>
+        <p>
+          OpenAI、DashScope、Gemini、Anthropic、Ollama 都有对应 starter；OpenAI Official 没有专用 starter
+          <span class="src" data-src="docs/v2/zh/integration/model/openai-official.md:43-47">openai-official.md:43-47</span>。
+          以 OpenAI 为例，自动配置只在 <code>agentscope.model.provider=openai</code> 且容器里没有现成
+          <code>Model</code> bean 时创建模型；<code>agentscope.openai.model-name</code> 必填，缺失会直接启动失败
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-openai-spring-boot-starter/src/main/java/io/agentscope/spring/boot/openai/OpenAIAutoConfiguration.java:37-55">OpenAIAutoConfiguration.java:37-55</span>。
+        </p>
+        <pre data-lang="yaml" data-file="Spring Boot 选择 provider（示意）">agentscope:
+  model:
+    provider: openai
+  openai:
+    api-key: ${OPENAI_API_KEY}
+    model-name: gpt-4.1-mini
+    # base-url: https://gateway.example.com/v1</pre>
+        <p>
+          Anthropic starter 同时支持 <code>api-key</code> 与 <code>auth-token</code>，但两者都非空会启动失败；
+          可以用 builder customizer 在校验前清掉其中一个
+          <span class="src" data-src="docs/v2/zh/integration/model/anthropic.md:73-87">anthropic.md:73-87</span>。
+          Ollama starter 的 base URL 可省略，默认仍是本机 11434
+          <span class="src" data-src="docs/v2/zh/integration/model/ollama.md:54-63">ollama.md:54-63</span>。
+        </p>
+
+        <h2 id="selection">选型：先看能力，再看价格</h2>
+        <p>
+          模型选型不是「哪个 benchmark 高」。在 AgentScope 里，至少要把下面五项放同一张表：工具调用、结构化输出、
+          思考控制、上下文窗口、凭证与数据边界。下面按常见需求给一个起点。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>优先考虑</th><th>注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>通用对话 + 大量工具</td><td><code>openai:</code> 或 <code>dashscope:</code></td><td>结构化输出与工具同时存在时要实测</td></tr>
+              <tr><td>需要 Responses 专有参数</td><td><code>openai-official:</code></td><td>只支持 Responses；不支持项会 fail-fast</td></tr>
+              <tr><td>国内部署 / 已有百炼</td><td><code>dashscope:</code></td><td>Qwen 短名与 thinking 的结构化输出约束</td></tr>
+              <tr><td>已有 DeepSeek / GLM / Kimi / MiniMax 账号</td><td>对应 id + OpenAI 兼容 artifact</td><td>formatter 会移除或降级部分参数</td></tr>
+              <tr><td>已有 Claude 网关</td><td><code>anthropic:</code></td><td>apiKey 与 authToken 只能二选一</td></tr>
+              <tr><td>本地离线 / 私有化</td><td><code>ollama:</code></td><td>默认 localhost，需自行保证模型已拉取</td></tr>
+              <tr><td>Google Cloud / Vertex</td><td><code>gemini:</code> + 显式 builder</td><td>Vertex 不是换 id 自动生效</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="verification">验证：一张七项清单，比「能回一句话」可靠</h2>
+        <p>
+          切换 provider 后，至少跑一遍下面七项。前两项证明能通，后五项才是 Agent 真正依赖的能力。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>检查</th><th>怎么验</th><th>失败通常说明</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>解析</td><td><code>canResolve(id)</code> 为 true</td><td>模块不在 classpath 或 id 拼错</td></tr>
+              <tr><td>凭据</td><td>最小 Chat 请求成功</td><td>环境变量、baseUrl 或租户 context 错</td></tr>
+              <tr><td>流式</td><td>观察增量输出与结束事件</td><td>代理缓冲、SSE 超时或 stream 开关错</td></tr>
+              <tr><td>工具</td><td>注册一个只读工具并调用</td><td>tool_choice / strict / schema 不兼容</td></tr>
+              <tr><td>结构化输出</td><td>带工具与不带工具各测一次</td><td>原生 schema 不支持，或 fallback 未生效</td></tr>
+              <tr><td>思考</td><td>按 provider 开关一次</td><td>参数名不对，或该模型不支持关闭</td></tr>
+              <tr><td>重试 / 降级</td><td>用错误 key 触发 fallback</td><td>预算被 SDK 重试吃掉，或 fallback 未配置</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          验证记录至少保存 provider id、模型名、baseUrl、是否流式、是否原生结构化、最大尝试次数。
+          这些字段能区分「模型行为变了」和「装配变了」。
+        </p>
+
+        <h2 id="failure">故障边界：先分清解析、鉴权、参数和能力</h2>
+        <p>
+          模型接入的报错看起来都像「模型不可用」，实际分四层。按顺序排查，比反复换 key 有效。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>症状</th><th>更可能的原因</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>id 无法解析</td><td>artifact 缺失、id 拼错、前缀不匹配</td><td><code>canResolve</code>、依赖树、SPI 文件</td></tr>
+              <tr><td>401 / 403</td><td>key 缺失、租户 context 错、authToken 与 apiKey 冲突</td><td>环境变量、<code>ModelCreationContext</code>、Anthropic 互斥规则</td></tr>
+              <tr><td>404 / 405</td><td>baseUrl 或 endpointPath 错，或用了不支持的协议</td><td>OpenAI Official 是否误配了 Chat Completions 路径</td></tr>
+              <tr><td>400 参数不支持</td><td>provider 不接受某个字段</td><td>formatter 是否移除；Official 是否 fail-fast</td></tr>
+              <tr><td>工具不调用 / 被降级</td><td>tool_choice 或 strict 不被支持</td><td>GLM / Kimi / MiniMax 的 formatter 规则</td></tr>
+              <tr><td>结构化输出变成普通文本</td><td>原生能力关闭，fallback 未按预期工作</td><td><code>supportsNativeStructuredOutput</code></td></tr>
+              <tr><td>请求次数异常增多</td><td>SDK 重试与 AgentScope 重试叠加</td><td><code>maxRetries</code>、provider SDK 配置</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>ModelException</code> 会保留 model 名与 provider，排障时先看这两个字段，再决定是换配置还是换 provider
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelException.java:22-86">ModelException.java:22-86</span>。
+          不要把所有失败都归因于「模型不稳定」。
+        </p>
+
+        <h2 id="cheatsheet">速查：id、凭证与默认值</h2>
+        <p>先记最常用的四组：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>值 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>OpenAI 默认 base URL</td><td><code>https://api.openai.com/v1</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/java/io/agentscope/extensions/model/openai/OpenAIClient.java:74-77">OpenAIClient.java:74-77</span></td></tr>
+              <tr><td>DeepSeek 默认端点</td><td><code>https://api.deepseek.com</code></td><td><span class="src" data-src="docs/v2/zh/integration/model/deepseek.md:29">deepseek.md:29</span></td></tr>
+              <tr><td>GLM 默认端点</td><td><code>https://open.bigmodel.cn/api/paas/v4</code></td><td><span class="src" data-src="docs/v2/zh/integration/model/glm.md:29">glm.md:29</span></td></tr>
+              <tr><td>Kimi 默认端点</td><td><code>https://api.moonshot.cn/v1</code></td><td><span class="src" data-src="docs/v2/zh/integration/model/kimi.md:29">kimi.md:29</span></td></tr>
+              <tr><td>MiniMax 默认端点</td><td><code>https://api.minimaxi.com/v1</code></td><td><span class="src" data-src="docs/v2/zh/integration/model/minimax.md:29">minimax.md:29</span></td></tr>
+              <tr><td>Ollama 默认端点</td><td><code>http://localhost:11434</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-ollama/src/main/java/io/agentscope/extensions/model/ollama/OllamaHttpClient.java:60">OllamaHttpClient.java:60</span></td></tr>
+              <tr><td>模型默认重试预算</td><td>3 次尝试；初始 2s、上限 30s、倍数 2.0</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ExecutionConfig.java:145-151">ExecutionConfig.java:145-151</span></td></tr>
+              <tr><td>可重试 HTTP 状态</td><td>429、5xx</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelHttpException.java:36-43">ModelHttpException.java:36-43</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="java" data-file="启动前预检（示意）">if (!ModelRegistry.canResolve("dashscope:qwen-plus")) {
+    throw new IllegalStateException("DashScope provider is not on the classpath");
+}
+Model model = ModelRegistry.resolve("dashscope:qwen-plus");</pre>
+
+        <h2 id="pitfalls">六个坑：把「兼容」当成「等价」</h2>
+        <p>
+          <strong>坑一：10 个 id 装 10 个依赖。</strong>DeepSeek、GLM、Kimi、MiniMax 都复用 OpenAI 兼容 artifact，
+          只有 OpenAI Official、DashScope、Gemini、Anthropic、Ollama 需要各自模块
+          <span class="src" data-src="docs/v2/zh/integration/overview.md:14-25">overview.md:14-25</span>。
+        </p>
+        <p>
+          <strong>坑二：以为 OpenAI 兼容就是行为一致。</strong>formatter 会移除 strict、改动 max_tokens、降级 tool_choice；
+          兼容的是载荷，不是模型能力
+          <span class="src" data-src="docs/v2/zh/integration/model/glm.md:56-64">glm.md:56-64</span>
+          <span class="src" data-src="docs/v2/zh/integration/model/minimax.md:49-55">minimax.md:49-55</span>。
+        </p>
+        <p>
+          <strong>坑三：假设所有 provider 都支持原生结构化输出。</strong>OpenAI 兼容四家明确关闭，Gemini / Anthropic / Ollama
+          也默认不打开；不支持的路径会退回工具式 fallback
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ChatModelBase.java:46-60">ChatModelBase.java:46-60</span>。
+        </p>
+        <p>
+          <strong>坑四：双重重试。</strong>SDK 自己重试，AgentScope 再重试，会把一次失败放大成多次请求；OpenAI Official 已把
+          SDK 重试设为 0
+          <span class="src" data-src="docs/v2/zh/integration/model/openai-official.md:70">openai-official.md:70</span>。
+        </p>
+        <p>
+          <strong>坑五：把租户凭据放进全局缓存。</strong>非空 context 默认不缓存；显式开启缓存时必须给稳定的
+          <code>cacheId</code>，否则可能跨租户复用模型实例
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/model/ModelRegistry.java:108-137">ModelRegistry.java:108-137</span>。
+        </p>
+        <p>
+          <strong>坑六：把 fallback 当负载均衡。</strong><code>fallbackModel</code> 只在主模型失败后接管，并共享重试预算；
+          它不会按成本或延迟轮询
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/agent/config/ModelConfig.java:21-36">ModelConfig.java:21-36</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>要接 DeepSeek，需要额外加一个 DeepSeek 专用 artifact 吗？</summary>
+          <p>
+            不需要。DeepSeek 由 <code>agentscope-extensions-model-openai</code> 里的
+            <code>DeepSeekModelProvider</code> 提供，加 OpenAI 兼容模块后使用 <code>deepseek:&lt;model&gt;</code> 即可
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/src/main/resources/META-INF/services/io.agentscope.core.model.spi.ModelProvider:1-5">ModelProvider:1-5</span>。
+          </p>
+        </details>
+        <details>
+          <summary><code>openai-official</code> 能走 Chat Completions 吗？</summary>
+          <p>
+            目前不能。它通过 OpenAI 官方 Java SDK 只支持 Responses API，未来才考虑 Chat Completions；需要 Chat Completions
+            或兼容网关时用 <code>openai:</code>
+            <span class="src" data-src="docs/v2/zh/integration/model/openai-official.md:6-8">openai-official.md:6-8</span>。
+          </p>
+        </details>
+        <details>
+          <summary><code>fallbackModel</code> 是不是每次都轮询两个模型？</summary>
+          <p>
+            不是。它是故障转移：主模型耗尽重试后，fallback 才接管，并与主模型共享重试预算；不会按请求轮流分配
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/agent/config/ModelConfig.java:21-36">ModelConfig.java:21-36</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：做一次可解释的模型切换</h2>
+        <p>目标不是「跑通一个模型」，而是能写清楚切换前后哪些能力变了。建议 45 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">列能力清单</span>
+            <div>写下你要用的三项能力：工具调用、结构化输出、思考模式；再写清楚是否要求流式。</div>
+          </li>
+          <li>
+            <span class="sh">选两个 provider</span>
+            <div>例如 <code>dashscope:qwen-plus</code> 与 <code>openai:gpt-4.1-mini</code>，分别记录 artifact、凭证与默认端点。</div>
+          </li>
+          <li>
+            <span class="sh">先做解析预检</span>
+            <div>用 <code>ModelRegistry.canResolve</code> 检查两个 id；故意写错一个前缀，记录异常文本。</div>
+          </li>
+          <li>
+            <span class="sh">跑最小对话</span>
+            <div>用同一个 Agent 代码分别切两个 id，确认只有装配变化，Agent 代码不变。</div>
+          </li>
+          <li>
+            <span class="sh">测工具与结构化输出</span>
+            <div>注册一个只读工具，发一个需要工具再返回 JSON 的请求；记录两家是否都调用工具、是否都返回合法结构。</div>
+          </li>
+          <li>
+            <span class="sh">加 fallback</span>
+            <div>设置 <code>maxRetries(3)</code> 与 <code>fallbackModel</code>，用错误 key 触发一次失败，观察是否切到备用模型。</div>
+          </li>
+          <li>
+            <span class="sh">检查缓存边界</span>
+            <div>用两个不同的 <code>apiKey</code> context 解析同一个 id，确认没有复用同一个模型实例。</div>
+          </li>
+          <li>
+            <span class="sh">写三行结论</span>
+            <div>分别写「id 与 artifact」「能力差异」「失败时的降级路径」，确保每一行都能独立核对。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          模型接完，下一章处理「跨会话记住什么」。官方文档把长期记忆收在 <code>LongTermMemory</code> 下，
+          但 2.0.4 源码已把这条路径标成 legacy；第 29 章会把 Mem0、百炼、ReMe 三种实现与这条弃用边界放在一起讲清楚。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>第 29 章 · 记忆接入</td><td>Mem0 / 百炼 / ReMe 的接口、配置与 legacy 边界</td></tr>
+              <tr><td>第 30–31 章 · 分布式与状态存储</td><td>会话状态、文件、快照与并发锁的落点</td></tr>
+              <tr><td>官方「模型提供商」</td><td>各 provider 的依赖、凭证与 builder 选项<span class="src" data-src="docs/v2/zh/integration/model/index.md:6-17">index.md:6-17</span></td></tr>
+              <tr><td><a href="27-extension-ecosystem.html">27 扩展生态总览</a></td><td>接口、artifact 与装配的整体地图</td></tr>
+              <tr><td><a href="25-workflow-automation-issue.html">25 Workflow、自动化与 Issue 闭环</a></td><td>模型失败如何收敛到 Run 与 Issue</td></tr>
+              <tr><td><a href="../appendix/errors.html">附录 B · 报错速查</a></td><td>模型 HTTP、参数与启动错误的定位顺序</td></tr>
+              <tr><td><a href="../appendix/api-cheatsheet.html">附录 C · API 速查</a></td><td>Builder 方法与模型相关参数</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的模型文档在 2.0.4 仓库里仍带「预览」提示；凡文档与实现有出入的地方，正文以源码为准，
+          凭证、端点、默认值与能力位都标了具体出处。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
