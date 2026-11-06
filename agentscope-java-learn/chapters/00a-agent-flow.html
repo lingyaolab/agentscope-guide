@@ -49,11 +49,12 @@
 
         <h2 id="demo">信息流实验室</h2>
         <div class="fd" id="fd">
-          <div class="fd-toolbar">
+          <div class="fd-top">
+            <div class="fd-brand"><span class="fd-pulse" aria-hidden="true"></span><span>AGENT TRACE</span><span class="fd-level" id="fd-level">L1</span></div>
             <div class="fd-modes" role="group" aria-label="选择演示场景">
-              <button type="button" class="fd-mode" data-scenario="minimal" aria-pressed="true">最小</button>
-              <button type="button" class="fd-mode" data-scenario="harness" aria-pressed="false">工程化</button>
-              <button type="button" class="fd-mode" data-scenario="full" aria-pressed="false">全依赖</button>
+              <button type="button" class="fd-mode" data-scenario="minimal" aria-pressed="true">L1 最小</button>
+              <button type="button" class="fd-mode" data-scenario="harness" aria-pressed="false">L2 工程化</button>
+              <button type="button" class="fd-mode" data-scenario="full" aria-pressed="false">L3 全依赖</button>
             </div>
             <div class="fd-controls">
               <button type="button" id="fd-prev">← 上一步</button>
@@ -65,22 +66,40 @@
 
           <p class="fd-blurb" id="fd-blurb"></p>
 
-          <div class="fd-rail" id="fd-rail" aria-label="信息流节点"></div>
+          <div class="fd-grid">
+            <div class="fd-canvas">
+              <div class="fd-canvas-head">
+                <span id="fd-scenario-label">MINIMAL REACT</span>
+                <span class="fd-counter" id="fd-counter">01 / 09</span>
+              </div>
+              <div class="fd-rail-wrap">
+                <div class="fd-track-line" aria-hidden="true"></div>
+                <div class="fd-rail" id="fd-rail" aria-label="信息流节点"></div>
+                <span class="fd-packet" id="fd-packet" aria-hidden="true"></span>
+              </div>
+              <div class="fd-timeline" aria-hidden="true"><i id="fd-bar"></i></div>
+            </div>
 
-          <div class="fd-panel" aria-live="polite">
-            <div class="fd-step" id="fd-step"></div>
-            <h3 class="fd-title" id="fd-title"></h3>
-            <dl class="fd-detail">
-              <dt>输入</dt><dd id="fd-input"></dd>
-              <dt>输出</dt><dd id="fd-output"></dd>
-              <dt>交给谁</dt><dd id="fd-next-node"></dd>
-            </dl>
-            <p class="fd-link" id="fd-link"></p>
+            <aside class="fd-panel" aria-live="polite">
+              <div class="fd-step" id="fd-step"></div>
+              <h3 class="fd-title" id="fd-title"></h3>
+              <dl class="fd-detail">
+                <dt>输入</dt><dd id="fd-input"></dd>
+                <dt>输出</dt><dd id="fd-output"></dd>
+                <dt>交给谁</dt><dd id="fd-next-node"></dd>
+              </dl>
+              <div class="fd-json-wrap">
+                <div class="fd-json-head">payload.json <span>live</span></div>
+                <pre class="fd-json" id="fd-json" data-no-copy></pre>
+              </div>
+              <div class="fd-events" id="fd-events" aria-label="事件轨迹"></div>
+              <p class="fd-link" id="fd-link"></p>
+            </aside>
           </div>
         </div>
         <p class="footnote">
-          提示：节点条可以横向滚动；播放会每 1.4 秒前进一格，到末尾自动停止。
-          在 <code>prefers-reduced-motion</code> 下，高亮仍会切换，但不会平滑滚动。
+          提示：节点按执行顺序排成网格；播放会每 1.4 秒前进一格，到末尾自动停止。
+          在 <code>prefers-reduced-motion</code> 下，高亮仍会切换，但不会平滑滚动或扫光。
         </p>
 
         <h2 id="minimal">最小链路：一次 ReAct 调用</h2>

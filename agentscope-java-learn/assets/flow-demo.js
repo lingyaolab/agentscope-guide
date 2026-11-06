@@ -7,6 +7,8 @@
 
   var SCENARIOS = {
     minimal: {
+      label: "MINIMAL REACT",
+      level: "L1",
       blurb: "最小 ReAct：一条 Msg 进来，模型决定说话或调工具，工具结果回填后再收尾。",
       nodes: [
         {
@@ -94,6 +96,8 @@
     },
 
     harness: {
+      label: "HARNESS PIPELINE",
+      level: "L2",
       blurb: "工程化 Harness：ReAct 循环不变，外面加工作区、中间件链、沙箱、子 Agent 与状态落盘。",
       nodes: [
         {
@@ -190,6 +194,8 @@
     },
 
     full: {
+      label: "FULL STACK",
+      level: "L3",
       blurb: "全依赖：入站、网关、注册 / 配置、工具网关、状态、观测与训练都接上；旁路设施不改变 ReAct 的主循环。",
       nodes: [
         {
@@ -322,6 +328,14 @@
   var outputEl = document.getElementById("fd-output");
   var nextEl = document.getElementById("fd-next-node");
   var linkEl = document.getElementById("fd-link");
+  var counterEl = document.getElementById("fd-counter");
+  var labelEl = document.getElementById("fd-scenario-label");
+  var levelEl = document.getElementById("fd-level");
+  var jsonEl = document.getElementById("fd-json");
+  var eventsEl = document.getElementById("fd-events");
+  var packetEl = document.getElementById("fd-packet");
+  var barEl = document.getElementById("fd-bar");
+  var railWrap = root.querySelector(".fd-rail-wrap");
   var prevBtn = document.getElementById("fd-prev");
   var nextBtn = document.getElementById("fd-next");
   var playBtn = document.getElementById("fd-play");
@@ -374,6 +388,36 @@
     });
   }
 
+  function pad2(n) {
+    return String(n).padStart(2, "0");
+  }
+
+  function positionPacket() {
+    var active = rail.querySelector(".fd-node.active");
+    if (!active || !railWrap) {
+      packetEl.classList.remove("on");
+      return;
+    }
+    var wr = railWrap.getBoundingClientRect();
+    var ar = active.getBoundingClientRect();
+    packetEl.style.left = ar.left - wr.left + ar.width / 2 - 4 + "px";
+    packetEl.classList.add("on");
+  }
+
+  function paintEvents() {
+    if (!eventsEl) return;
+    eventsEl.innerHTML = "";
+    var from = Math.max(0, index - 6);
+    nodes()
+      .slice(from, index + 1)
+      .forEach(function (n) {
+        var chip = document.createElement("span");
+        chip.className = "fd-event";
+        chip.textContent = n.name;
+        eventsEl.appendChild(chip);
+      });
+  }
+
   function select(i) {
     index = Math.max(0, Math.min(nodes().length - 1, i));
     var list = rail.querySelectorAll(".fd-node");
@@ -384,14 +428,29 @@
       else list[k].removeAttribute("aria-current");
     }
     var n = nodes()[index];
-    stepEl.textContent = "第 " + (index + 1) + " / " + nodes().length + " 步";
+    var len = nodes().length;
+    stepEl.textContent = "第 " + (index + 1) + " / " + len + " 步";
+    counterEl.textContent = pad2(index + 1) + " / " + pad2(len);
+    barEl.style.width = ((index + 1) / len) * 100 + "%";
     titleEl.textContent = n.title;
     inputEl.textContent = n.input;
     outputEl.textContent = n.output;
     nextEl.textContent = n.next;
+    jsonEl.textContent = JSON.stringify(
+      {
+        step: index + 1,
+        node: n.name,
+        input: n.input,
+        output: n.output,
+        next: n.next,
+      },
+      null,
+      2
+    );
+    paintEvents();
     linkEl.innerHTML = '对应章节：<a href="' + n.link + '">' + n.linkText + "</a>";
     prevBtn.disabled = index === 0;
-    nextBtn.disabled = index === nodes().length - 1;
+    nextBtn.disabled = index === len - 1;
     var active = list[index];
     if (active) {
       var left = active.offsetLeft - (rail.clientWidth - active.offsetWidth) / 2;
@@ -399,6 +458,7 @@
         rail.scrollTo({ left: Math.max(0, left), behavior: reduce ? "auto" : "smooth" });
       }
     }
+    requestAnimationFrame(positionPacket);
   }
 
   function renderScenario(key) {
@@ -409,6 +469,10 @@
       b.setAttribute("aria-pressed", b.dataset.scenario === key ? "true" : "false");
     });
     blurb.textContent = SCENARIOS[key].blurb;
+    labelEl.textContent = SCENARIOS[key].label;
+    levelEl.textContent = SCENARIOS[key].level;
+    eventsEl.innerHTML = "";
+    jsonEl.textContent = "";
     paintRail();
     select(0);
   }
@@ -460,6 +524,9 @@
       select(index - 1);
     }
   });
+
+  rail.addEventListener("scroll", positionPacket, { passive: true });
+  window.addEventListener("resize", positionPacket);
 
   renderScenario("minimal");
 })();

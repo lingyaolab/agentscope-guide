@@ -944,6 +944,7 @@
   function enhanceCode() {
     document.querySelectorAll(".article pre").forEach(function (pre) {
       if (pre.parentElement.classList.contains("codeblock")) return;
+      if (pre.hasAttribute("data-no-copy")) return;
       var lang = pre.getAttribute("data-lang") || guessLang(pre);
       var file = pre.getAttribute("data-file") || "";
       var wrap = el("div", "codeblock");

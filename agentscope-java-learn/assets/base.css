@@ -831,7 +831,13 @@ th, td {
 
 th { background: var(--bg-panel); font-weight: 600; white-space: nowrap; }
 tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--bg-soft) 60%, transparent); }
-td code { white-space: nowrap; }
+td code {
+  white-space: nowrap;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--fg);
+}
 
 /* ---------- 出处 chip ---------- */
 
