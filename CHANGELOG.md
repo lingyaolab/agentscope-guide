@@ -4,21 +4,21 @@
 
 ## v1.0.0 — 2026-11-05
 
-当前内容：32 页（26 章 + 5 附录 + 首页），零构建纯静态，`file://` 直接可读。
+当前内容：33 页（27 章 + 5 附录 + 首页），零构建纯静态，`file://` 直接可读。
 
 ### 内容
 
 - SDK 地基 11 章（00 学习地图 – 11）
 - Harness 工程能力 7 章（12–18）
-- Service 服务化 8 章路线（19–26）：第 19–25 章已可读——起站与第一个 Managed Agent，发布 Endpoint 与 SSE 调用，Agent 定义与 Workspace / Environment / Memory / Vault 四类资源，已有应用注册为 External Agent 的 HTTP 合约与 ASDP 派发边界，Hosted Agent 的 claim 主循环、provider 能力矩阵与恢复条件，Team 的 Leader 回合、成员委派、策略默认值与结果收敛分层，以及 Workflow 的 draft / revision、八种节点、失败策略，Automation 的 cron / Webhook / 队列，Issue 与 Inbox 的验收闭环
+- Service 服务化 8 章路线（19–26）：第 19–26 章已可读——起站与第一个 Managed Agent，发布 Endpoint 与 SSE 调用，Agent 定义与 Workspace / Environment / Memory / Vault 四类资源，已有应用注册为 External Agent 的 HTTP 合约与 ASDP 派发边界，Hosted Agent 的 claim 主循环、provider 能力矩阵与恢复条件，Team 的 Leader 回合、成员委派、策略默认值与结果收敛分层，Workflow 的 draft / revision、八种节点、失败策略，Automation 的 cron / Webhook / 队列，Issue 与 Inbox 的验收闭环，以及生产环境的 Helm 安装、共享存储、一致备份、升级迁移与恢复验收
 - 集成生态 10 章路线（27–36）已进目录：模型 / 记忆 / 存储 / RAG / 协议 / 渠道 / 技能仓库 / 基础设施，灰显为规划占位
 - 附录 A 术语表、附录 B 报错速查、附录 C API 速查、附录 D 源码地图、附录 E 勘误汇总
 - 附录 E 把 11 章里 60 条「官方文档这么说、2.0.4 源码那么写」抽成一张表，每条带文档与源码双出处
-- 每处数字、默认值与抛错点都带 `file:line` 出处；`check-sources` 2331 条全部可定位
+- 每处数字、默认值与抛错点都带 `file:line` 出处；`check-sources` 2480 条全部可定位
 
 ### 阅读体验
 
-- 全文检索（642 段正文索引）与标题锚点深链
+- 全文检索（664 段正文索引）与标题锚点深链
 - 右侧三级小节目录、手机目录抽屉、窄屏搜索层
 - 阅读设置：正文字号、内容宽度、代码自动换行、目录精简；顶部阅读进度条
 - 暗色主题、`prefers-reduced-motion`、skip link、抽屉 Esc 关闭与焦点回收

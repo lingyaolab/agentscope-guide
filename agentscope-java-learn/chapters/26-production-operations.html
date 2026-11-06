@@ -1,0 +1,748 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 26 章把 AgentScope Service 放进生产：Kubernetes 与 Helm 安装、Secret 与共享存储、数据库 / 卷 / 密钥的一致备份、升级迁移与恢复验收、探针日志和常见故障。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="26 生产部署与运维：K8s、备份、升级、排障 · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 26 章把 AgentScope Service 放进生产：Kubernetes 与 Helm 安装、Secret 与共享存储、数据库 / 卷 / 密钥的一致备份、升级迁移与恢复验收、探针日志和常见故障。"
+    />
+    <title>26 生产部署与运维：K8s、备份、升级、排障 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="26-production-operations" data-root="..">
+    <main>
+      <article class="article">
+        <h1>26 · 生产部署与运维：K8s、备份、升级、排障</h1>
+        <p class="lede">
+          第 19 章用 Docker Compose 在本机起过完整栈，那里最重要的是「能看到五个组件跑起来」。生产环境换了判据：
+          能不能在维护窗口内装好、能不能在数据库或卷损坏后恢复、能不能在升级失败时退回，以及出问题时能不能在十分钟内
+          判断该看哪个组件。这一章只讲生产差异，不重复 Compose 的首次登录流程。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清生产拓扑里四个应用组件、PostgreSQL 和两个 PVC 各自负责什么，以及为什么只暴露 Gateway</li>
+          <li>用 Helm 装出一套可验证的 Service，并解释 <code>existingSecret</code>、<code>publicURL</code> 与存储 values 的作用</li>
+          <li>做出一份真正可恢复的备份：数据库、Workspace、Artifact 与 Vault 密钥属于同一批次</li>
+          <li>在独立空库上完成恢复演练，并按验收清单确认历史、文件、凭据和新任务都正常</li>
+          <li>解释升级时 Go 的启动迁移与 Java 的 Hibernate <code>update</code> 各自改了什么，以及为什么回退镜像不等于回退 schema</li>
+          <li>用探针、日志和症状表把故障定位到具体组件，而不是盲目重启</li>
+        </ul>
+
+        <h2 id="why">分水岭：从「能启动」到「能恢复」</h2>
+        <p>
+          Compose 安装适合本机体验与联调；生产安装则要自己管理 PostgreSQL、持久存储、入口域名和 TLS
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:10">kubernetes.md:10</span>。
+          这条边界带来三个硬约束，后面所有章节都围绕它们展开。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>约束</th><th>Compose 体验</th><th>生产现实</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>更新方式</td>
+                <td>重建容器，短暂中断可以接受</td>
+                <td>Chart 每个组件默认单副本并采用 <code>Recreate</code>，升级必须安排维护窗口<span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:28-31">planes.yaml:28-31</span></td>
+              </tr>
+              <tr>
+                <td>共享文件</td>
+                <td>本机命名卷即可</td>
+                <td>Workspace 要被多个组件跨节点挂载，必须 RWX；只有单节点可用的 RWO 卷不能替代<span class="src" data-src="docs/v2/zh/service/kubernetes.md:14">kubernetes.md:14</span></td>
+              </tr>
+              <tr>
+                <td>数据恢复</td>
+                <td>删掉卷重新初始化</td>
+                <td>数据库、Workspace、Artifact 和解密密钥必须同批备份，缺一项都不算可恢复<span class="src" data-src="docs/v2/zh/service/operations.md:10">operations.md:10</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="ct">先接受「有停机」</span>
+          <p>
+            当前 Chart 的单副本安装不提供无停机迁移或多副本 HA 保证
+            <span class="src" data-src="docs/v2/zh/service/kubernetes.md:83">kubernetes.md:83</span>。
+            如果你的业务要求零停机升级，需要先改架构并单独验证，而不是调大副本数就宣布解决。
+          </p>
+        </div>
+
+        <h2 id="topology">生产拓扑：四个组件、一个数据库、两个卷</h2>
+        <p>
+          端口与暴露方式沿用 Compose 版本：Gateway 对外 8080，Control、Dataplane、Scheduler 分别监听 8081、8082、8083，
+          PostgreSQL 在内部网络 5432
+          <span class="src" data-src="docs/v2/zh/service/quickstart.md:54-60">quickstart.md:54-60</span>。
+          Helm Chart 用同一组端口创建四个 Deployment 和四个 Service，只有 Gateway 的 Service 类型跟随 values，其余固定为 ClusterIP
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:18">planes.yaml:18</span>
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:151-155">planes.yaml:151-155</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>组件</th><th>端口</th><th>对外</th><th>排障时先看什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Gateway</td><td>8080</td><td>是（可经 Ingress / 反向代理）</td><td>只证明入口可达，不代表模型或工具执行正常</td></tr>
+              <tr><td>Control</td><td>8081</td><td>否</td><td>产品 Automation、资源、账号与编排派发</td></tr>
+              <tr><td>Dataplane</td><td>8082</td><td>否</td><td>Managed 会话、模型调用与工具执行</td></tr>
+              <tr><td>Scheduler</td><td>8083</td><td>否</td><td>渠道消息与 Worker 调度</td></tr>
+              <tr><td>PostgreSQL</td><td>5432</td><td>否</td><td>连接、schema、备份与恢复目标</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          组件分工来自官方排障指南：Gateway 正常不代表模型或工具执行正常；Managed 会话看 Dataplane，渠道与 Worker 调度看 Scheduler，
+          产品 Automation、资源、账号和编排派发看 Control
+          <span class="src" data-src="docs/v2/zh/service/troubleshooting.md:34">troubleshooting.md:34</span>。
+        </p>
+        <p>
+          启动顺序也有依赖：Dataplane 的 initContainer 先等 Control 的 <code>/healthz</code>，Scheduler 再等 Dataplane 的
+          <code>/actuator/health</code>
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:61-75">planes.yaml:61-75</span>。
+          所以 Control 起不来时，看到 Dataplane 和 Scheduler 也卡在 Init 是预期现象，不要逐个 Pod 重启。
+        </p>
+
+        <h2 id="prereq">安装前置：存储、数据库与版本三件事</h2>
+        <p>
+          官方前置清单很短，但任何一项缺失都会让安装停在 Pending 或直接启动失败：Kubernetes、Helm、可达的 PostgreSQL，以及 Workspace 所需的
+          RWX StorageClass 或已有共享 PVC；Artifact 默认只用 RWO
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:14">kubernetes.md:14</span>。
+          发布包还要先用 <code>SHA256SUMS</code> 校验，再用应用数据库所有者在目标库执行 <code>postgres-init.sql</code>，
+          创建 <code>cp</code>、<code>rt</code>、<code>dp</code> 三个 schema
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:16">kubernetes.md:16</span>。
+        </p>
+        <p>
+          Chart 与组件镜像版本必须配套：可以用发布包里的 OCI Chart 地址加 <code>--version</code> 安装，也可以改用下载的
+          <code>.tgz</code>；私有仓库要先完成 Helm registry 登录
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:68">kubernetes.md:68</span>。
+          发布物本身包含四个镜像：control、gateway、dataplane、scheduler，控制台随 control 镜像交付
+          <span class="src" data-src="docs/v2/zh/service/releasing.md:14">releasing.md:14</span>。
+        </p>
+        <div class="callout">
+          <span class="ct">别把两个 Chart 叠起来</span>
+          <p>
+            这套 Chart 运行的是 standalone HTTP 模式，不带 Kubernetes-native 控制器，也不暴露 ASDP gRPC
+            <span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:23-24">values.yaml:23-24</span>。
+            需要 CRD 或 SDK 的 ASDP 派发时，应按另一套部署模式规划，不要把两个 Chart 直接装成同一个服务
+            <span class="src" data-src="docs/v2/zh/service/kubernetes.md:83">kubernetes.md:83</span>。
+          </p>
+        </div>
+
+        <h2 id="secret">Secret：密钥只进集群，不进 values</h2>
+        <p>
+          官方流程是把 <code>kubernetes.env.example</code> 复制到私有文件，替换全部占位值，再用
+          <code>--from-env-file</code> 创建 Secret；URI 里的密码要 URL 编码，JDBC 密码单独提供原值
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:20">kubernetes.md:20</span>。
+          Secret 是运行配置，不能把明文文件或渲染结果提交到仓库
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:27">kubernetes.md:27</span>。
+        </p>
+        <pre data-lang="bash" data-file="创建运行 Secret（示意）">kubectl create namespace agentscope
+kubectl -n agentscope create secret generic agentscope-service \
+  --from-env-file=/private/path/service.env</pre>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>变量</th><th>约束</th><th>为什么容易错</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>BUILDER_JWT_SECRET</code></td><td>至少 32 字符</td><td>服务启动时会直接校验，短于 32 字符拒绝启动<span class="src" data-src="agentscope-service/aistio/internal/product/server.go:147-150">server.go:147-150</span></td></tr>
+              <tr><td><code>AISTIO_BOOTSTRAP_PASSWORD</code></td><td>12–72 字节</td><td>bcrypt 上限 72 字节；配置 bootstrap 管理员时必须关闭 <code>AISTIO_SEED_USERS</code><span class="src" data-src="agentscope-service/aistio/internal/product/bootstrap.go:30-36">bootstrap.go:30-36</span></td></tr>
+              <tr><td><code>BUILDER_VAULT_MASTER_KEY</code></td><td>各组件一致，随数据备份</td><td>只恢复数据库但换掉密钥，已有凭据无法解密<span class="src" data-src="docs/v2/zh/service/configuration.md:23">configuration.md:23</span></td></tr>
+              <tr><td>数据库 DSN 中的密码</td><td>URL 编码</td><td>URI 与 JDBC 是两种解析方式，JDBC 密码要单独给原值<span class="src" data-src="docs/v2/zh/service/kubernetes.md:20">kubernetes.md:20</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          Secret 只注入 Control、Dataplane 和 Scheduler；Gateway 不挂 <code>envFrom</code>
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:89-92">planes.yaml:89-92</span>。
+          需要排障时先确认变量落在哪个 Pod，而不是在 Gateway 上找一个根本不存在的环境变量。
+        </p>
+
+        <h2 id="values">values：存储、入口与资源预算</h2>
+        <p>
+          官方给了一份可直接改的起点：<code>existingSecret</code> 指向刚建的 Secret，<code>allowLocalEnvironment</code>
+          保持 <code>false</code>，<code>publicURL</code> 填真实外部地址，Workspace 用共享 RWX StorageClass，Artifact 用普通 RWO
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:34-50">kubernetes.md:34-50</span>。
+        </p>
+        <pre data-lang="yaml" data-file="production-values.yaml（示意）">existingSecret: agentscope-service
+allowLocalEnvironment: false
+publicURL: https://agentscope.example.com
+persistence:
+  workspaces:
+    storageClass: shared-rwx
+    size: 20Gi
+  artifacts:
+    storageClass: standard
+    size: 20Gi
+ingress:
+  enabled: true
+  className: nginx
+  host: agentscope.example.com
+  tls:
+    - hosts: [agentscope.example.com]
+      secretName: agentscope-service-tls</pre>
+        <p>
+          Chart 自己的默认值更保守：Workspace 与 Artifact 都只要 10Gi，Workspace 访问模式是
+          <code>ReadWriteMany</code>，Artifact 是 <code>ReadWriteOnce</code>，Ingress 默认关闭，Service 默认 ClusterIP
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:26-40">values.yaml:26-40</span>
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:57-62">values.yaml:57-62</span>。
+          已有 PVC 时设置 <code>existingClaim</code>，Chart 就不会再创建同名 PVC。
+        </p>
+        <p>
+          资源默认值是 requests 与 limits 的组合：Control 100m / 256Mi 起、内存上限 1Gi；Dataplane 250m / 512Mi 起、
+          内存上限 2Gi；Scheduler 100m / 512Mi 起、上限 1Gi；Gateway 100m / 256Mi 起、上限 1Gi
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:41-56">values.yaml:41-56</span>。
+          这些只是起点，官方要求按实际任务负载压测定容
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:53">kubernetes.md:53</span>。
+        </p>
+
+        <h2 id="install">安装：一条 Helm 命令与一次用户路径验证</h2>
+        <p>
+          安装命令把 Chart 版本、镜像仓库和 values 固定在一起，<code>--wait --timeout 10m</code> 让 Helm 等到资源就绪或超时失败
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:59-66">kubernetes.md:59-66</span>。
+          镜像 tag 默认取 Chart 的 <code>appVersion</code>，除非显式设置 <code>imageTag</code>
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:17-18">values.yaml:17-18</span>。
+        </p>
+        <pre data-lang="bash" data-file="安装指定版本（示意）">helm upgrade --install service oci://REGISTRY/NAMESPACE/charts/agentscope-service \
+  --version VERSION \
+  --namespace agentscope \
+  --set imageRepository=REGISTRY/NAMESPACE \
+  -f production-values.yaml \
+  --wait --timeout 10m</pre>
+        <p>装完不要只看 Helm 的退出码，按下面的顺序验证：</p>
+        <pre data-lang="bash" data-file="安装后检查（示意）">kubectl -n agentscope get pods,pvc,svc,ingress
+kubectl -n agentscope port-forward service/service-agentscope-gateway 18080:8080</pre>
+        <p>
+          确认 PVC 已 Bound、Pod Ready，再用初始管理员登录公开域名并修改密码；随后验证模型连接、执行 Environment、第一次 Chat、
+          Issue 交付和长连接。port-forward 只用于排障，不能替代公开回调地址的验证
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:72-77">kubernetes.md:72-77</span>。
+        </p>
+
+        <h2 id="exposure">入口：只暴露 Gateway，并为 SSE 留出超时</h2>
+        <p>
+          Compose 默认把 Gateway 绑在 <code>127.0.0.1:18080</code>，只向用户暴露 Gateway，内部组件和数据库留在私网
+          <span class="src" data-src="docs/v2/zh/service/quickstart.md:54-60">quickstart.md:54-60</span>
+          <span class="src" data-src="docs/v2/zh/service/quickstart.md:62">quickstart.md:62</span>。
+          Kubernetes 下同样只有 Gateway 的 Service 类型可配置，其余固定 ClusterIP
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:151-155">planes.yaml:151-155</span>。
+        </p>
+        <p>
+          需要远程访问时，把 HTTPS 反向代理指向 Gateway，并把 <code>BUILDER_OAUTH_PUBLIC_URL</code> 设成真实公开 origin；
+          OAuth 回调和渠道回调都依赖它
+          <span class="src" data-src="docs/v2/zh/service/configuration.md:28">configuration.md:28</span>
+          <span class="src" data-src="docs/v2/zh/service/quickstart.md:66">quickstart.md:66</span>。
+          代理必须及时转发 SSE 事件、不缓存事件流，并设置足够长的读取超时；验证时要覆盖登录、长回复、刷新重连和回调，
+          不能只验证首页能打开
+          <span class="src" data-src="docs/v2/zh/service/quickstart.md:68">quickstart.md:68</span>。
+        </p>
+        <p>
+          Ingress 的 TLS Secret 必须预先存在，或由证书控制器创建；SSE 相关的超时与缓冲行为要按实际 Ingress controller
+          调整 annotations
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:31">kubernetes.md:31</span>
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:53">kubernetes.md:53</span>。
+          一个「能打开首页但长回复总断」的故障，通常就出在这层。
+        </p>
+
+        <h2 id="data">数据面：三个 schema、两个卷与一份密钥</h2>
+        <p>
+          PostgreSQL 被拆成三个 schema：<code>cp</code> 给控制面产品库，<code>rt</code> 给运行状态库，<code>dp</code>
+          给 Java 的 JDBC 连接
+          <span class="src" data-src="docs/v2/zh/service/configuration.md:18-20">configuration.md:18-20</span>。
+          <code>postgres-init.sql</code> 只做三件事：<code>CREATE SCHEMA IF NOT EXISTS</code>，从不删除已有数据
+          <span class="src" data-src="agentscope-service/deploy/postgres-init.sql:1-4">postgres-init.sql:1-4</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>数据</th><th>落在哪</th><th>备份方式</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>产品、运行状态、Java 表</td><td>PostgreSQL 的 <code>cp</code> / <code>rt</code> / <code>dp</code></td><td><code>pg_dump -Fc</code> 或数据库快照</td></tr>
+              <tr><td>Workspace 文件</td><td><code>/data/workspaces</code>，RWX PVC</td><td>存储快照或卷级备份</td></tr>
+              <tr><td>Artifact</td><td><code>/data/artifacts</code>，RWO PVC</td><td>与 Workspace 同批快照</td></tr>
+              <tr><td>Vault 凭据密文</td><td>数据库内，依赖 <code>BUILDER_VAULT_MASTER_KEY</code> 解密</td><td>备份密钥本身</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Compose 版本把 PostgreSQL、共享 Workspace 和 Artifact 分别放在三个命名卷里
+          <span class="src" data-src="docs/v2/zh/service/quickstart.md:72">quickstart.md:72</span>。
+          Chart 会给 Workspace 和 Artifact 各建一个 PVC，并打上 <code>helm.sh/resource-policy: keep</code>，
+          所以卸载 Chart 不会删除数据卷；重新安装时要显式指定保留的 <code>existingClaim</code>
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/persistence.yaml:20-25">persistence.yaml:20-25</span>
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:81">kubernetes.md:81</span>。
+        </p>
+        <div class="callout danger">
+          <span class="ct">内存存储不是生产选项</span>
+          <p>
+            Control 的 <code>--storage-driver</code> 默认是 <code>memory</code>，只适合开发与测试，重启后会话、事件和 Team 数据都会丢；
+            生产必须显式使用 <code>postgres</code>
+            <span class="src" data-src="agentscope-service/aistio/cmd/aistiod/main.go:420-423">main.go:420-423</span>。
+            源码在内存模式下还会打印明确警告
+            <span class="src" data-src="agentscope-service/aistio/cmd/aistiod/main.go:520">main.go:520</span>。
+          </p>
+        </div>
+        <p>
+          Java 侧默认使用 Hibernate <code>update</code> 自动改表，但源码注释明确写着：生产环境应使用 Flyway / Liquibase 固定 schema，
+          再把 <code>BUILDER_JPA_DDL_AUTO</code> 切到 <code>validate</code>
+          <span class="src" data-src="agentscope-service/service-dataplane/src/main/resources/application.yml:20-24">application.yml:20-24</span>。
+          <code>validate</code> 只校验已有表，不会初始化新库；只有在你自行管理 schema 时才使用
+          <span class="src" data-src="docs/v2/zh/service/configuration.md:40">configuration.md:40</span>。
+        </p>
+
+        <h2 id="backup">备份：数据库、文件、密钥必须同批</h2>
+        <p>
+          一份可恢复的备份包括数据库、Workspace、Artifact，以及解密这些数据所需的密钥
+          <span class="src" data-src="docs/v2/zh/service/operations.md:10">operations.md:10</span>。
+          Compose 的官方步骤是：安排维护窗口，先停四个应用组件、保留数据库运行，再做数据库导出和卷快照。
+        </p>
+        <pre data-lang="bash" data-file="Compose 一致性备份（示意）">docker compose stop gateway scheduler data control
+mkdir -p backup &amp;&amp; chmod 700 backup
+docker compose exec -T db pg_dump -U agentscope -d agentscope -Fc &gt; backup/database.dump</pre>
+        <p>
+          然后用卷备份工具为 <code>workspaces</code>、<code>artifacts</code> 命名卷做快照，保存 <code>.env</code>，
+          记录 <code>SERVICE_VERSION</code>、镜像 digest 和快照时间；备份目录要放在安装目录之外的受保护持久存储中。
+          确认数据库备份与文件快照属于同一维护窗口后，再启动应用
+          <span class="src" data-src="docs/v2/zh/service/operations.md:23">operations.md:23</span>
+          <span class="src" data-src="docs/v2/zh/service/operations.md:25-27">operations.md:25-27</span>。
+        </p>
+        <p>
+          Kubernetes 同理：数据库备份加 PVC 快照，按存储提供程序选择快照方式，并保存配置 Secret 的受保护副本
+          <span class="src" data-src="docs/v2/zh/service/operations.md:29">operations.md:29</span>。
+          不要只备份数据库，也不要只备份卷：Vault 密文在数据库里，没有原密钥就解不开；文件路径在数据库里，
+          只恢复文件也无法还原归属<span class="src" data-src="agentscope-service/aistio/internal/product/handlers_vault.go:288-290">handlers_vault.go:288-290</span>。
+        </p>
+
+        <h2 id="restore">恢复：先造空库，再按同一批次还原</h2>
+        <p>
+          需要回退数据时，先停止应用写入；在独立空数据库中恢复备份，恢复同一批 Workspace / Artifact 快照与原 Vault 密钥，
+          再用备份对应的组件版本启动。<code>pg_restore --clean</code> 绝不能指向仍在使用的业务数据库
+          <span class="src" data-src="docs/v2/zh/service/operations.md:39">operations.md:39</span>。
+        </p>
+        <pre data-lang="bash" data-file="恢复到新数据库（示意）">pg_restore --no-owner --no-acl --dbname="$RESTORE_DATABASE_URL" backup/database.dump</pre>
+        <p>
+          恢复到同一 PostgreSQL 实例中的新数据库后，在 Compose 的 <code>.env</code> 里把 <code>POSTGRES_DB</code>
+          指向恢复库，并使用原密钥和同批文件快照启动。数据库容器只在数据目录为空时初始化数据库，已有实例里的恢复库需要预先创建
+          <span class="src" data-src="docs/v2/zh/service/operations.md:47">operations.md:47</span>。
+        </p>
+        <p>
+          恢复验收至少覆盖：管理员登录、已有 Agent 与 Session 历史、Workspace 文件、Vault 凭据解密、运行时连接，
+          以及一项新的小任务；Task 与 Issue 的验收状态应与备份时刻相符
+          <span class="src" data-src="docs/v2/zh/service/operations.md:51">operations.md:51</span>。
+          只有数据库、文件和密钥都能共同恢复，备份才算通过验证
+          <span class="src" data-src="docs/v2/zh/service/operations.md:53">operations.md:53</span>。
+        </p>
+
+        <h2 id="upgrade">升级：先备份，再接受一次维护窗口</h2>
+        <p>
+          升级前先读新版本的迁移与兼容性说明，在测试数据库副本上演练，然后完成备份。Docker 修改 <code>.env</code>
+          里的 <code>SERVICE_VERSION</code>，拉取镜像并重建容器；Helm 用指定版本的 Chart 执行 upgrade
+          <span class="src" data-src="docs/v2/zh/service/operations.md:33">operations.md:33</span>。
+          由于 Chart 是单副本加 <code>Recreate</code>，升级期间该组件会先停后起，不能当作滚动更新
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:28-31">planes.yaml:28-31</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>组件</th><th>迁移方式</th><th>升级时要看什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Go 控制面</td><td>启动时执行产品库与运行状态库迁移</td><td>迁移失败会直接阻止启动<span class="src" data-src="agentscope-service/aistio/internal/product/server.go:162-165">server.go:162-165</span> <span class="src" data-src="agentscope-service/aistio/internal/store/factory.go:33-49">factory.go:33-49</span></td></tr>
+              <tr><td>Java Dataplane / Scheduler</td><td>Hibernate <code>update</code>，默认 <code>dp</code> schema</td><td>表结构变更不保证可逆<span class="src" data-src="agentscope-service/service-dataplane/src/main/resources/application.yml:20-24">application.yml:20-24</span></td></tr>
+              <tr><td>Chart 与镜像</td><td>Chart <code>appVersion</code> 决定默认镜像 tag</td><td>版本必须配套，不能只升一半<span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:17-18">values.yaml:17-18</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Go 迁移会在 PostgreSQL advisory lock 下串行执行，已应用版本记录在 <code>schema_migrations</code>，
+          普通迁移包在事务里提交，失败会回滚
+          <span class="src" data-src="agentscope-service/aistio/internal/store/postgres/migrate.go:30-53">migrate.go:30-53</span>
+          <span class="src" data-src="agentscope-service/aistio/internal/store/postgres/migrate.go:97-112">migrate.go:97-112</span>。
+          这保证多个组件同时启动时不会重复改表，但不保证新 schema 能被旧版本读取。
+        </p>
+        <div class="callout warn">
+          <span class="ct">回退镜像 ≠ 回退 schema</span>
+          <p>
+            组件镜像回退不保证旧版本可以读取新 schema
+            <span class="src" data-src="docs/v2/zh/service/operations.md:35">operations.md:35</span>。
+            所以升级前的数据库备份不是「以防万一」，而是唯一的回退路径；演练时要连恢复步骤一起计时。
+          </p>
+        </div>
+
+        <h2 id="verify">验收：升级与恢复都要跑同一套事实检查</h2>
+        <p>
+          官方建议用固定案例做升级回归：升级前保存样例知识与验收结果，在隔离的恢复环境里执行同一组问题。模型措辞可以不同，
+          但事实和持久化结果必须可核对
+          <span class="src" data-src="docs/v2/zh/service/operations.md:59-61">operations.md:59-61</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>检查</th><th>验收依据</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>知识恢复</td><td>文档正文与备份一致，Agent 实际读取成功<span class="src" data-src="docs/v2/zh/service/operations.md:65">operations.md:65</span></td></tr>
+              <tr><td>文件恢复</td><td>原 Artifact 可下载，内容与备份记录一致<span class="src" data-src="docs/v2/zh/service/operations.md:66">operations.md:66</span></td></tr>
+              <tr><td>新任务</td><td>新 Invocation / Run 完成，引用正确来源，没有把未确认能力写成承诺<span class="src" data-src="docs/v2/zh/service/operations.md:67">operations.md:67</span></td></tr>
+              <tr><td>历史</td><td>升级前的 Issue、事件与验收状态仍能查看<span class="src" data-src="docs/v2/zh/service/operations.md:68">operations.md:68</span></td></tr>
+              <tr><td>Host 与自动化</td><td>在测试目标上分别运行研发与订单履约案例，检查关联记录<span class="src" data-src="docs/v2/zh/service/operations.md:69">operations.md:69</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          记录升级前后版本、备份批次、用例输入、执行 ID 和差异；只在需要对应集成时验证其凭据可用性
+          <span class="src" data-src="docs/v2/zh/service/operations.md:71">operations.md:71</span>。
+          知识读取案例本身不碰外部凭据，不能证明 Vault 解密路径也已经验证
+          <span class="src" data-src="docs/v2/zh/service/operations.md:71">operations.md:71</span>。
+        </p>
+
+        <h2 id="rollout">重新开放：先受控，再逐级放量</h2>
+        <p>
+          恢复或升级完成后，先保持定时规则和外部入口受控，在测试工作上验证登录、历史、文件和凭据；确认 Runtime Host
+          重新上线，再逐个恢复计划触发与业务流量
+          <span class="src" data-src="docs/v2/zh/service/operations.md:57">operations.md:57</span>。
+          这一步的顺序不能反：入口先全开，故障会直接落到真实用户。
+        </p>
+        <p>
+          数据库快照恢复不会撤销备份之后已经发出的消息或外部写入；要对照业务系统核对幂等记录和未完成工作，再决定是否重跑
+          <span class="src" data-src="docs/v2/zh/service/operations.md:57">operations.md:57</span>。
+          尤其注意 Workflow 的 Rerun 和 Webhook 的 Replay：它们都会产生新的执行机会，可能重复业务副作用
+          <span class="src" data-src="docs/v2/zh/service/workflows.md:53">workflows.md:53</span>
+          <span class="src" data-src="docs/v2/zh/service/automation.md:73">automation.md:73</span>。
+        </p>
+
+        <h2 id="health">可观测性：探针、启动顺序与日志归属</h2>
+        <p>
+          Helm 为四个组件都配置了 startup、readiness 和 liveness 探针：Control 用 <code>/healthz</code>，其余用
+          <code>/actuator/health</code>；startup 每 5 秒一次、失败阈值 120，相当于最多给 600 秒启动时间
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:113-122">planes.yaml:113-122</span>。
+          Compose 的健康检查则是 10 秒间隔、5 秒超时、30 次重试、60 秒启动宽限
+          <span class="src" data-src="agentscope-service/deploy/compose.yaml:34-39">compose.yaml:34-39</span>。
+        </p>
+        <p>
+          Control 的健康检查是本地 HTTP 探测：<code>/aistiod --healthcheck</code> 请求本地 <code>/healthz</code>，
+          非 200 就退出 1
+          <span class="src" data-src="agentscope-service/aistio/cmd/aistiod/main.go:391-392">main.go:391-392</span>
+          <span class="src" data-src="agentscope-service/aistio/cmd/aistiod/main.go:462-468">main.go:462-468</span>。
+          但要看清它探测的是什么：源码里 <code>/healthz</code> 只返回 <code>status: ok</code>，真正会 Ping 存储的是
+          <code>/readyz</code>
+          <span class="src" data-src="agentscope-service/aistio/internal/httpapi/server.go:1143-1155">server.go:1143-1155</span>。
+          而 Chart 对 Control 的 readiness 仍使用 <code>/healthz</code>
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:113-119">planes.yaml:113-119</span>。
+          所以数据库掉线时 Pod 可能依旧 Ready，这时要看 Control 日志和 <code>/readyz</code>，不能只看 Pod 状态。
+        </p>
+        <pre data-lang="bash" data-file="取组件日志（示意）">docker compose logs --tail=200 control data scheduler gateway
+kubectl -n agentscope logs deployment/service-agentscope-control --tail=200
+kubectl -n agentscope describe pod POD_NAME</pre>
+        <p>
+          日志默认是 JSON，本地开发可以用 <code>--log-format=console</code> 或 <code>AGENTSCOPE_DEV_LOG=true</code> 切到人类可读格式；
+          控制面还支持 <code>--otel-endpoint</code> 和 0–1 的采样率
+          <span class="src" data-src="agentscope-service/aistio/cmd/aistiod/main.go:384-386">main.go:384-386</span>。
+          共享日志前先移除令牌、密码和业务敏感内容
+          <span class="src" data-src="docs/v2/zh/service/troubleshooting.md:10">troubleshooting.md:10</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>保留项</th><th>默认窗口</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Session 事件</td><td><code>0</code></td><td>0 表示保留完整历史<span class="src" data-src="agentscope-service/aistio/cmd/aistiod/main.go:427">main.go:427</span></td></tr>
+              <tr><td>Session 快照</td><td>30 天</td><td>会话快照<span class="src" data-src="agentscope-service/aistio/internal/store/filter.go:179">filter.go:179</span></td></tr>
+              <tr><td>上下文快照</td><td>14 天</td><td>完整 context 快照<span class="src" data-src="agentscope-service/aistio/internal/store/filter.go:180">filter.go:180</span></td></tr>
+              <tr><td>Token / Agent 指标</td><td>90 天</td><td>保留时间最长的一类<span class="src" data-src="agentscope-service/aistio/internal/store/filter.go:181">filter.go:181</span></td></tr>
+              <tr><td>Bus 队列 / 日志</td><td>7 天 / 3 天</td><td>未消费队列与回放日志<span class="src" data-src="agentscope-service/aistio/internal/store/filter.go:182-183">filter.go:182-183</span></td></tr>
+              <tr><td>异步工具 / Sandbox 快照 / 终止任务</td><td>各 7 天</td><td>可通过启动参数调整<span class="src" data-src="agentscope-service/aistio/internal/store/filter.go:184-186">filter.go:184-186</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          保留期全部来自 <code>DefaultRetention</code>，可用 <code>--retention-*</code> 启动参数覆盖
+          <span class="src" data-src="agentscope-service/aistio/internal/store/filter.go:176-187">filter.go:176-187</span>
+          <span class="src" data-src="agentscope-service/aistio/cmd/aistiod/main.go:427-439">main.go:427-439</span>。
+          调大之前先算磁盘：这些表与业务表在同一个 PostgreSQL 实例里。
+        </p>
+
+        <h2 id="troubleshoot">排障：先定位组件，再改配置</h2>
+        <p>
+          从发生问题的工作记录开始，记录版本、时间、Session / Task / Attempt / Run ID，再检查相关组件
+          <span class="src" data-src="docs/v2/zh/service/troubleshooting.md:10">troubleshooting.md:10</span>。
+          下面这组症状覆盖了安装、登录、执行和入口四条主线。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>现象</th><th>优先检查</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>镜像拉取失败</td><td>发布清单中的仓库命名空间、标签、登录与 CPU 架构<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:14">troubleshooting.md:14</span></td></tr>
+              <tr><td>容器健康检查失败</td><td><code>docker compose ps</code>、数据库状态和失败组件日志<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:15">troubleshooting.md:15</span></td></tr>
+              <tr><td>Helm Pod Pending</td><td>PVC 是否 Bound、StorageClass 是否支持所需访问模式<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:16">troubleshooting.md:16</span></td></tr>
+              <tr><td>登录失败</td><td>用的是 bootstrap 密码还是旧账号密码、数据库是否已有账号<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:17">troubleshooting.md:17</span></td></tr>
+              <tr><td>Local Environment 被拒绝</td><td>是否显式启用 Local；是否应改用 Sandbox / Self-hosted<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:18">troubleshooting.md:18</span></td></tr>
+              <tr><td>Agent 不回复</td><td>模型凭据、环境绑定、工具确认、Dataplane 日志<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:19">troubleshooting.md:19</span></td></tr>
+              <tr><td>Team 等待不结束</td><td>未完成成员任务、缺少输入、待审批或交付评审<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:20">troubleshooting.md:20</span></td></tr>
+              <tr><td>刷新后历史丢失</td><td>是否误用了 memory 存储、数据库与原卷是否一致<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:21">troubleshooting.md:21</span></td></tr>
+              <tr><td>OAuth 回调失败</td><td>公开 origin、平台回调 URL、HTTPS 可达性<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:22">troubleshooting.md:22</span></td></tr>
+              <tr><td>Runtime Host 离线</td><td>provider 是否安装可运行、Host 凭据、网络和 daemon 日志<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:23">troubleshooting.md:23</span></td></tr>
+              <tr><td>SDK gRPC 连接失败</td><td>当前部署是否启用 Kubernetes-native ASDP，端口是否正确<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:24">troubleshooting.md:24</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <strong>登录失败先别重生成 <code>.env</code>。</strong>重启不会重置管理员密码，这是预期行为；
+          <code>AISTIO_BOOTSTRAP_PASSWORD</code> 只用于空账号表，已有账号要通过 Profile 或管理员账号管理修改
+          <span class="src" data-src="docs/v2/zh/service/troubleshooting.md:36-38">troubleshooting.md:36-38</span>。
+        </p>
+        <p>
+          <strong>Vault 解密失败先找原密钥。</strong>检查恢复时是否保留了原 <code>BUILDER_VAULT_MASTER_KEY</code>，
+          以及各组件是否一致；不要通过随意替换密钥来修复
+          <span class="src" data-src="docs/v2/zh/service/troubleshooting.md:40-42">troubleshooting.md:40-42</span>。
+        </p>
+        <p>
+          <strong>收到任务但没有最终结果，先看执行链。</strong>从 Issue 的 Executions 判断 Run、Node 和最新 Attempt，
+          而不是看最后一条文字；waiting 查依赖、approval 或 signal，blocked 补信息，failed 看错误和部分产物。
+          Inbox 的 Request changes 不会自动启动执行
+          <span class="src" data-src="docs/v2/zh/service/troubleshooting.md:44-46">troubleshooting.md:44-46</span>。
+        </p>
+        <p>
+          <strong>重复请求先查幂等记录。</strong>先查询已有 Delivery / Invocation 的状态；同一逻辑请求保持同一幂等键和内容，
+          只有新业务请求才换 key。事件被过滤看 trigger 的 event 配置，请求被拒绝看认证头和 schema，
+          SSE 断线后先查返回的 statusUrl
+          <span class="src" data-src="docs/v2/zh/service/troubleshooting.md:48-50">troubleshooting.md:48-50</span>。
+        </p>
+
+        <h2 id="boundaries">生产边界：单副本、最小暴露与资源预算</h2>
+        <p>
+          当前 Chart 每个组件只跑一个副本，升级策略是 <code>Recreate</code>，注释写得很直接：DDL 与共享文件系统的高可用需要单独验证
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:28-31">planes.yaml:28-31</span>。
+          官方也重复了同一结论：不提供多副本 HA 或无停机升级保证
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:83">kubernetes.md:83</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>边界</th><th>当前做法</th><th>你要补什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>运行身份</td><td><code>runAsNonRoot</code>，UID/GID 65532，丢弃全部 capabilities，不挂 ServiceAccount token<span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:42-48">planes.yaml:42-48</span></td><td>确认卷权限允许 65532 读写</td></tr>
+              <tr><td>本地执行</td><td><code>allowLocalEnvironment</code> 默认 <code>false</code><span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:25">values.yaml:25</span></td><td>只在可信安装中开启，并接受 shell 运行在容器内</td></tr>
+              <tr><td>凭据</td><td>通过 <code>existingSecret</code> 注入，values 里不写明文<span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:21-22">values.yaml:21-22</span></td><td>Secret 的访问控制、轮换与备份</td></tr>
+              <tr><td>入口</td><td>只有 Gateway 可能对外，其余 ClusterIP<span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:151-155">planes.yaml:151-155</span></td><td>Ingress / 反代 / 网络策略与 TLS</td></tr>
+              <tr><td>数据卷</td><td>PVC 带 keep 注解，卸载不删卷<span class="src" data-src="agentscope-service/helm/agentscope-service/templates/persistence.yaml:20-25">persistence.yaml:20-25</span></td><td>快照策略与恢复演练</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          资源预算同样要自己补：Chart 给的 requests / limits 只是起点，官方要求按实际任务负载压测定容
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:53">kubernetes.md:53</span>。
+          Dataplane 承担模型与工具执行，应是资源预算的重点；Control 承担编排与产品 API；Scheduler 负责调度。
+          不要平均分配，也不要只调 limits 不给 requests。
+        </p>
+
+        <h2 id="cheatsheet">速查：端口、默认值与命令</h2>
+        <p>先看组件与检查点：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>值 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Gateway 端口</td><td>容器 8080，Compose 默认宿主 <code>127.0.0.1:18080</code></td><td><span class="src" data-src="docs/v2/zh/service/quickstart.md:54-60">quickstart.md:54-60</span></td></tr>
+              <tr><td>Control / Dataplane / Scheduler</td><td>8081 / 8082 / 8083，内部网络</td><td><span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:18">planes.yaml:18</span></td></tr>
+              <tr><td>Control 健康检查</td><td><code>/healthz</code> + <code>/aistiod --healthcheck</code></td><td><span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:113-114">planes.yaml:113-114</span></td></tr>
+              <tr><td>Java 健康检查</td><td><code>/actuator/health</code></td><td><span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:113-114">planes.yaml:113-114</span></td></tr>
+              <tr><td>启动宽限</td><td>Helm 5s × 120 次；Compose 60s 起步、30 次重试</td><td><span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:113-116">planes.yaml:113-116</span> <span class="src" data-src="agentscope-service/deploy/compose.yaml:34-39">compose.yaml:34-39</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>再看默认值与限制：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>默认值</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Workspace / Artifact 容量</td><td>各 10Gi；访问模式 RWX / RWO</td><td><span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:30-40">values.yaml:30-40</span></td></tr>
+              <tr><td>Ingress</td><td>默认关闭</td><td><span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:57-62">values.yaml:57-62</span></td></tr>
+              <tr><td>Local Environment</td><td><code>false</code></td><td><span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:25">values.yaml:25</span></td></tr>
+              <tr><td>Control 存储驱动</td><td><code>memory</code>；生产用 <code>postgres</code></td><td><span class="src" data-src="agentscope-service/aistio/cmd/aistiod/main.go:420-423">main.go:420-423</span></td></tr>
+              <tr><td>JWT 密钥下限</td><td>32 字符</td><td><span class="src" data-src="agentscope-service/aistio/internal/product/server.go:147-150">server.go:147-150</span></td></tr>
+              <tr><td>Bootstrap 密码</td><td>12–72 字节，仅空账号表生效</td><td><span class="src" data-src="agentscope-service/aistio/internal/product/bootstrap.go:30-36">bootstrap.go:30-36</span></td></tr>
+              <tr><td>Session 事件保留</td><td><code>0</code>（完整历史）</td><td><span class="src" data-src="agentscope-service/aistio/cmd/aistiod/main.go:427">main.go:427</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="bash" data-file="运维命令速查（示意）"># 安装 / 升级
+helm upgrade --install service ./agentscope-service-VERSION.tgz \
+  --namespace agentscope --set imageRepository=REGISTRY/NAMESPACE \
+  --set existingSecret=agentscope-service --wait --timeout 10m
+
+# 备份
+docker compose stop gateway scheduler data control
+docker compose exec -T db pg_dump -U agentscope -d agentscope -Fc &gt; backup/database.dump
+
+# 恢复
+pg_restore --no-owner --no-acl --dbname="$RESTORE_DATABASE_URL" backup/database.dump
+
+# 排障
+kubectl -n agentscope get pods,pvc,svc,ingress
+kubectl -n agentscope logs deployment/service-agentscope-control --tail=200
+kubectl -n agentscope describe pod POD_NAME</pre>
+
+        <h2 id="pitfalls">七个坑：先分清层，再动生产</h2>
+        <p>
+          <strong>坑一：只备数据库。</strong>Workspace、Artifact 与 Vault 密钥缺任何一项，备份都不算通过
+          <span class="src" data-src="docs/v2/zh/service/operations.md:10">operations.md:10</span>
+          <span class="src" data-src="docs/v2/zh/service/operations.md:53">operations.md:53</span>。
+        </p>
+        <p>
+          <strong>坑二：用 RWO 卷当 Workspace。</strong>多个组件要跨节点挂载同一份工作目录，只有单节点可用的卷不能替代共享存储
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:14">kubernetes.md:14</span>。
+        </p>
+        <p>
+          <strong>坑三：升级后只回退镜像。</strong>旧镜像不保证能读新 schema；回退前先恢复同批次的数据库备份
+          <span class="src" data-src="docs/v2/zh/service/operations.md:35">operations.md:35</span>。
+        </p>
+        <p>
+          <strong>坑四：用 <code>docker compose restart</code> 应用新环境变量。</strong>restart 不会把新的环境变量注入已有容器，
+          要重新创建容器
+          <span class="src" data-src="docs/v2/zh/service/configuration.md:48">configuration.md:48</span>。
+        </p>
+        <p>
+          <strong>坑五：把 Gateway 健康当成执行健康。</strong>Gateway 正常只证明入口可达；模型与工具执行要看 Dataplane，
+          调度看 Scheduler，编排与资源看 Control
+          <span class="src" data-src="docs/v2/zh/service/troubleshooting.md:34">troubleshooting.md:34</span>。
+        </p>
+        <p>
+          <strong>坑六：把密钥写进 values。</strong>Secret 要用 <code>existingSecret</code> 单独创建；values 只放非敏感配置
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/values.yaml:21-22">values.yaml:21-22</span>。
+        </p>
+        <p>
+          <strong>坑七：把单副本 Chart 当高可用。</strong>每个组件默认 1 副本 + <code>Recreate</code>，升级必然中断；
+          需要 HA 要先改架构并单独验证
+          <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:28-31">planes.yaml:28-31</span>
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:83">kubernetes.md:83</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>只做 <code>pg_dump</code>，能把一套 Service 恢复到昨天吗？</summary>
+          <p>
+            不能。可恢复备份必须同时包含数据库、Workspace、Artifact，以及解密这些数据所需的密钥；
+            只有三者都能共同恢复，备份才算通过验证
+            <span class="src" data-src="docs/v2/zh/service/operations.md:10">operations.md:10</span>
+            <span class="src" data-src="docs/v2/zh/service/operations.md:53">operations.md:53</span>。
+          </p>
+        </details>
+        <details>
+          <summary>Helm 显示安装成功、Pod 都 Ready，是否说明升级验收完成？</summary>
+          <p>
+            不是。还要验证 PVC Bound、公开域名登录、模型连接、执行 Environment、第一次 Chat、Issue 交付和长连接；
+            port-forward 只能排障，不能替代公开回调地址验证
+            <span class="src" data-src="docs/v2/zh/service/kubernetes.md:72-77">kubernetes.md:72-77</span>。
+          </p>
+        </details>
+        <details>
+          <summary>把 Chart 副本数改成 2，是否就获得零停机升级？</summary>
+          <p>
+            不能这样推断。当前 Chart 使用 <code>Recreate</code>，注释明确说 DDL 与共享文件系统 HA 需要单独验证；
+            官方也不提供多副本 HA 或无停机迁移保证
+            <span class="src" data-src="agentscope-service/helm/agentscope-service/templates/planes.yaml:28-31">planes.yaml:28-31</span>
+            <span class="src" data-src="docs/v2/zh/service/kubernetes.md:83">kubernetes.md:83</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：做一次可回退的生产演练</h2>
+        <p>目标不是把服务跑起来，而是证明「装得上、备得全、恢复得了、退得回」。建议 60 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">准备存储与 schema</span>
+            <div>确认一个支持 RWX 的 StorageClass，并在独立 PostgreSQL 上以应用数据库所有者执行 <code>postgres-init.sql</code>，核对三个 schema 都存在。</div>
+          </li>
+          <li>
+            <span class="sh">创建 Secret 与 values</span>
+            <div>复制 <code>kubernetes.env.example</code>，替换全部占位值并 URL 编码数据库密码；写一份 production-values，把 Workspace 指到 RWX 存储。</div>
+          </li>
+          <li>
+            <span class="sh">安装并验证用户路径</span>
+            <div>用指定 Chart 版本安装，检查 Pod、PVC、Service、Ingress；登录后修改密码，跑一次模型请求、一次 Issue 和一次长回复。</div>
+          </li>
+          <li>
+            <span class="sh">做一次一致性备份</span>
+            <div>停四个应用组件，导出数据库，快照两个卷，保存 Secret 受保护副本和版本 / digest / 时间；记录这批备份的批次号。</div>
+          </li>
+          <li>
+            <span class="sh">在空库上恢复</span>
+            <div>新建空数据库，用 <code>pg_restore --no-owner --no-acl</code> 恢复，接入同批卷快照和原 Vault 密钥，再以备份对应版本启动。</div>
+          </li>
+          <li>
+            <span class="sh">跑恢复验收</span>
+            <div>逐项检查管理员登录、Agent 与 Session 历史、Workspace 文件、Vault 解密、Runtime 连接和一项新任务；确认 Issue 状态与备份时刻相符。</div>
+          </li>
+          <li>
+            <span class="sh">演练一次升级</span>
+            <div>记录当前 Chart 与镜像版本，备份后在测试环境 upgrade 到下一版本；观察 Control 启动迁移、Java 表结构变化和探针状态。</div>
+          </li>
+          <li>
+            <span class="sh">故意制造一次失败</span>
+            <div>把镜像 tag 改成一个不存在的值，确认 Pod 停在 ImagePullBackOff 且 Gateway 不可用；改回后记录恢复时间，并写进维护手册。</div>
+          </li>
+          <li>
+            <span class="sh">最后写三行结论</span>
+            <div>分别写「备份批次覆盖什么」「恢复验收哪几项通过」「升级回退的触发条件」，确保每一行都能独立核对，而不是用 Pod Ready 代替。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          到这里，Service 的部署、备份、升级与排障已经闭环。下一章离开控制面，进入集成生态：模型、记忆、存储、RAG、协议、
+          渠道、技能仓库与基础设施。进入之前，最好先能解释一次真实故障分别属于哪一层，再去看每个集成点补了什么能力。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>官方「生产安装」</td><td>Kubernetes 前置、Secret、values 与验证路径<span class="src" data-src="docs/v2/zh/service/kubernetes.md:10-83">kubernetes.md:10-83</span></td></tr>
+              <tr><td>官方「备份、升级与恢复」</td><td>一致性备份、恢复顺序、验收与回归案例<span class="src" data-src="docs/v2/zh/service/operations.md:10-71">operations.md:10-71</span></td></tr>
+              <tr><td>官方「排障」</td><td>常见症状、日志归属与四个高频故障<span class="src" data-src="docs/v2/zh/service/troubleshooting.md:10-50">troubleshooting.md:10-50</span></td></tr>
+              <tr><td><a href="19-service-basics.html">19 Service 起站</a></td><td>五个组件、Compose 安装与首次登录，本章的前置</td></tr>
+              <tr><td><a href="20-endpoints-sse.html">20 Endpoint、Job 与 SSE</a></td><td>入口、长连接与状态查询；生产反代必须覆盖的能力</td></tr>
+              <tr><td><a href="25-workflow-automation-issue.html">25 Workflow、自动化与 Issue 闭环</a></td><td>备份恢复后如何核对幂等记录、未完成工作与验收状态</td></tr>
+              <tr><td><a href="../appendix/errors.html">附录 B · 报错速查</a></td><td>启动失败、探针失败与 acceptance blocked 的排查顺序</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的安装、运维与排障文档在 2.0.4 仓库里仍带「预览」提示
+          <span class="src" data-src="docs/v2/zh/service/kubernetes.md:6-8">kubernetes.md:6-8</span>。
+          凡文档与实现有出入的地方，正文以源码与 Chart 模板为准；数字、默认值与状态码都标了具体出处。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
