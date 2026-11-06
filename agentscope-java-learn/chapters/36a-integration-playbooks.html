@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 36A 章是第 36 章的落地手册：把 Nacos A2A、Nacos Prompt / Skill、Higress MCP、Quartz / XXL-Job、Studio HITL、Training 影子训练与 Chat Completions Web 拆成七条可执行链路，每条给出配置、代码、验收标准与失败边界。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="36A 集成落地手册：七条链路从配置到验收 · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 36A 章是第 36 章的落地手册：把 Nacos A2A、Nacos Prompt / Skill、Higress MCP、Quartz / XXL-Job、Studio HITL、Training 影子训练与 Chat Completions Web 拆成七条可执行链路，每条给出配置、代码、验收标准与失败边界。"
+    />
+    <title>36A 集成落地手册：七条链路从配置到验收 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="36a-integration-playbooks" data-root="..">
+    <main>
+      <article class="article">
+        <h1>36A · 集成落地手册：七条链路从配置到验收</h1>
+        <p class="lede">
+          第 36 章回答「每个扩展接在哪一层」，这一页回答「真正接起来要做哪几步」。
+          七个 playbook 互相独立：Nacos A2A、Nacos Prompt / Skill、Higress、Scheduler、Studio、Training、Chat Completions。
+          每条都给最小配置、能编译的调用形状、验收标准和最常见的失败点；它们是第 36 章的配套子页，不重复讲完整背景。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>把 A2A AgentCard 真正注册到 Nacos，并让另一个进程按名字解析出来</li>
+          <li>用 starter 或直接 listener 接 Prompt，知道版本 / 标签为什么只生效一次</li>
+          <li>让 Nacos Skill 出现在 Agent 的技能列表里，而不是只让 <code>getSkill</code> 能调用</li>
+          <li>用 Higress 的 MCP 客户端与工具搜索接上网关工具，并验证工具真的进了 Toolkit</li>
+          <li>分清 Quartz 与 XXL-Job 谁真正持有调度状态，跑通一次触发与一次暂停</li>
+          <li>开 Studio 看最终消息与 HITL，开 Training 跑一条被标记的样本并完成 commit</li>
+          <li>用 starter 暴露 OpenAI 兼容接口，验证普通 JSON、SSE 与工具调用往返</li>
+        </ul>
+
+        <h2 id="map">七条链路怎么选</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>链路</th><th>你想要的結果</th><th>先决条件</th><th>主要 artifact</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Nacos A2A</td><td>Agent 能被别的服务按名字发现</td><td>Nacos + A2A 服务端</td><td><code>agentscope-extensions-nacos-a2a</code></td></tr>
+              <tr><td>Nacos Prompt / Skill</td><td>提示词与技能在线更新</td><td>Nacos AI 模块、Prompt / Skill 条目</td><td><code>-nacos-prompt</code> / <code>-nacos-skill</code></td></tr>
+              <tr><td>Higress</td><td>网关上的工具直接给 Agent 用</td><td>Higress MCP endpoint</td><td><code>agentscope-extensions-higress</code></td></tr>
+              <tr><td>Scheduler</td><td>Agent 按时间自动跑</td><td>Quartz 数据库或 XXL-Job admin</td><td><code>-scheduler-quartz</code> / <code>-scheduler-xxl-job</code></td></tr>
+              <tr><td>Studio</td><td>看到消息、trace，并能人工输入</td><td>Studio 服务</td><td><code>agentscope-extensions-studio</code></td></tr>
+              <tr><td>Training</td><td>线上流量采样、反馈、周期训练</td><td>Trinity 或兼容后端</td><td><code>agentscope-extensions-training</code></td></tr>
+              <tr><td>Chat Completions</td><td>OpenAI 客户端零改造接入</td><td>Spring Boot + ReActAgent bean</td><td><code>-chat-completions-web-starter</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          先选链路，再选 artifact。完整的 artifactId 与 <code>pom.xml</code> 出处见
+          <a href="../appendix/artifacts.html">附录 F</a>。
+        </p>
+
+        <h2 id="nacos-a2a">Playbook 1：Nacos A2A 注册与发现</h2>
+        <p>
+          服务端做两件事：把 <code>AgentCard</code> 发布到 Nacos，再把 Transport 端点注册成 Endpoint。
+          <code>NacosAgentRegistry</code> 是 A2A 服务端与 Nacos 之间的适配器；它的 builder 接收
+          <code>AiService</code> 或 Nacos <code>Properties</code>，<code>nacosA2aProperties</code> 可选
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/registry/NacosAgentRegistry.java:250-306">NacosAgentRegistry.java:250-306</span>。
+        </p>
+        <pre data-lang="java" data-file="注册：NacosAgentRegistry + AgentScopeA2aServer">NacosAgentRegistry registry = NacosAgentRegistry.builder(nacosProperties)
+    .nacosA2aProperties(NacosA2aRegistryProperties.builder().build())
+    .build();
+
+AgentScopeA2aServer server = AgentScopeA2aServer.builder(agentBuilder)
+    .agentCard(agentCard)                 // ConfigurableAgentCard
+    .withAgentRegistry(registry)          // 注意不是 agentRegistry(...)
+    .deploymentProperties(8080)
+    .build();</pre>
+        <div class="callout warn">
+          <span class="ct">文档这里又少了一个 <code>with</code></span>
+          <p>
+            官方 Nacos 页写的是 <code>AgentScopeA2aServer.builder().agentRegistry(...)</code>
+            <span class="src" data-src="docs/v2/zh/integration/infrastructure/nacos.md:107-110">nacos.md:107-110</span>，
+            但源码里 builder 必须传 <code>ReActAgent.Builder</code> 或 <code>AgentRunner</code>，注册方法叫
+            <code>withAgentRegistry(...)</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:174-184">AgentScopeA2aServer.java:174-184</span>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:333">AgentScopeA2aServer.java:333</span>。
+            按文档写会编译失败。
+          </p>
+        </div>
+        <p>
+          客户端只拿 <code>AgentCardResolver</code>：构造器是 <code>(Properties)</code> 或 <code>(AiService)</code>，
+          Agent 名由 <code>A2aAgent.builder().name(...)</code> 提供。解析器内部会缓存并按 Nacos 事件更新
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/discovery/NacosAgentCardResolver.java:75-98">NacosAgentCardResolver.java:75-98</span>。
+        </p>
+        <pre data-lang="java" data-file="发现：把远端 A2A Agent 变成本地 Agent">NacosAgentCardResolver resolver = new NacosAgentCardResolver(nacosProperties);
+
+A2aAgent translator = A2aAgent.builder()
+    .name("translator")
+    .agentCardResolver(resolver)
+    .build();</pre>
+        <p>
+          <strong>验收：</strong>在 Nacos 控制台能看到 AgentCard 与 Endpoint；另一个进程用 resolver 能拿到卡；
+          调用远端 Agent 时 URL 指向注册的 Transport，而不是写死的地址。注册是显式动作，新版本上线要再调一次。
+        </p>
+
+        <h2 id="nacos-prompt-skill">Playbook 2：Nacos Prompt 与 Skill</h2>
+        <p>
+          Spring Boot 直接用 <code>agentscope-nacos-spring-boot-starter</code>，Prompt 前缀是
+          <code>agentscope.nacos.prompt</code>；<code>enabled</code> 默认 true，<code>sys-prompt-key</code>
+          指向 Nacos 的 promptKey，<code>version</code> 与 <code>label</code> 互斥，<code>variables</code> 用于渲染
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-nacos-spring-boot-starter/src/main/java/io/agentscope/spring/boot/nacos/properties/AgentScopeNacosPromptProperties.java:53-81">AgentScopeNacosPromptProperties.java:53-81</span>。
+        </p>
+        <pre data-lang="yaml" data-file="application.yml：Prompt 交给 Nacos">agentscope:
+  nacos:
+    prompt:
+      enabled: true
+      sys-prompt-key: system-prompt
+      version: "1.2.0"          # 或 label: stable，不要同时写
+      variables:
+        userName: Alice</pre>
+        <p>
+          非 Spring 场景直接用 <code>NacosPromptListener</code>：第一次按 promptKey 订阅，之后 Nacos 推送会写回本地缓存
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-prompt/src/main/java/io/agentscope/core/nacos/prompt/NacosPromptListener.java:37-68">NacosPromptListener.java:37-68</span>。
+          但缓存只按 promptKey 命中；第二次换 version / label 不会重新订阅
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-prompt/src/main/java/io/agentscope/core/nacos/prompt/NacosPromptListener.java:112-138">NacosPromptListener.java:112-138</span>。
+        </p>
+        <pre data-lang="java" data-file="直接使用 listener">NacosPromptListener prompts = new NacosPromptListener(aiService);
+
+String tpl = prompts.getPrompt(
+    "system-prompt",
+    "1.2.0",                  // version
+    null,                     // label，与 version 互斥
+    Map.of("userName", "Alice"),
+    "你是一个助手");           // 找不到时的默认值</pre>
+        <p>
+          Skill 侧要把 Nacos 里的 ZIP 当成只读仓库。构造器签名是
+          <code>(AiService, namespaceId, Properties, knownSkillNames)</code>；命名空间为空按 <code>public</code> 处理，
+          version / label 的解析顺序是 Properties → JVM <code>-D</code> → 环境变量，版本优先
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-skill/src/main/java/io/agentscope/core/nacos/skill/NacosSkillRepository.java:136-158">NacosSkillRepository.java:136-158</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-skill/src/main/java/io/agentscope/core/nacos/skill/NacosSkillRepository.java:49-52">NacosSkillRepository.java:49-52</span>。
+        </p>
+        <pre data-lang="java" data-file="Nacos Skill：必须给名单">Properties props = new Properties();
+props.setProperty(NacosSkillRepository.SKILL_VERSION_PATH, "1.2.0");
+
+NacosSkillRepository repo = new NacosSkillRepository(
+    aiService,
+    "public",
+    props,
+    List.of("calculator", "translator"));   // 不给名单，getAllSkills() 返回空</pre>
+        <p>
+          <strong>验收：</strong>改一次 Prompt 模板，下一次 <code>getPrompt</code> 能看到新内容；
+          Nacos 里加一个技能名到名单后，<code>getAllSkills()</code> 能返回它，而不只是 <code>getSkill</code> 能下载。
+          技能仓库只读，<code>save</code> / <code>delete</code> 返回 false 是预期行为。
+        </p>
+
+        <h2 id="higress">Playbook 3：Higress MCP 工具</h2>
+        <p>
+          Higress 的 builder 有两种端点：SSE 与 StreamableHTTP；请求超时默认 120 秒，初始化超时 30 秒
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientBuilder.java:71-82">HigressMcpClientBuilder.java:71-82</span>。
+          它没有 <code>build()</code>，只有 <code>buildAsync()</code> 与 <code>buildSync()</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientBuilder.java:311">HigressMcpClientBuilder.java:311</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientBuilder.java:357">:357</span>。
+        </p>
+        <pre data-lang="java" data-file="Higress：同步构建 + 工具搜索">HigressMcpClientWrapper client = HigressMcpClientBuilder
+    .create("higress")
+    .streamableHttpEndpoint("http://gateway/mcp-servers/union-tools-search")
+    .toolSearch("退款", 8)          // 只返回语义相关 Top 8；默认 Top 10
+    .buildSync();
+
+HigressToolkit toolkit = new HigressToolkit();
+toolkit.registration()
+    .mcpClient(client)
+    .enableTools(List.of("search-doc", "fetch-url"))
+    .group("knowledge")
+    .apply();</pre>
+        <p>
+          工具搜索默认关闭；开启后 <code>listTools()</code> 会先调 <code>x_higress_tool_search</code>，
+          只返回相关工具，并把结果缓存到本地
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientWrapper.java:156-204">HigressMcpClientWrapper.java:156-204</span>。
+          <code>registerMcpClient</code> 返回 <code>Mono&lt;Void&gt;</code>，必须 <code>block()</code> 或组合，否则不会真正注册
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressToolkit.java:99-120">HigressToolkit.java:99-120</span>。
+        </p>
+        <p>
+          <strong>验收：</strong><code>toolkit.getHigressMcpClient()</code> 非空；<code>listTools()</code>
+          返回的工具名与白名单一致；Agent 实际调用一个只读工具成功。鉴权、限流、路由留在 Higress，不要在 Java 侧重复。
+        </p>
+
+        <h2 id="scheduler">Playbook 4：Quartz 与 XXL-Job</h2>
+        <p>
+          先分清职责：Quartz 在 Java 进程内持有 Trigger；XXL-Job 只把 Agent 注册成 JobHandler，调度在 admin 控制台。
+          两者共用 <code>AgentScheduler.schedule(...)</code> 形状，但能力不同。
+        </p>
+        <h3>Quartz：显式给模式，别用默认 NONE</h3>
+        <pre data-lang="java" data-file="Quartz：每天 8 点">QuartzAgentScheduler scheduler = QuartzAgentScheduler.builder()
+    .schedulerId("daily")
+    .autoStart(true)
+    .build();
+
+ScheduleConfig cfg = ScheduleConfig.builder()
+    .cron("0 0 8 * * ?")
+    .zoneId("Asia/Shanghai")
+    .build();
+
+scheduler.schedule(agentConfig, cfg);
+scheduler.pause("DailyReportAgent");    // 只有具体 Quartz 类型有
+scheduler.resume("DailyReportAgent");</pre>
+        <p>
+          <code>autoStart</code> 默认 true，Job 组是 <code>agentscope-quartz</code>；CRON / FIXED_RATE /
+          FIXED_DELAY 分别映射为不同 Trigger
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/src/main/java/io/agentscope/extensions/scheduler/quartz/QuartzAgentScheduler.java:626-629">QuartzAgentScheduler.java:626-629</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/src/main/java/io/agentscope/extensions/scheduler/quartz/QuartzAgentScheduler.java:246-305">QuartzAgentScheduler.java:246-305</span>。
+          但便利方法 <code>schedule(agentConfig)</code> 用的是 <code>NONE</code>，不会建 Trigger
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/src/main/java/io/agentscope/extensions/scheduler/quartz/QuartzAgentScheduler.java:154-156">QuartzAgentScheduler.java:154-156</span>。
+        </p>
+        <h3>XXL-Job：只注册，控制台排程</h3>
+        <pre data-lang="java" data-file="XXL-Job：注册 JobHandler">XxlJobSpringExecutor executor = new XxlJobSpringExecutor();
+executor.setAdminAddresses("http://localhost:8080/xxl-job-admin");
+executor.setAppname("agentscope-demo");
+executor.setAccessToken("xxxxxxxx");
+executor.start();
+
+AgentScheduler scheduler = new XxlJobAgentScheduler(executor);
+scheduler.schedule(agentConfig, ScheduleConfig.builder().build()); // 只接受 NONE</pre>
+        <p>
+          XXL-Job 实现传非 NONE 模式会抛 <code>UnsupportedOperationException</code>；<code>cancel</code> 也不支持，
+          要去控制台暂停或删除 Job
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-xxl-job/src/main/java/io/agentscope/extensions/scheduler/xxljob/XxlJobAgentScheduler.java:148-161">XxlJobAgentScheduler.java:148-161</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-xxl-job/src/main/java/io/agentscope/extensions/scheduler/xxljob/XxlJobAgentScheduler.java:289-304">:289-304</span>。
+        </p>
+        <p>
+          <strong>验收：</strong>Quartz 看本地日志出现第一次触发，pause 后不再触发、resume 后恢复；
+          XXL-Job 控制台能看到以 Agent 名命名的 JobHandler，并在控制台配置 CRON 后触发一次。
+        </p>
+
+        <h2 id="studio">Playbook 5：Studio 消息与 HITL</h2>
+        <p>
+          <code>StudioManager.init()</code> 会建 HTTP / WebSocket 客户端、注册 run、连接 WebSocket；成功后自动
+          <code>addSystemHook</code> 并注册 Tracer
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioManager.java:214-260">StudioManager.java:214-260</span>。
+          所以初始化后不要再手动加 <code>StudioMessageHook</code>。
+        </p>
+        <pre data-lang="java" data-file="Studio：初始化 + 真人 Agent">StudioManager.init()
+    .studioUrl("http://localhost:3000")
+    .project("MyProject")
+    .runName("experiment_001")
+    .initialize()
+    .block();
+
+StudioUserAgent reviewer = StudioUserAgent.builder()
+    .name("Reviewer")
+    .studioClient(StudioManager.getClient())
+    .webSocketClient(StudioManager.getWebSocketClient())
+    .inputTimeout(Duration.ofMinutes(10))   // 默认 30 分钟
+    .build();</pre>
+        <p>
+          <code>StudioUserAgent</code> 会发 <code>requestUserInput</code>，等 Studio 侧输入；默认超时 30 分钟
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioUserAgent.java:237-327">StudioUserAgent.java:237-327</span>。
+          消息 Hook 只推 <code>PostCallEvent</code> 的最终消息，不覆盖每条 token
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioMessageHook.java:66-95">StudioMessageHook.java:66-95</span>。
+        </p>
+        <p>
+          <strong>验收：</strong>一次 <code>agent.call()</code> 后 Studio 只出现一条最终消息；HITL 场景能看到输入框并暂停；
+          生产 Profile 关闭 Studio 后，调用不再产生推送，退出时调 <code>StudioManager.shutdown()</code> 释放连接。
+        </p>
+
+        <h2 id="training">Playbook 6：Training 采样与 commit</h2>
+        <p>
+          Training 是影子流量：命中采样后克隆 Agent、换 <code>TrinityModelAdapter</code> 异步跑一遍，
+          生产响应不等它完成
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRouter.java:221-249">TrainingRouter.java:221-249</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRouter.java:277-298">:277-298</span>。
+          <code>commitIntervalSeconds</code> 默认 300；<code>stop()</code> 会做最后一次 commit 并移除 Hook
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRunner.java:139-168">TrainingRunner.java:139-168</span>。
+        </p>
+        <pre data-lang="java" data-file="Training：显式标记一条样本">TrainingRunner runner = TrainingRunner.builder()
+    .trinityEndpoint("http://localhost:8080")
+    .modelName("/path/to/model")
+    .selectionStrategy(ExplicitMarkingStrategy.create())  // 只训练显式标记
+    .rewardCalculator(agent -> 1.0)
+    .commitIntervalSeconds(300)
+    .build();
+
+runner.start();
+
+agent.call(msg)
+    .contextWrite(TrainingContext.mark("prod", "high-quality"))
+    .block();
+
+runner.stop();</pre>
+        <p>
+          <code>ExplicitMarkingStrategy.create()</code> 的标记 TTL 是 1 分钟
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/strategy/ExplicitMarkingStrategy.java:58-70">ExplicitMarkingStrategy.java:58-70</span>；
+          <code>TrainingContext.mark(...)</code> 通过 Reactor Context 传播
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/strategy/TrainingContext.java:81-137">TrainingContext.java:81-137</span>。
+          不传策略时默认 10% 采样；<code>commitIntervalSeconds &lt;= 0</code> 会关闭定时 commit
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingConfig.java:125-137">TrainingConfig.java:125-137</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRunner.java:185-214">TrainingRunner.java:185-214</span>。
+        </p>
+        <p>
+          <strong>验收：</strong>只有带 <code>TrainingContext.mark</code> 的调用进入样本；日志出现 reward / feedback；
+          commit 周期到达时看到 commit 成功；<code>stop()</code> 后再调 Agent 不再触发训练。
+        </p>
+
+        <h2 id="chat">Playbook 7：Chat Completions Web</h2>
+        <p>
+          核心适配器只做事件转换，HTTP / SSE 由 starter 提供。starter 默认路径是
+          <code>/v1/chat/completions</code>，默认启用
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-chat-completions-web-starter/src/main/java/io/agentscope/spring/boot/chat/config/ChatCompletionsProperties.java:34-41">ChatCompletionsProperties.java:34-41</span>。
+        </p>
+        <pre data-lang="yaml" data-file="application.yml：OpenAI 兼容接口">agentscope:
+  chat-completions:
+    enabled: true
+    base-path: /v1/chat/completions</pre>
+        <p>
+          Controller 用 <code>ObjectProvider&lt;ReActAgent&gt;</code> 每次取一个新的 prototype bean
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-chat-completions-web-starter/src/main/java/io/agentscope/spring/boot/chat/config/ChatCompletionsWebAutoConfiguration.java:36-37">ChatCompletionsWebAutoConfiguration.java:36-37</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-chat-completions-web-starter/src/main/java/io/agentscope/spring/boot/chat/config/ChatCompletionsWebAutoConfiguration.java:139-148">:139-148</span>。
+          自己写 Controller 时，核心适配器签名是
+          <code>stream(ReActAgent, List&lt;Msg&gt;, requestId, model)</code>，请求先由
+          <code>ChatMessageConverter.convertMessages(...)</code> 转成消息列表
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-chat-completions-web/src/main/java/io/agentscope/core/chat/completions/streaming/ChatCompletionsStreamingAdapter.java:86-104">ChatCompletionsStreamingAdapter.java:86-104</span>。
+        </p>
+        <pre data-lang="java" data-file="直接调用核心适配器">ChatCompletionsStreamingAdapter adapter = new ChatCompletionsStreamingAdapter();
+List&lt;Msg&gt; messages = converter.convertMessages(request.getMessages());
+
+Flux&lt;ChatCompletionsChunk&gt; chunks = adapter.stream(
+    agent, messages, requestId, request.getModel());</pre>
+        <p>
+          <strong>验收：</strong><code>curl</code> 普通 JSON 返回 <code>choices</code>；<code>stream=true</code>
+          或 <code>Accept: text/event-stream</code> 返回 SSE 并以 <code>data: [DONE]</code> 结束
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-chat-completions-web-starter/src/main/java/io/agentscope/spring/boot/chat/service/ChatCompletionsStreamingService.java:79-83">ChatCompletionsStreamingService.java:79-83</span>；
+          带工具的请求把 <code>tool_calls</code> 返回给客户端，由客户端执行后回填下一轮
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-chat-completions-web/src/main/java/io/agentscope/core/chat/completions/model/ChatCompletionsRequest.java:74-81">ChatCompletionsRequest.java:74-81</span>。
+        </p>
+
+        <h2 id="checklist">验收清单：每条链路只看一个硬指标</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>链路</th><th>硬指标</th><th>失败时先看</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Nacos A2A</td><td>另一个进程能按名字解析出 AgentCard</td><td>注册是否调用、Endpoint 是否可达</td></tr>
+              <tr><td>Nacos Prompt</td><td>改模板后下一次 <code>getPrompt</code> 内容变化</td><td>promptKey、首次绑定、版本 / 标签</td></tr>
+              <tr><td>Nacos Skill</td><td><code>getAllSkills()</code> 非空</td><td><code>knownSkillNames</code> 是否传</td></tr>
+              <tr><td>Higress</td><td><code>listTools()</code> 返回白名单工具</td><td><code>registerMcpClient().block()</code></td></tr>
+              <tr><td>Quartz</td><td>日志出现第一次触发</td><td>是否误用 <code>NONE</code></td></tr>
+              <tr><td>XXL-Job</td><td>控制台出现 JobHandler</td><td>executor appname / admin 地址</td></tr>
+              <tr><td>Studio</td><td>Studio 只出现一条最终消息</td><td>是否手动重复挂 Hook</td></tr>
+              <tr><td>Training</td><td>只有标记样本进入反馈</td><td>策略、Context 标记、采样率</td></tr>
+              <tr><td>Chat Completions</td><td>SSE 以 <code>[DONE]</code> 结束</td><td>starter、prototype Agent bean</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="failure">失败边界：七个最常见现象</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>现象</th><th>更可能的原因</th><th>处理</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Nacos A2A 编译失败</td><td>照文档用了无参 builder / <code>agentRegistry</code></td><td>用 <code>builder(agentBuilder)</code> + <code>withAgentRegistry</code></td></tr>
+              <tr><td>Prompt 版本不切换</td><td>缓存已按 promptKey 命中</td><td>新建 listener 或拆 promptKey</td></tr>
+              <tr><td>技能列表为空</td><td>Nacos 仓库没给 <code>knownSkillNames</code></td><td>构造时传名单</td></tr>
+              <tr><td>Higress 工具不可见</td><td>没 <code>block()</code> / 白名单过滤</td><td>检查 <code>registerMcpClient</code> 与 <code>enableTools</code></td></tr>
+              <tr><td>Quartz 不触发</td><td>默认 <code>NONE</code></td><td>显式 CRON / FIXED_RATE / FIXED_DELAY</td></tr>
+              <tr><td>Studio 重复消息</td><td>initialize 自动 Hook + 手动 Hook</td><td>去掉手动 <code>.hook(...)</code></td></tr>
+              <tr><td>Training 没有样本</td><td>未标记 / 采样未命中 / Agent 名含 <code>-shadow</code></td><td>换 Explicit 策略、检查标记</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="next">继续读什么</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="36-infrastructure-ecosystem.html">36 基础设施与生态</a></td><td>七个 playbook 的背景、默认值与边界</td></tr>
+              <tr><td><a href="../appendix/artifacts.html">附录 F 扩展 artifact 速查</a></td><td>每个链路要引哪个 artifact</td></tr>
+              <tr><td><a href="../appendix/errata.html">附录 E 勘误汇总</a></td><td>Nacos / Higress / Scheduler / Studio / Training / Chat 的文档差异</td></tr>
+              <tr><td><a href="27-extension-ecosystem.html">27 扩展生态</a></td><td>回到契约 / 实现 / 装配三层看全局</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          这一页是落地手册，不替代第 36 章的机制解释；所有默认值与签名都沿用 2.0.4 源码。
+          如果文档与源码冲突，以源码为准，并在附录 E 里查对应条目。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

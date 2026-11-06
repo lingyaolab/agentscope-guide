@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="附录 F 把 AgentScope Java 2.0.4 的扩展 artifact 按能力收成一张表：模型、记忆、状态 / 分布式存储、RAG、协议、渠道、技能仓库、基础设施、生态、服务与 Spring Boot starter，每行给出 artifactId、用途、对应章节和 pom.xml 出处。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="附录 F 扩展 artifact 速查：能力 → 依赖 · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="附录 F 把 AgentScope Java 2.0.4 的扩展 artifact 按能力收成一张表：模型、记忆、状态 / 分布式存储、RAG、协议、渠道、技能仓库、基础设施、生态、服务与 Spring Boot starter，每行给出 artifactId、用途、对应章节和 pom.xml 出处。"
+    />
+    <title>附录 F 扩展 artifact 速查：能力 → 依赖 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="artifacts" data-root="..">
+    <main>
+      <article class="article">
+        <h1>附录 F · 扩展 artifact 速查：能力 → 依赖</h1>
+        <p class="lede">
+          这一页只回答两个问题：<strong>这个能力要引哪个 artifact</strong>，以及<strong>它对应哪一章</strong>。
+          模型 id、provider 名称和 artifactId 不是一回事：同一个 artifact 可能承载多个 provider id，同一种能力也可能拆成 core、扩展和 starter 三层。
+          表里的 artifactId 都来自各模块自己的 <code>pom.xml</code>，版本统一跟站点一致：<code>2.0.4</code>
+          <span class="src" data-src="agentscope-java-2.0.4/pom.xml:30">pom.xml:30</span>。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>按能力直接找到 artifactId，不再把 provider id 当成依赖坐标</li>
+          <li>分清「核心扩展」「具体后端」「Spring Boot starter」三层，知道什么时候只引扩展、什么时候还要引 starter</li>
+          <li>识别已经标记 legacy 的 MySQL 旧类，新项目直接走 JDBC</li>
+          <li>把站点章节、artifact 与源码 <code>pom.xml</code> 对上，升级时能自己复核</li>
+        </ul>
+
+        <h2 id="how">怎么用这一页</h2>
+        <ul class="goals">
+          <li><strong>先找能力，再看 artifact</strong>：例如「要接 Redis」在「状态 / 分布式存储」组，不在「模型」组</li>
+          <li><strong>再判断要不要 starter</strong>：普通 Java 应用只引扩展；Spring Boot 想要自动装配，再引对应 starter</li>
+          <li><strong>一个 artifact 可能覆盖多个 id</strong>：OpenAI 兼容模块同时承载 <code>openai</code>、<code>deepseek</code>、<code>glm</code>、<code>kimi</code>、<code>minimax</code></li>
+          <li><strong>旧类只做兼容</strong>：<code>MysqlDistributedStore</code>、<code>MysqlAgentStateStore</code>、<code>MysqlSkillRepository</code> 的旧构造器都不要写进新代码</li>
+          <li>每一行的 <code>pom.xml</code> 出处都可以点开复核；artifactId 与目录名一致，便于在 IDE 里搜</li>
+        </ul>
+
+        <h2 id="model">模型：6 个 artifact，10 个 provider id</h2>
+        <p>
+          官方集成表列了 10 个 provider id，但 artifact 只有 6 个；OpenAI 兼容模块承载其中 5 个
+          <span class="src" data-src="docs/v2/zh/integration/model/index.md:6-17">index.md:6-17</span>。
+          所以「换模型」通常只换 id，不换依赖。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>能力 / id</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>openai</code> / <code>deepseek</code> / <code>glm</code> / <code>kimi</code> / <code>minimax</code></td>
+                <td><code>agentscope-extensions-model-openai</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai/pom.xml:29">pom.xml:29</span></td>
+                <td>通用 Chat Completions 客户端 + 四家兼容 formatter；原生结构化输出默认开</td>
+                <td>第 28 章</td>
+              </tr>
+              <tr>
+                <td><code>openai-official</code></td>
+                <td><code>agentscope-extensions-model-openai-official</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-openai-official/pom.xml:29">pom.xml:29</span></td>
+                <td>OpenAI 官方 Java SDK，只走 Responses API；没有专用 starter</td>
+                <td>第 28 章</td>
+              </tr>
+              <tr>
+                <td><code>dashscope</code> / <code>qwen*</code></td>
+                <td><code>agentscope-extensions-model-dashscope</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-dashscope/pom.xml:29">pom.xml:29</span></td>
+                <td>DashScope / 通义千问；支持短名与 thinking</td>
+                <td>第 28 章</td>
+              </tr>
+              <tr>
+                <td><code>gemini</code></td>
+                <td><code>agentscope-extensions-model-gemini</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-gemini/pom.xml:29">pom.xml:29</span></td>
+                <td>Gemini API；Vertex AI 需显式 builder 配置</td>
+                <td>第 28 章</td>
+              </tr>
+              <tr>
+                <td><code>anthropic</code></td>
+                <td><code>agentscope-extensions-model-anthropic</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-anthropic/pom.xml:29">pom.xml:29</span></td>
+                <td>Anthropic Messages API；apiKey 与 authToken 互斥</td>
+                <td>第 28 章</td>
+              </tr>
+              <tr>
+                <td><code>ollama</code></td>
+                <td><code>agentscope-extensions-model-ollama</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-model/agentscope-extensions-model-ollama/pom.xml:29">pom.xml:29</span></td>
+                <td>本地 Ollama；无必填密钥</td>
+                <td>第 28 章</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="memory">记忆：三个后端，一个已弃用接口</h2>
+        <p>
+          Mem0、百炼、ReMe 都实现同一个 <code>LongTermMemory</code> 接口；接口本身从 2.0.0 起已标记弃用，
+          但三个适配器仍可运行，适合作为迁移对象而不是新项目地基。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>能力</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Mem0</td><td><code>agentscope-extensions-mem0</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-mem0/pom.xml:31">pom.xml:31</span></td><td>托管记忆服务；metadata 过滤与固定 topK 5</td><td>第 29 章</td></tr>
+              <tr><td>百炼记忆</td><td><code>agentscope-extensions-memory-bailian</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-memory-bailian/pom.xml:31">pom.xml:31</span></td><td>阿里云托管记忆库；topK 10 / minScore 0.3</td><td>第 29 章</td></tr>
+              <tr><td>ReMe</td><td><code>agentscope-extensions-reme</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mem/agentscope-extensions-reme/pom.xml:31">pom.xml:31</span></td><td>按 workspace 组织的轨迹记忆；固定 topK 5</td><td>第 29 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="store">状态 / 分布式存储：先 JDBC，再按能力补齐</h2>
+        <p>
+          <code>AgentStateStore</code> 与 <code>DistributedStore</code> 共用 Redis / JDBC / MongoDB / OSS 这些后端。
+          关系型数据库优先 JDBC；旧 MySQL 类只保留兼容，不要写进新代码。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>后端</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Redis</td><td><code>agentscope-extensions-redis</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-redis/pom.xml:31">pom.xml:31</span></td><td>状态、KV、快照、分布式锁四项齐全；低延迟多副本首选</td><td>第 30、31 章</td></tr>
+              <tr><td>JDBC</td><td><code>agentscope-extensions-jdbc</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-jdbc/pom.xml:31">pom.xml:31</span></td><td>当前关系型主线，支持 MySQL / PostgreSQL / H2 / SQLite；组件懒加载</td><td>第 30、31 章</td></tr>
+              <tr><td>MongoDB</td><td><code>agentscope-extensions-mongodb</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/pom.xml:31">pom.xml:31</span></td><td>文档型状态 + GridFS 快照；TTL 默认关闭</td><td>第 30、31 章</td></tr>
+              <tr><td>OSS</td><td><code>agentscope-extensions-oss</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-oss/pom.xml:31">pom.xml:31</span></td><td>大快照首选；没有 <code>SandboxExecutionGuard</code></td><td>第 30、31 章</td></tr>
+              <tr><td>MySQL（legacy）</td><td><code>agentscope-extensions-mysql</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mysql/pom.xml:31">pom.xml:31</span></td><td><code>MysqlDistributedStore</code> 已标未来移除；<code>MysqlAgentStateStore</code> 是旧实现</td><td>第 30、31 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="rag">RAG：五种知识库，整条路径是 legacy</h2>
+        <p>
+          Simple、百炼、Dify、HayStack、RAGFlow 五个适配器仍实现 <code>Knowledge</code>，但
+          <code>Knowledge</code> / <code>RAGMode</code> / <code>RetrieveConfig</code> 从 2.0.0 起都已弃用。
+          新项目更适合把检索做成应用层工具。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>实现</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Simple</td><td><code>agentscope-extensions-rag-simple</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-simple/pom.xml:31">pom.xml:31</span></td><td>自己管读取、切块、embedding 与向量库；唯一支持写入</td><td>第 32 章</td></tr>
+              <tr><td>百炼</td><td><code>agentscope-extensions-rag-bailian</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-bailian/pom.xml:31">pom.xml:31</span></td><td>托管索引，Java 只检索；写入抛 <code>UnsupportedOperationException</code></td><td>第 32 章</td></tr>
+              <tr><td>Dify</td><td><code>agentscope-extensions-rag-dify</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-dify/pom.xml:31">pom.xml:31</span></td><td>数据集 + 四种检索模式；topK 10 / 阈值 0.0</td><td>第 32 章</td></tr>
+              <tr><td>HayStack</td><td><code>agentscope-extensions-rag-haystack</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-haystack/pom.xml:31">pom.xml:31</span></td><td>复用已有索引流水线；topK 3 / 30 秒超时 / 3 次重试</td><td>第 32 章</td></tr>
+              <tr><td>RAGFlow</td><td><code>agentscope-extensions-rag-ragflow</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-ragflow/pom.xml:31">pom.xml:31</span></td><td>复杂文档解析；topK 1024 / 阈值 0.2</td><td>第 32 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="protocol">协议与兼容层：先看调用方</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>能力</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>A2A 客户端</td><td><code>agentscope-extensions-a2a-client</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-client/pom.xml:30">pom.xml:30</span></td><td>把远端 A2A Agent 变成本地 Agent；按 AgentCard 解析</td><td>第 33 章</td></tr>
+              <tr><td>A2A 服务端</td><td><code>agentscope-extensions-a2a-server</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/pom.xml:31">pom.xml:31</span></td><td>组装处理器，不负责监听端口；注册 AgentCard</td><td>第 33 章</td></tr>
+              <tr><td>Agent Protocol</td><td><code>agentscope-extensions-agent-protocol</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agent-protocol/pom.xml:29">pom.xml:29</span></td><td><code>/tasks</code> 任务 API + SSE / HITL</td><td>第 33 章</td></tr>
+              <tr><td>AG-UI</td><td><code>agentscope-extensions-agui</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-agui/pom.xml:28">pom.xml:28</span></td><td>把 <code>AgentEvent</code> 映射成前端事件流；支持 interrupt / resume</td><td>第 33 章</td></tr>
+              <tr><td>Chat Completions</td><td><code>agentscope-extensions-chat-completions-web</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-chat-completions-web/pom.xml:28">pom.xml:28</span></td><td>框架无关适配器；HTTP / SSE 路由由 starter 或自写 Controller 提供</td><td>第 36 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="channel">渠道：公共组件 + 六个平台适配器</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>平台</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>公共</td><td><code>agentscope-extensions-channel-common</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-common/pom.xml:28">pom.xml:28</span></td><td>去重、防循环、token 缓存与 <code>Channel</code> 契约</td><td>第 34 章</td></tr>
+              <tr><td>钉钉</td><td><code>agentscope-extensions-channel-dingtalk</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-dingtalk/pom.xml:28">pom.xml:28</span></td><td>Stream 默认，HTTP 可选；HTTP 可配 <code>aesKey</code></td><td>第 34 章</td></tr>
+              <tr><td>飞书</td><td><code>agentscope-extensions-channel-feishu</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-feishu/pom.xml:28">pom.xml:28</span></td><td>事件订阅 v2；可选 AES-256-CBC 解密</td><td>第 34 章</td></tr>
+              <tr><td>企微</td><td><code>agentscope-extensions-channel-wecom</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-wecom/pom.xml:28">pom.xml:28</span></td><td>回调全加密；token / timestamp / nonce 验签</td><td>第 34 章</td></tr>
+              <tr><td>微信</td><td><code>agentscope-extensions-channel-weixin</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-weixin/pom.xml:40">pom.xml:40</span></td><td>微信渠道适配器；保留独立模块</td><td>第 34 章</td></tr>
+              <tr><td>GitHub</td><td><code>agentscope-extensions-channel-github</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-github/pom.xml:28">pom.xml:28</span></td><td>issue / PR 评论 Webhook；HMAC-SHA256</td><td>第 34 章</td></tr>
+              <tr><td>GitLab</td><td><code>agentscope-extensions-channel-gitlab</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-channel/agentscope-extensions-channel-gitlab/pom.xml:28">pom.xml:28</span></td><td>Note hook；过滤 bot 自身评论</td><td>第 34 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="skill">技能仓库：四种来源</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>来源</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Git</td><td><code>agentscope-extensions-skill-git-repository</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/pom.xml:31">pom.xml:31</span></td><td>只读；autoSync 默认开；读前 ls-remote，变化才 pull</td><td>第 35 章</td></tr>
+              <tr><td>MySQL</td><td><code>agentscope-extensions-skill-mysql-repository</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/pom.xml:29">pom.xml:29</span></td><td>在线 CRUD；旧文档构造器不存在，用三参或 builder</td><td>第 35 章</td></tr>
+              <tr><td>PostgreSQL</td><td><code>agentscope-extensions-skill-postgresql-repository</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-postgresql-repository/pom.xml:29">pom.xml:29</span></td><td>schema 隔离；默认 schema <code>agentscope</code></td><td>第 35 章</td></tr>
+              <tr><td>Nacos</td><td><code>agentscope-extensions-nacos-skill</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-skill/pom.xml:29">pom.xml:29</span></td><td>只读 ZIP；枚举必须给 <code>knownSkillNames</code></td><td>第 36 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="infra">基础设施：注册、网关、调度</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>能力</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Nacos A2A</td><td><code>agentscope-extensions-nacos-a2a</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/pom.xml:29">pom.xml:29</span></td><td>AgentCard / 端点注册与发现</td><td>第 36 章</td></tr>
+              <tr><td>Nacos Prompt</td><td><code>agentscope-extensions-nacos-prompt</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-prompt/pom.xml:29">pom.xml:29</span></td><td>订阅模板、缓存、热更新；缓存键只有 promptKey</td><td>第 36 章</td></tr>
+              <tr><td>Higress</td><td><code>agentscope-extensions-higress</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/pom.xml:29">pom.xml:29</span></td><td>MCP 工具客户端 + 工具搜索 + <code>HigressToolkit</code></td><td>第 36 章</td></tr>
+              <tr><td>Scheduler 公共</td><td><code>agentscope-extensions-scheduler-common</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-common/pom.xml:31">pom.xml:31</span></td><td><code>AgentScheduler</code> / <code>ScheduleConfig</code> / <code>ScheduleAgentTask</code></td><td>第 36 章</td></tr>
+              <tr><td>Quartz</td><td><code>agentscope-extensions-scheduler-quartz</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/pom.xml:28">pom.xml:28</span></td><td>本地 / 小集群；CRON、固定速率、固定延迟</td><td>第 36 章</td></tr>
+              <tr><td>XXL-Job</td><td><code>agentscope-extensions-scheduler-xxl-job</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-xxl-job/pom.xml:29">pom.xml:29</span></td><td>只注册 JobHandler；调度在控制台配置</td><td>第 36 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="ecosystem">生态：调试与训练</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>能力</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Studio</td><td><code>agentscope-extensions-studio</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/pom.xml:28">pom.xml:28</span></td><td>消息推送、trace、HITL；initialize 自动挂 Hook</td><td>第 36 章</td></tr>
+              <tr><td>Training</td><td><code>agentscope-extensions-training</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-training/pom.xml:28">pom.xml:28</span></td><td>采样、影子 Agent、reward、周期 commit</td><td>第 36 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="service">服务化：把应用接进控制面</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>能力</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>External Agent SDK</td><td><code>agentscope-extensions-aistio</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-aistio/pom.xml:33">pom.xml:33</span></td><td><code>Aistio.instrument</code> / <code>newBridge</code>；注册后进入 Agent 目录</td><td>第 22 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="sandbox">沙箱：Docker 之外四个后端</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>后端</th><th>artifactId（出处）</th><th>说明</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Kubernetes</td><td><code>agentscope-extensions-sandbox-kubernetes</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-sandbox/agentscope-extensions-sandbox-kubernetes/pom.xml:31">pom.xml:31</span></td><td>Pod 级隔离；适合已有 K8s 集群</td><td>第 13 章</td></tr>
+              <tr><td>AgentRun</td><td><code>agentscope-extensions-sandbox-agentrun</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-sandbox/agentscope-extensions-sandbox-agentrun/pom.xml:31">pom.xml:31</span></td><td>托管沙箱运行时</td><td>第 13 章</td></tr>
+              <tr><td>Daytona</td><td><code>agentscope-extensions-sandbox-daytona</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-sandbox/agentscope-extensions-sandbox-daytona/pom.xml:31">pom.xml:31</span></td><td>远程开发环境型沙箱</td><td>第 13 章</td></tr>
+              <tr><td>E2B</td><td><code>agentscope-extensions-sandbox-e2b</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-sandbox/agentscope-extensions-sandbox-e2b/pom.xml:31">pom.xml:31</span></td><td>托管代码执行沙箱</td><td>第 13 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="starters">Spring Boot starter：自动装配层</h2>
+        <p>
+          starter 只负责装配，不替代扩展 artifact。模型 starter 通常只在
+          <code>agentscope.model.provider</code> 匹配且容器里没有现成 <code>Model</code> bean 时创建模型。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>starter</th><th>artifactId（出处）</th><th>装配什么</th><th>章节</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>核心</td><td><code>agentscope-spring-boot-starter</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-spring-boot-starter/pom.xml:28">pom.xml:28</span></td><td>ReActAgent 基础装配与默认配置</td><td>第 28 章</td></tr>
+              <tr><td>OpenAI</td><td><code>agentscope-openai-spring-boot-starter</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-openai-spring-boot-starter/pom.xml:28">pom.xml:28</span></td><td><code>agentscope.model.provider=openai</code> 时创建 OpenAI 模型</td><td>第 28 章</td></tr>
+              <tr><td>DashScope</td><td><code>agentscope-dashscope-spring-boot-starter</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-dashscope-spring-boot-starter/pom.xml:28">pom.xml:28</span></td><td>DashScope 模型自动配置</td><td>第 28 章</td></tr>
+              <tr><td>Anthropic</td><td><code>agentscope-anthropic-spring-boot-starter</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-anthropic-spring-boot-starter/pom.xml:28">pom.xml:28</span></td><td>Anthropic 模型自动配置</td><td>第 28 章</td></tr>
+              <tr><td>Gemini</td><td><code>agentscope-gemini-spring-boot-starter</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-gemini-spring-boot-starter/pom.xml:28">pom.xml:28</span></td><td>Gemini 模型自动配置</td><td>第 28 章</td></tr>
+              <tr><td>Ollama</td><td><code>agentscope-ollama-spring-boot-starter</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-ollama-spring-boot-starter/pom.xml:26">pom.xml:26</span></td><td>本地 Ollama 模型自动配置</td><td>第 28 章</td></tr>
+              <tr><td>Nacos</td><td><code>agentscope-nacos-spring-boot-starter</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-nacos-spring-boot-starter/pom.xml:28">pom.xml:28</span></td><td>A2A 注册发现、Prompt 配置中心</td><td>第 36 章</td></tr>
+              <tr><td>A2A</td><td><code>agentscope-a2a-spring-boot-starter</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-a2a-spring-boot-starter/pom.xml:28">pom.xml:28</span></td><td>A2A 服务端自动配置</td><td>第 33 章</td></tr>
+              <tr><td>AG-UI</td><td><code>agentscope-agui-spring-boot-starter</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-agui-spring-boot-starter/pom.xml:28">pom.xml:28</span></td><td>AG-UI 事件流与路由</td><td>第 33 章</td></tr>
+              <tr><td>Chat Completions</td><td><code>agentscope-chat-completions-web-starter</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-chat-completions-web-starter/pom.xml:32">pom.xml:32</span></td><td><code>/v1/chat/completions</code> 控制器与 SSE</td><td>第 36 章</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="version">版本与选型提醒</h2>
+        <ul class="goals">
+          <li><strong>版本统一</strong>：所有 artifact 跟根 <code>revision</code> 走，当前是 <code>2.0.4</code><span class="src" data-src="agentscope-java-2.0.4/pom.xml:30">pom.xml:30</span>；不要给单个扩展写别的版本。</li>
+          <li><strong>先扩展，后 starter</strong>：普通 Java 应用不需要 starter；Spring Boot 只有在需要自动装配时才加。</li>
+          <li><strong>模型看 id，不看 artifact</strong>：<code>deepseek:</code> 等五个 id 共用 OpenAI 兼容 artifact。</li>
+          <li><strong>关系型存储优先 JDBC</strong>：<code>MysqlDistributedStore</code> / <code>MysqlAgentStateStore</code> 都是兼容层。</li>
+          <li><strong>RAG / 记忆是 legacy</strong>：适配器可用，但新项目优先应用层集成。</li>
+        </ul>
+
+        <h2 id="next">接着看什么</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="../chapters/27-extension-ecosystem.html">27 扩展生态</a></td><td>按契约 / 实现 / 装配三层理解这些 artifact 的位置</td></tr>
+              <tr><td><a href="../chapters/36a-integration-playbooks.html">36A 集成落地手册</a></td><td>把 artifact 真正接起来：Nacos / Higress / Scheduler / Studio / Training / Chat Completions</td></tr>
+              <tr><td><a href="errata.html">附录 E 勘误汇总</a></td><td>artifact 名、构造器、默认值与文档不一致时的核对入口</td></tr>
+              <tr><td><a href="source-map.html">附录 D 源码地图</a></td><td>找不到扩展模块时，先看它在 core / harness 还是 extensions</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          表里的 artifactId 以各模块 <code>pom.xml</code> 为准；starter 只列正文覆盖到的 10 个，
+          仓库里另有 <code>admin</code>、<code>jev</code> 等 starter，未在 00–36 章展开。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

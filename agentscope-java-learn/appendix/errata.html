@@ -3,12 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="全书 19 个有偏差章节里共 78 条「官方文档这么说、2.0.4 源码那么写」的核对结果，这一页把它们按章收进一张表：默认值、触发时机、参数名、未接线字段，每条都同时给出文档行号与源码行号，遇到对不上的描述先来这里查。" />
+    <meta name="description" content="全书 19 个有偏差章节里共 79 条「官方文档这么说、2.0.4 源码那么写」的核对结果，这一页把它们按章收进一张表：默认值、触发时机、参数名、未接线字段，每条都同时给出文档行号与源码行号，遇到对不上的描述先来这里查。" />
     <meta property="og:type" content="article" />
     <meta property="og:locale" content="zh_CN" />
     <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
     <meta property="og:title" content="附录 E 勘误汇总：官方文档 vs 2.0.4 源码 · AgentScope Java 2.0.4 学习站" />
-    <meta property="og:description" content="全书 19 个有偏差章节里共 78 条「官方文档这么说、2.0.4 源码那么写」的核对结果，这一页把它们按章收进一张表：默认值、触发时机、参数名、未接线字段，每条都同时给出文档行号与源码行号，遇到对不上的描述先来这里查。" />
+    <meta property="og:description" content="全书 19 个有偏差章节里共 79 条「官方文档这么说、2.0.4 源码那么写」的核对结果，这一页把它们按章收进一张表：默认值、触发时机、参数名、未接线字段，每条都同时给出文档行号与源码行号，遇到对不上的描述先来这里查。" />
     <title>附录 E 勘误汇总：官方文档 vs 2.0.4 源码 · AgentScope Java 2.0.4 学习站</title>
     <script>
       try {
@@ -28,12 +28,12 @@
         <p class="lede">
           这是全站最「不客气」的一页：把全书逐条核对出来的偏差集中成一张表。左边是
           <code>docs/v2/zh/**</code> 的原话，右边是 <code>agentscope-java-2.0.4</code> 里真正执行的代码，中间那句是「照文档写会怎么坑你」。
-          一共 <strong>78 条</strong>，去掉三组跨章重复后是 75 条独立偏差。每条都带文档与源码两套行号，可以自己复核。
+          一共 <strong>79 条</strong>，去掉三组跨章重复后是 76 条独立偏差。每条都带文档与源码两套行号，可以自己复核。
         </p>
         <div class="callout warn">
           <span class="ct">范围说明：只列真正有偏差的 19 章</span>
           <p>
-            下面的 78 条覆盖 04、08–10、12–18、21、29–33、35–36。第 20–36 章新增的差异——A2A starter 名、RAG 的
+            下面的 79 条覆盖 04、08–10、12–18、21、29–33、35–36。第 20–36 章新增的差异——A2A starter 名、RAG 的
             <code>RAGMode</code> 枚举、MySQL 技能仓库构造器、Nacos A2A 构造器、Scheduler 的
             <code>pause</code> / <code>resume</code>、Studio 自动 Hook、Training 影子流量、Chat Completions 适配器签名——已经回填到本表。
             没有列出的章节，是正文没有发现「文档与源码不一致」的条目，不代表它们没有坑。
@@ -109,7 +109,7 @@
 
         <h2 id="by-chapter">按章查</h2>
         <p>
-          只列有偏差的 19 章（04、08–10、12–18、21、29–33、35–36）。01–03、05–07、11、19–20、22–28、34 与附录 A–D 没有发现「文档与源码不一致」的条目，不代表它们没有坑，
+          只列有偏差的 19 章（04、08–10、12–18、21、29–33、35–36）。01–03、05–07、11、19–20、22–28、34 与附录 A–D、F 没有发现「文档与源码不一致」的条目，不代表它们没有坑，
           而是那些坑在正文的「陷阱与窍门」里，不属于勘误。同一处文档被两章引用时（Docker 镜像、isolationScope、本地状态存储强度），
           两章都会列一次，方便按章阅读。
         </p>
@@ -662,7 +662,7 @@
           </table>
         </div>
 
-        <h3 id="ch36">36 · 基础设施与生态（8 条）</h3>
+        <h3 id="ch36">36 · 基础设施与生态（9 条）</h3>
         <div class="table-wrap">
           <table>
             <thead>
@@ -673,6 +673,11 @@
                 <td>文档写 <code>new NacosA2aRegistryProperties()</code><span class="src" data-src="docs/v2/zh/integration/infrastructure/nacos.md:36-38">nacos.md:36-38</span>，又写 <code>new NacosAgentCardResolver(props, "translator-agent")</code><span class="src" data-src="docs/v2/zh/integration/infrastructure/nacos.md:48-52">nacos.md:48-52</span></td>
                 <td><code>NacosA2aRegistryProperties</code> 是四字段 record，没有无参构造器<span class="src" data-src="agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/registry/NacosA2aRegistryProperties.java:34-38">NacosA2aRegistryProperties.java:34-38</span>；解析器只有 <code>(Properties)</code> / <code>(AiService)</code> 两个构造器，Agent 名由 <code>A2aAgent.builder().name(...)</code> 提供<span class="src" data-src="agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/discovery/NacosAgentCardResolver.java:75-88">NacosAgentCardResolver.java:75-88</span></td>
                 <td>照文档写两处都会编译失败；properties 用 <code>builder()</code>，resolver 用 <code>(Properties)</code>，名字交给 <code>A2aAgent</code></td>
+              </tr>
+              <tr id="ch36-nacos-a2a-builder">
+                <td>Nacos 页写 <code>AgentScopeA2aServer.builder().agentRegistry(...)</code><span class="src" data-src="docs/v2/zh/integration/infrastructure/nacos.md:107-110">nacos.md:107-110</span></td>
+                <td>builder 必须传 <code>ReActAgent.Builder</code> 或 <code>AgentRunner</code><span class="src" data-src="agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:174-184">AgentScopeA2aServer.java:174-184</span>，注册方法叫 <code>withAgentRegistry(...)</code><span class="src" data-src="agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:333">:333</span></td>
+                <td>照文档写会编译失败；用 <code>builder(agentBuilder).withAgentRegistry(registry)</code></td>
               </tr>
               <tr id="ch36-higress-build">
                 <td>Higress 快速上手以 <code>.build()</code> 结尾<span class="src" data-src="docs/v2/zh/integration/infrastructure/higress.md:31-34">higress.md:31-34</span></td>
@@ -715,7 +720,7 @@
 
 
         <h2 id="why">为什么会有这些差异</h2>
-        <p>把 78 条放在一起看，成因其实只有三类，认出类型就能猜出该信哪边：</p>
+        <p>把 79 条放在一起看，成因其实只有三类，认出类型就能猜出该信哪边：</p>
         <ol class="steps">
           <li>
             <span class="sh">文档滞后于代码</span>
@@ -728,7 +733,7 @@
             <span class="sh">示例从 1.x 或别的语言搬来</span>
             <div>
               1.x 的 <code>memory.addMessage()</code>、<code>StaticLongTermMemoryHook</code>、Python 部署页的示例，都还在文档站里。典型：09 章示例缺
-              <code>RuntimeContext</code> 参数（07 章 1.x 记忆 API 整包换成新接口，不在这 78 条里，正文有专段说）。这类先看包级 <code>@Deprecated</code> 与签名。
+              <code>RuntimeContext</code> 参数（07 章 1.x 记忆 API 整包换成新接口，不在这 79 条里，正文有专段说）。这类先看包级 <code>@Deprecated</code> 与签名。
             </div>
           </li>
           <li>

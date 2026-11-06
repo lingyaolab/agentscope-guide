@@ -36,6 +36,13 @@
           这一章补的是「Agent 怎么进入企业已有的运行环境」：注册到控制面、通过网关拿工具、被调度器触发、在 Studio 里被看见、把线上流量喂给训练后端。
           它们大多不改 Agent 的推理逻辑，改的是 Agent 的外围边界；边界没分清，接入就会变成一堆看似成功、实际不生效的配置。
         </p>
+        <div class="callout tip">
+          <span class="ct">想直接照着接？</span>
+          <p>
+            本章讲清「接在哪一层、默认值是什么、哪里会坏」；真正动手时看配套的
+            <a href="36a-integration-playbooks.html">36A 集成落地手册</a>，那里把七条链路拆成了配置、代码、验收与失败边界。
+          </p>
+        </div>
 
         <h2 id="goals">读完你能做到</h2>
         <ul class="goals">
@@ -828,6 +835,8 @@ Flux&lt;ChatCompletionsChunk&gt; stream = adapter.stream(
               <tr><td><a href="33-protocols.html">33 A2A / Agent Protocol / AG-UI</a></td><td>Nacos A2A 的协议底座</td></tr>
               <tr><td><a href="34-channels.html">34 渠道</a></td><td>入站入口与去重、防循环边界</td></tr>
               <tr><td><a href="35-skill-repositories.html">35 技能仓库</a></td><td>Nacos Skill 与 Git / MySQL / PostgreSQL 的对比</td></tr>
+              <tr><td><a href="36a-integration-playbooks.html">36A 集成落地手册</a></td><td>把 Nacos / Higress / Scheduler / Studio / Training / Chat 真正接起来</td></tr>
+              <tr><td><a href="../appendix/artifacts.html">附录 F · 扩展 artifact 速查</a></td><td>每条链路要引哪个 artifact</td></tr>
               <tr><td><a href="../appendix/errata.html">附录 E · 勘误汇总</a></td><td>本页几个文档与源码差异的核对方式</td></tr>
               <tr><td>官方「基础设施」与「生态」概览</td><td>依赖与模块清单<span class="src" data-src="docs/v2/zh/integration/infrastructure/overview.md:8-19">overview.md:8-19</span><span class="src" data-src="docs/v2/zh/integration/ecosystem/overview.md:8-12">overview.md:8-12</span></td></tr>
             </tbody>
