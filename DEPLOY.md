@@ -70,7 +70,7 @@ server {
   }
   error_page 404 /404.html;
 
-  # 搜索索引约 1038 KB，建议开启压缩
+  # 搜索索引约 1061 KB，建议开启压缩
   gzip on;
   gzip_types text/html text/css application/javascript image/svg+xml;
 }
@@ -95,7 +95,7 @@ location ~* \.(css|js|svg)$ { add_header Cache-Control "public, max-age=86400"; 
 ```powershell
 node tools/build-search-index.cjs   # 正文改过就必须重建
 node tools/check-site.cjs           # 静态 + 浏览器回归（当前 38 项）
-node tools/check-sources.cjs        # 2721 条出处是否都能定位
+node tools/check-sources.cjs        # 2792 条出处是否都能定位
 ```
 
 再手测三件事：

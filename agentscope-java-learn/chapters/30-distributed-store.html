@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 30 章拆 AgentScope Java 2.0.4 的分布式存储：DistributedStore 的九个组件、Redis / JDBC / MongoDB / OSS 的差异、混合后端、隔离范围、CAS 边界与 aistio 托管 Store。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="30 分布式存储：Redis / MySQL / MongoDB / OSS · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 30 章拆 AgentScope Java 2.0.4 的分布式存储：DistributedStore 的九个组件、Redis / JDBC / MongoDB / OSS 的差异、混合后端、隔离范围、CAS 边界与 aistio 托管 Store。"
+    />
+    <title>30 分布式存储：Redis / MySQL / MongoDB / OSS · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="30-distributed-store" data-root="..">
+    <main>
+      <article class="article">
+        <h1>30 · 分布式存储：Redis / MySQL / MongoDB / OSS</h1>
+        <p class="lede">
+          单机跑 Agent 时，状态写本地 JSON、文件写本地目录、沙箱快照不存，一切都能工作。一旦变成多副本，
+          同一会话可能落到不同进程：状态会互相覆盖，文件会「这台有、那台没有」，沙箱会在两个节点同时启动。
+          <code>DistributedStore</code> 就是把这些组件收成一个门面的地方，但它不替你选文件系统，也不保证每个后端能力相同。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 <code>DistributedStore</code> 的九个 getter 中，哪两个必填、哪些有默认值、哪些可以留空</li>
+          <li>解释 <code>HarnessAgent</code> 的装配优先级，以及为什么 <code>RemoteFilesystemSpec</code> 配本地状态存储会直接报错</li>
+          <li>按能力矩阵选择 Redis、JDBC、MongoDB、OSS，而不是按品牌背模块名</li>
+          <li>用混合后端解决「对象存储不能做锁」「MongoDB 快照很大」「MySQL 已有基础设施」三类冲突</li>
+          <li>区分 <code>USER</code>、<code>SESSION</code>、<code>AGENT</code>、<code>GLOBAL</code> 四种隔离范围，以及并发时的真实语义</li>
+          <li>识别 CAS 不是每个后端都有，并解释 aistio 托管 Store 为什么仍要求自备 <code>AgentStateStore</code></li>
+        </ul>
+
+        <h2 id="why">单机默认与多副本现实</h2>
+        <p>
+          不开分布式存储时，Harness 会退回本地实现：状态用 <code>JsonFileAgentStateStore</code>，工作区用本地文件系统，
+          沙箱快照默认 <code>NoopSnapshotSpec</code>，并发锁默认 no-op
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2426-2429">HarnessAgent.java:2426-2429</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:90-112">DistributedStore.java:90-112</span>。
+          这些默认值在单进程里很合理，在多副本里就是数据竞争。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>问题</th><th>单机默认</th><th>多副本后果</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>会话状态</td><td>本地 JSON 文件</td><td>同一 <code>sessionId</code> 落到不同 Pod，互相看不到；并发写最后写入者覆盖</td></tr>
+              <tr><td>工作区文件</td><td>本地目录</td><td>换节点后文件消失；<code>RemoteFilesystemSpec</code> 直接拒绝本地状态</td></tr>
+              <tr><td>沙箱快照</td><td>不保存</td><td>下次调用拿不到上一次的工作区</td></tr>
+              <tr><td>并发锁</td><td>不限制</td><td><code>USER</code> / <code>AGENT</code> / <code>GLOBAL</code> 范围下两个沙箱同时改同一份状态</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>DistributedStore</code> 的设计目标就是「一次配置，覆盖这些组件」。但它只提供存储组件，
+          <strong>文件系统模式仍要你显式选</strong>：注释写得很清楚，distributed store 提供 storage，filesystem mode 是用户的选择
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2381-2384">HarnessAgent.java:2381-2384</span>。
+        </p>
+
+        <h2 id="contract">契约：九个 getter，两个必填</h2>
+        <p>
+          官方文档常把它讲成「四件套」，但 2.0.4 的接口实际有九个 getter：状态、基础 KV、快照、并发锁，外加消息总线、
+          异步工具注册表、任务仓库、会话轮次闸门和 Team 客户端
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:74-179">DistributedStore.java:74-179</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>组件</th><th>是否必填</th><th>默认</th><th>作用</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>agentStateStore()</code></td><td>是</td><td>无，builder 缺失抛 NPE</td><td>会话状态持久化，第 31 章细讲</td></tr>
+              <tr><td><code>baseStore()</code></td><td>是</td><td>无，builder 缺失抛 NPE</td><td>工作区文件 KV，供 <code>RemoteFilesystemSpec</code></td></tr>
+              <tr><td><code>sandboxSnapshotSpec()</code></td><td>否</td><td><code>NoopSnapshotSpec</code></td><td>沙箱工作区 tar 快照</td></tr>
+              <tr><td><code>sandboxExecutionGuard()</code></td><td>否</td><td>no-op guard</td><td>沙箱并发锁</td></tr>
+              <tr><td><code>messageBus()</code></td><td>否</td><td><code>null</code>，回退 workspace</td><td>消息投递与事件流</td></tr>
+              <tr><td><code>asyncToolRegistry()</code></td><td>否</td><td><code>null</code></td><td>异步工具执行记录</td></tr>
+              <tr><td><code>taskRepository()</code></td><td>否</td><td><code>null</code></td><td>子 Agent 后台任务</td></tr>
+              <tr><td><code>sessionTurnGate()</code></td><td>否</td><td><code>null</code></td><td>按会话串行化轮次</td></tr>
+              <tr><td><code>teamClient()</code></td><td>否</td><td><code>null</code></td><td>Team 协作</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          builder 的校验很简单：<code>agentStateStore</code> 与 <code>baseStore</code> 必须非空，快照与锁为空就换成 no-op，
+          其余五个直接传 <code>null</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:303-321">DistributedStore.java:303-321</span>。
+          所以「混合后端」不是高级技巧，而是 builder 的默认能力。
+        </p>
+        <pre data-lang="java" data-file="最小 DistributedStore（示意）">DistributedStore store = DistributedStore.builder()
+    .agentStateStore(redisStore.agentStateStore())
+    .baseStore(redisStore.baseStore())
+    .build();</pre>
+
+        <h2 id="autowire">装配：显式 builder &gt; distributedStore &gt; 本地默认</h2>
+        <p>
+          <code>HarnessAgent</code> 的优先级是固定的：显式 builder 方法最高，其次是 <code>distributedStore</code> 自动注入，
+          最后才是 workspace 默认
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2381-2407">HarnessAgent.java:2381-2407</span>。
+          自动注入覆盖：状态、远程文件 KV、沙箱快照、沙箱锁、消息总线、异步工具注册表；任务仓库与会话闸门在上层按需使用。
+        </p>
+        <div class="callout danger">
+          <span class="ct">远程文件 + 本地状态 = 启动失败</span>
+          <p>
+            如果用了 <code>RemoteFilesystemSpec</code>，但最终生效的 <code>AgentStateStore</code> 仍是
+            <code>JsonFileAgentStateStore</code> 或 <code>InMemoryAgentStateStore</code>，Harness 会直接抛
+            <code>IllegalStateException</code>，提示你配置分布式状态存储或改用 <code>.distributedStore(...)</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431-2438">HarnessAgent.java:2431-2438</span>。
+            这不是配置警告，而是设计上的拒绝：远程文件系统不能配一个进程内的状态存储。
+          </p>
+        </div>
+        <p>
+          这也是本章与第 31 章的分界：本章讲「怎么把组件接上」，第 31 章讲「状态存储内部怎么序列化、怎么做 CAS」。
+        </p>
+
+        <h2 id="components">四件核心组件，五个可选扩展</h2>
+        <p>
+          先把四个核心组件的职责分清，后面选后端才不会混。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>组件</th><th>存什么</th><th>谁消费</th><th>没有它会怎样</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>AgentStateStore</code></td><td>会话上下文、摘要、权限 / 工具 / 任务子状态</td><td>ReActAgent</td><td>重启丢失，多副本各写各的</td></tr>
+              <tr><td><code>BaseStore</code></td><td><code>MEMORY.md</code>、<code>memory/</code>、<code>skills/</code>、<code>sessions/</code> 等路径</td><td><code>RemoteFilesystemSpec</code></td><td>文件只在单机可见</td></tr>
+              <tr><td><code>SandboxSnapshotSpec</code></td><td>沙箱工作区 tar 包</td><td>Sandbox 文件系统</td><td>下次调用不恢复上次工作区</td></tr>
+              <tr><td><code>SandboxExecutionGuard</code></td><td>按隔离键的租约</td><td>Sandbox 文件系统</td><td>同范围并发调用可能互相覆盖</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          后五个组件属于「有则更好」：消息总线、异步工具注册表、任务仓库、会话轮次闸门与 Team 客户端。它们默认
+          <code>null</code>，由 Harness 回退到 workspace 或本地实现；只有使用托管 Store 或特定部署时才需要关心
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:114-179">DistributedStore.java:114-179</span>。
+        </p>
+
+        <h2 id="redis">Redis：默认最全，适合低延迟多副本</h2>
+        <p>
+          Redis 是文档里的多副本首选，也是能力矩阵里四项核心组件齐全的后端
+          <span class="src" data-src="docs/v2/zh/integration/distributed/redis.md:6">redis.md:6</span>
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:24-33">index.md:24-33</span>。
+          <code>RedisDistributedStore.fromJedis(jedis)</code> 会把默认前缀 <code>agentscope:</code> 拆成
+          <code>agentscope:session:</code>、<code>agentscope:store:</code>、<code>agentscope:snapshot:</code>、
+          <code>agentscope:guard:</code> 四组 key
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-redis/src/main/java/io/agentscope/extensions/redis/RedisDistributedStore.java:56-108">RedisDistributedStore.java:56-108</span>。
+        </p>
+        <pre data-lang="java" data-file="Redis 一键配置（示意）">DistributedStore store = RedisDistributedStore.fromJedis(
+        new JedisPooled("redis://localhost:6379"));
+
+HarnessAgent agent = HarnessAgent.builder()
+    .name("assistant")
+    .distributedStore(store)
+    .filesystem(new RemoteFilesystemSpec()
+            .isolationScope(IsolationScope.USER))
+    .build();</pre>
+        <p>
+          Redis 的 <code>BaseStore</code> 用 Lua 把「读版本 + 写 hash + 更索引」放进一次 <code>EVAL</code>，
+          所以 <code>putIfVersion</code> 可以作为跨副本 CAS
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-redis/src/main/java/io/agentscope/extensions/redis/store/RedisStore.java:47-85">RedisStore.java:47-85</span>。
+          快照 TTL 是可选的，<code>null</code> 表示不过期
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-redis/src/main/java/io/agentscope/extensions/redis/snapshot/RedisSnapshotSpec.java:27-35">RedisSnapshotSpec.java:27-35</span>；
+          独立 guard 的默认租约是 30 分钟、重试间隔 500ms
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-redis/src/main/java/io/agentscope/extensions/redis/sandbox/RedisSandboxExecutionGuard.java:192-199">RedisSandboxExecutionGuard.java:192-199</span>。
+          代价是内存：大工作区快照（文档举例 &gt;50MB）应改用 OSS
+          <span class="src" data-src="docs/v2/zh/integration/distributed/redis.md:97">redis.md:97</span>。
+        </p>
+
+        <h2 id="jdbc">JDBC：当前推荐路径，不是旧的 MysqlDistributedStore</h2>
+        <p>
+          这一页文档与源码有一个重要差异：官方 MySQL 文档仍用 <code>MysqlDistributedStore.create(dataSource)</code>
+          <span class="src" data-src="docs/v2/zh/integration/distributed/mysql.md:20-33">mysql.md:20-33</span>，
+          但 2.0.4 源码已经把 <code>MysqlDistributedStore</code> 标成 <code>@Deprecated(since = "2.1", forRemoval = true)</code>，
+          并明确建议改用 <code>agentscope-extensions-jdbc</code> 的 <code>JdbcDistributedStore</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mysql/src/main/java/io/agentscope/extensions/mysql/MysqlDistributedStore.java:54-60">MysqlDistributedStore.java:54-60</span>。
+        </p>
+        <p>
+          新实现会自动检测数据库方言，再组装四个组件：<code>JdbcAgentStateStore</code>、<code>JdbcStore</code>、
+          <code>JdbcSnapshotSpec</code>、<code>JdbcSandboxExecutionGuard</code>，支持 MySQL、PostgreSQL、H2 与 SQLite
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-jdbc/src/main/java/io/agentscope/extensions/jdbc/JdbcDistributedStore.java:31-42">JdbcDistributedStore.java:31-42</span>。
+          组件是懒加载的，第一次访问才建表，之后复用，避免每次 getter 都跑一遍 DDL
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-jdbc/src/main/java/io/agentscope/extensions/jdbc/JdbcDistributedStore.java:65-78">JdbcDistributedStore.java:65-78</span>。
+        </p>
+        <pre data-lang="java" data-file="JDBC 一键配置（示意）">DistributedStore store = JdbcDistributedStore.create(dataSource);</pre>
+        <p>
+          旧 MySQL 文档里的细节仍适用于 MySQL 方言：状态表可自动创建，库名 / 表名限定
+          <code>[a-zA-Z_][a-zA-Z0-9_-]*</code> 且长度 ≤ 64；<code>JdbcStore</code> 的 <code>putIfVersion</code>
+          通过单语句 CAS 实现；在 MySQL 方言下，<code>JdbcSandboxExecutionGuard</code> 走
+          <code>GET_LOCK()</code> / <code>RELEASE_LOCK()</code>，锁名超过 64 字符会自动 hash，
+          且 named lock 是 server 级别，共享实例时要用唯一前缀
+          <span class="src" data-src="docs/v2/zh/integration/distributed/mysql.md:52">mysql.md:52</span>
+          <span class="src" data-src="docs/v2/zh/integration/distributed/mysql.md:76">mysql.md:76</span>
+          <span class="src" data-src="docs/v2/zh/integration/distributed/mysql.md:93-106">mysql.md:93-106</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">新项目直接用 JdbcDistributedStore</span>
+          <p>
+            旧类不是不能用，而是它只覆盖 MySQL，且已被标成未来移除。新项目用 <code>JdbcDistributedStore</code>，
+            同一套代码可以跑 MySQL、PostgreSQL、H2 与 SQLite；迁移时只需换工厂，组件接口不变。
+          </p>
+        </div>
+
+        <h2 id="mongodb">MongoDB：文档型状态 + GridFS 快照</h2>
+        <p>
+          MongoDB 用复合 <code>_id</code> 组织会话，状态键放在 <code>states</code> 子文档、版本放在 <code>versions</code> 子文档
+          <span class="src" data-src="docs/v2/zh/integration/distributed/mongodb.md:48-64">mongodb.md:48-64</span>。
+          <code>MongoDistributedStore.create(mongoClient)</code> 默认库名是 <code>agentscope</code>，四个集合分别是
+          <code>agentscope_sessions</code>、<code>agentscope_base</code>、<code>agentscope_snapshots</code>、
+          <code>agentscope_sandbox_locks</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/MongoConstants.java:26-44">MongoConstants.java:26-44</span>。
+        </p>
+        <pre data-lang="java" data-file="MongoDB 一键配置（示意）">MongoClient mongoClient = MongoClients.create("mongodb://localhost:27017");
+DistributedStore store = MongoDistributedStore.create(mongoClient);</pre>
+        <p>
+          这里也有一个文档与源码的差异。文档写会话 TTL 30 天、快照上限 15MB；源码写的是：
+          <strong>会话 TTL 默认关闭</strong>，要显式 <code>ttlDays(n)</code> 才创建 TTL 索引；
+          快照走 GridFS，按 255KB 分块，单文件上限 16GB，并且快照没有独立 TTL
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:84-98">MongoAgentStateStore.java:84-98</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/snapshot/MongoRemoteSnapshotClient.java:40-50">MongoRemoteSnapshotClient.java:40-50</span>。
+          文档的 30 天 / 15MB 不能作为容量与保留策略依据
+          <span class="src" data-src="docs/v2/zh/integration/distributed/mongodb.md:64">mongodb.md:64</span>
+          <span class="src" data-src="docs/v2/zh/integration/distributed/mongodb.md:89">mongodb.md:89</span>。
+        </p>
+
+        <h2 id="oss">OSS：大快照首选，但不做锁</h2>
+        <p>
+          OSS 提供状态、基础 KV 与快照三件，<strong>不提供 <code>SandboxExecutionGuard</code></strong>：
+          对象存储不适合做分布式锁
+          <span class="src" data-src="docs/v2/zh/integration/distributed/oss.md:80-93">oss.md:80-93</span>。
+          <code>OssDistributedStore.create(ossClient, bucket, "agentscope/")</code> 会把前缀拆成
+          <code>state/</code>、<code>store/</code>、<code>snapshot/</code> 三组对象
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-oss/src/main/java/io/agentscope/extensions/oss/OssDistributedStore.java:39-84">OssDistributedStore.java:39-84</span>。
+        </p>
+        <pre data-lang="java" data-file="OSS + Redis 锁（示意）">DistributedStore oss = OssDistributedStore.create(ossClient, "my-bucket", "agentscope/");
+DistributedStore mixed = DistributedStore.builder()
+    .agentStateStore(oss.agentStateStore())
+    .baseStore(oss.baseStore())
+    .sandboxSnapshotSpec(oss.sandboxSnapshotSpec())
+    .sandboxExecutionGuard(RedisDistributedStore.fromJedis(jedis).sandboxExecutionGuard())
+    .build();</pre>
+        <p>
+          OSS 的运维重点不在接口，而在凭据与生命周期：生产建议用 RAM Role + STS 临时凭证，不要硬编码 AK/SK；
+          给快照 bucket 配生命周期规则（文档举例 7 天），避免存储成本失控
+          <span class="src" data-src="docs/v2/zh/integration/distributed/oss.md:104-107">oss.md:104-107</span>。
+        </p>
+
+        <h2 id="compare">能力矩阵：先排除「缺能力」的后端</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>能力</th><th>Redis</th><th>JDBC</th><th>MongoDB</th><th>OSS</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Agent 状态</td><td>有</td><td>有</td><td>有</td><td>有</td></tr>
+              <tr><td>工作区 KV</td><td>有</td><td>有</td><td>有</td><td>有</td></tr>
+              <tr><td>沙箱快照</td><td>有（内存代价）</td><td>有（BLOB）</td><td>有（GridFS，16GB）</td><td>有（大对象首选）</td></tr>
+              <tr><td>沙箱锁</td><td>有</td><td>有（方言锁）</td><td>有（TTL 锁）</td><td><strong>无</strong></td></tr>
+              <tr><td>CAS / 版本</td><td>有（Lua）</td><td>有（SQL CAS）</td><td>有（versions 子文档）</td><td>AgentState 版本化按文档为 last-writer-wins</td></tr>
+              <tr><td>最适合</td><td>低延迟多副本</td><td>已有关系型库</td><td>文档型 / 大历史</td><td>大快照 / 阿里云</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          能力矩阵来自官方分布式存储概览
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:24-33">index.md:24-33</span>；
+          版本化差异见同一页的说明
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:103-106">index.md:103-106</span>。
+          JDBC 的方言能力见新模块源码
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-jdbc/src/main/java/io/agentscope/extensions/jdbc/JdbcDistributedStore.java:31-42">JdbcDistributedStore.java:31-42</span>。
+        </p>
+
+        <h2 id="mixed">混合后端：把「必须在一起」拆开</h2>
+        <p>
+          混合后端的规则很简单：状态和基础 KV 必填，快照与锁可以来自另一套后端，后五个可选组件也可以单独接。
+          最常见的组合有三种：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>组合</th><th>解决什么</th><th>代价</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>JDBC 状态 + 文件，Redis 快照 + 锁</td><td>已有 MySQL，但想要 Redis 的低延迟锁</td><td>两套基础设施、两套备份</td></tr>
+              <tr><td>MongoDB 状态 + 锁，OSS 快照</td><td>快照超过 Mongo 单文档时代的容量假设，或想用对象存储生命周期</td><td>状态与快照不在同一后端，恢复要同批协调</td></tr>
+              <tr><td>OSS 状态 + 文件 + 快照，Redis 锁</td><td>阿里云生态、大快照、仍需要并发控制</td><td>OSS 的 CAS / 延迟不适合高频状态写</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          builder 只要求状态与基础 KV，其余为空时用 no-op 或 <code>null</code>；这意味着「只补一个能力」是合法的，
+          不需要为了锁引入一整套新后端
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:303-321">DistributedStore.java:303-321</span>。
+        </p>
+
+        <h2 id="isolation">隔离范围：同一 scope 不等于同一个活沙箱</h2>
+        <p>
+          <code>IsolationScope</code> 同时决定状态键与 store 命名空间：<code>USER</code> 按用户共享（默认，缺 userId 回退
+          <code>SESSION</code>），<code>SESSION</code> 按会话隔离，<code>AGENT</code> 按 Agent 名共享，<code>GLOBAL</code>
+          在同一 workspace / store 实例内全局共享
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/IsolationScope.java:30-51">IsolationScope.java:30-51</span>。
+        </p>
+        <div class="callout warn">
+          <span class="ct">这是顺序复用，不是活实例共享</span>
+          <p>
+            源码注释特别说明：沙箱模式下，同一 scope 的并发调用各自拿到自己的容器，结束时收敛到最后一个持久化快照；
+            它不是「多个调用共享同一个正在运行的容器」
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/IsolationScope.java:49-51">IsolationScope.java:49-51</span>。
+            所以 <code>USER</code> / <code>AGENT</code> / <code>GLOBAL</code> 范围才需要 <code>SandboxExecutionGuard</code> 来串行化
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxExecutionGuard.java:27-31">SandboxExecutionGuard.java:27-31</span>。
+          </p>
+        </div>
+
+        <h2 id="consistency">一致性：CAS 不是每个后端都有</h2>
+        <p>
+          <code>BaseStore.putIfVersion</code> 的默认实现直接返回 <code>false</code>，注释要求支持分布式的后端自己覆盖成服务端原子检查
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/remote/store/BaseStore.java:47-77">BaseStore.java:47-77</span>。
+          <code>AgentStateStore</code> 也一样：默认 <code>supportsVersioning()</code> 为 false，<code>saveIfVersion</code>
+          会退化成无条件 <code>save</code>，返回 <code>UNVERSIONED = -1</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:63-67">AgentStateStore.java:63-67</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:81-138">AgentStateStore.java:81-138</span>。
+        </p>
+        <p>
+          因此「用了分布式存储」不等于「解决了并发」。还要确认后端是否实现版本化：Redis 用 Lua、JDBC 用 SQL CAS、MongoDB 用
+          <code>versions</code> 子文档；OSS 在文档里被列为 last-writer-wins
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:103-106">index.md:103-106</span>。
+          高并发写同一会话时，优先选支持 CAS 的后端。
+        </p>
+
+        <h2 id="hosted">托管 Store：协调能力可以外置，状态仍要自备</h2>
+        <p>
+          如果已经部署 aistio 控制面，可以用 <code>ControlPlaneStores</code> 把 BaseStore、沙箱锁 / 快照、MessageBus、
+          AsyncToolRegistry、TaskRepository 与 SessionTurnGate 托管出去；<strong><code>AgentStateStore</code> 被刻意排除</strong>，
+          必须通过 <code>withAgentStateStore(...)</code> 传入自己的 Redis / MySQL / Postgres / OSS 后端
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/store/ControlPlaneStores.java:31-43">ControlPlaneStores.java:31-43</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/store/ControlPlaneStores.java:168-179">ControlPlaneStores.java:168-179</span>。
+        </p>
+        <pre data-lang="java" data-file="托管 Store + 自备状态（示意）">ControlPlaneStores cp = ControlPlaneStores.fromEnv();
+DistributedStore store = cp.withAgentStateStore(redisStore.agentStateStore());</pre>
+        <p>
+          <code>fromEnv()</code> 要求 <code>AISTIO_CONTROL_PLANE_HTTP</code>、<code>BUILDER_INTERNAL_TOKEN</code>、
+          <code>AISTIO_AGENT_NAME</code>，命名空间默认 <code>default</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/store/ControlPlaneStores.java:57-67">ControlPlaneStores.java:57-67</span>。
+          托管组件是否可达由 <code>GET /api/v1/dp/healthz</code> 探测；不可达时部分可选组件返回 <code>null</code>，回退到 workspace 实现
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-aistio/src/main/java/io/agentscope/extensions/aistio/store/ControlPlaneStores.java:182-189">ControlPlaneStores.java:182-189</span>。
+        </p>
+
+        <h2 id="selection">选型：按瓶颈选，不按品牌选</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>瓶颈 / 现状</th><th>优先</th><th>理由</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>多副本、低延迟、状态写频繁</td><td>Redis</td><td>四项齐全，Lua CAS，锁与快照都有</td></tr>
+              <tr><td>已有 MySQL / PostgreSQL</td><td>JDBC</td><td>复用现有库与备份；新模块支持多方言</td></tr>
+              <tr><td>会话历史大、文档型更自然</td><td>MongoDB</td><td>无 MySQL 字段长度红线；GridFS 快照</td></tr>
+              <tr><td>大工作区快照、阿里云生态</td><td>OSS</td><td>对象存储便宜且容量大；锁另配</td></tr>
+              <tr><td>已有控制面，想少管协调组件</td><td>aistio 托管 Store</td><td>BaseStore / 锁 / 快照 / 任务可托管；状态自备</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          三条硬规则：<strong>对象存储不做锁</strong>；<strong>远程文件系统必须配分布式状态</strong>；
+          <strong>高并发写要确认 CAS</strong>。其余都是成本、延迟与运维习惯的权衡。
+        </p>
+
+        <h2 id="failure">故障边界：先看接线，再看后端</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>症状</th><th>更可能的原因</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>启动报「RemoteFilesystemSpec ... local AgentStateStore」</td><td>只配了远程文件，没配分布式状态</td><td>是否传 <code>.distributedStore(...)</code> 或 <code>.stateStore(...)</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431-2438">HarnessAgent.java:2431-2438</span></td></tr>
+              <tr><td>换 Pod 后文件消失</td><td><code>BaseStore</code> 没注入，或仍在用本地文件系统</td><td><code>RemoteFilesystemSpec</code> 与 store 前缀</td></tr>
+              <tr><td>同一会话状态互相覆盖</td><td>AgentStateStore 不支持版本化，或没开 CAS</td><td><code>supportsVersioning()</code></td></tr>
+              <tr><td>沙箱并发冲突</td><td>OSS 没有 guard，或 scope 为 USER/AGENT/GLOBAL 却没锁</td><td>是否混入 Redis / JDBC 锁</td></tr>
+              <tr><td>MongoDB 快照超 15MB 就担心</td><td>沿用了旧文档的 BSON 限制</td><td>源码走 GridFS，单文件上限 16GB</td></tr>
+              <tr><td>MySQL 锁互相干扰</td><td>named lock 是 server 级，前缀重复</td><td>每个应用唯一 <code>keyPrefix</code><span class="src" data-src="docs/v2/zh/integration/distributed/mysql.md:104-106">mysql.md:104-106</span></td></tr>
+              <tr><td>Redis key 混在一起</td><td>多环境共用默认前缀 <code>agentscope:</code></td><td>自定义前缀或分库</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="migration">迁移：三条最常见的升级路径</h2>
+        <p>
+          <strong>MySQL 旧类 → JDBC。</strong>把 <code>MysqlDistributedStore.create(dataSource)</code> 换成
+          <code>JdbcDistributedStore.create(dataSource)</code>，其余接口不变；旧类已在源码里标记未来移除
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mysql/src/main/java/io/agentscope/extensions/mysql/MysqlDistributedStore.java:54-60">MysqlDistributedStore.java:54-60</span>。
+        </p>
+        <p>
+          <strong>MongoDB 保留策略 → 显式 TTL。</strong>如果旧文档让你以为会话 30 天自动过期，升级后要显式设置
+          <code>ttlDays(n)</code>；快照也不会独立过期，需要自己的清理或生命周期策略
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:688-703">MongoAgentStateStore.java:688-703</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/snapshot/MongoRemoteSnapshotClient.java:47-50">MongoRemoteSnapshotClient.java:47-50</span>。
+        </p>
+        <p>
+          <strong>OSS 单后端 → 混入锁。</strong>如果之前只用 OSS，切到 USER / AGENT / GLOBAL 沙箱范围时，必须补一个
+          Redis / JDBC / Mongo 的 guard；对象存储本身不提供锁
+          <span class="src" data-src="docs/v2/zh/integration/distributed/oss.md:80-93">oss.md:80-93</span>。
+        </p>
+
+        <h2 id="cheatsheet">速查：默认值、前缀与必填项</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>默认 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>builder 必填</td><td><code>agentStateStore</code> + <code>baseStore</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:303-321">DistributedStore.java:303-321</span></td></tr>
+              <tr><td>装配优先级</td><td>显式 builder &gt; distributedStore &gt; 本地默认</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2381-2407">HarnessAgent.java:2381-2407</span></td></tr>
+              <tr><td>Redis 默认前缀</td><td><code>agentscope:</code>，再分 session/store/snapshot/guard</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-redis/src/main/java/io/agentscope/extensions/redis/RedisDistributedStore.java:61-107">RedisDistributedStore.java:61-107</span></td></tr>
+              <tr><td>Redis 锁默认</td><td>租约 30 分钟，重试 500ms</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-redis/src/main/java/io/agentscope/extensions/redis/sandbox/RedisSandboxExecutionGuard.java:192-199">RedisSandboxExecutionGuard.java:192-199</span></td></tr>
+              <tr><td>Mongo 默认库 / 集合</td><td><code>agentscope</code> / <code>agentscope_sessions</code> 等四组</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/MongoConstants.java:26-44">MongoConstants.java:26-44</span></td></tr>
+              <tr><td>Mongo 会话 TTL</td><td>默认 <code>null</code>（不删除），<code>ttlDays(n)</code> 才启用</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:688-703">MongoAgentStateStore.java:688-703</span></td></tr>
+              <tr><td>Mongo 快照</td><td>GridFS，255KB 分块，单文件上限 16GB，无独立 TTL</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/snapshot/MongoRemoteSnapshotClient.java:43-50">MongoRemoteSnapshotClient.java:43-50</span></td></tr>
+              <tr><td>OSS 默认前缀</td><td><code>agentscope/</code>，再分 state/store/snapshot</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-oss/src/main/java/io/agentscope/extensions/oss/OssDistributedStore.java:45-84">OssDistributedStore.java:45-84</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">六个坑：把「接上」当成「接对」</h2>
+        <p>
+          <strong>坑一：以为 DistributedStore 会自动切文件系统。</strong>它只提供存储组件，文件系统仍要显式
+          <code>RemoteFilesystemSpec</code> 或 Sandbox 模式
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2381-2384">HarnessAgent.java:2381-2384</span>。
+        </p>
+        <p>
+          <strong>坑二：远程文件配本地状态。</strong>Harness 会直接拒绝；这不是可以忽略的警告
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431-2438">HarnessAgent.java:2431-2438</span>。
+        </p>
+        <p>
+          <strong>坑三：用 OSS 做锁。</strong>对象存储没有 guard；需要并发控制时混入 Redis / JDBC / Mongo
+          <span class="src" data-src="docs/v2/zh/integration/distributed/oss.md:80-93">oss.md:80-93</span>。
+        </p>
+        <p>
+          <strong>坑四：沿用 MongoDB 旧文档的 TTL / 15MB。</strong>源码是 TTL 默认关闭、GridFS 16GB；容量与保留策略要按源码重算
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:84-98">MongoAgentStateStore.java:84-98</span>。
+        </p>
+        <p>
+          <strong>坑五：以为 putIfVersion 一定有效。</strong>BaseStore 默认返回 false，AgentStateStore 默认 UNVERSIONED；
+          要选实现了 CAS 的后端
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/remote/store/BaseStore.java:64-77">BaseStore.java:64-77</span>。
+        </p>
+        <p>
+          <strong>坑六：继续用 MysqlDistributedStore。</strong>它已标记未来移除；新代码用 JdbcDistributedStore
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mysql/src/main/java/io/agentscope/extensions/mysql/MysqlDistributedStore.java:54-60">MysqlDistributedStore.java:54-60</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>传了 <code>distributedStore</code>，文件系统就自动变成分布式了吗？</summary>
+          <p>
+            不会。它只提供 <code>BaseStore</code> 等存储组件；文件系统模式仍要显式选 <code>RemoteFilesystemSpec</code>
+            或 Sandbox 模式，源码注释明确区分 storage 与 filesystem mode
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2381-2384">HarnessAgent.java:2381-2384</span>。
+          </p>
+        </details>
+        <details>
+          <summary>OSS 能不能同时提供沙箱并发锁？</summary>
+          <p>
+            不能。OSS 提供状态、基础 KV 与快照，但不提供 <code>SandboxExecutionGuard</code>；
+            需要锁时混入 Redis / JDBC / Mongo
+            <span class="src" data-src="docs/v2/zh/integration/distributed/oss.md:80-93">oss.md:80-93</span>。
+          </p>
+        </details>
+        <details>
+          <summary>MongoDB 快照还有 15MB 上限、会话 30 天自动过期吗？</summary>
+          <p>
+            2.0.4 源码不是这样：快照走 GridFS，单文件上限 16GB；会话 TTL 默认关闭，要显式 <code>ttlDays(n)</code>
+            才创建 TTL 索引。旧文档的 15MB / 30 天不能直接作为当前依据
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:84-98">MongoAgentStateStore.java:84-98</span>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/snapshot/MongoRemoteSnapshotClient.java:40-50">MongoRemoteSnapshotClient.java:40-50</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：给多副本部署选一套存储</h2>
+        <p>目标不是装齐四个后端，而是能写清楚为什么每个组件落在那里。建议 50 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">画四个组件</span>
+            <div>写下状态、文件 KV、快照、锁，分别标出当前单机默认与多副本需求。</div>
+          </li>
+          <li>
+            <span class="sh">先排除缺能力</span>
+            <div>如果要用 OSS 做快照，先把锁从 OSS 方案里排除，补一个 Redis / JDBC / Mongo 锁。</div>
+          </li>
+          <li>
+            <span class="sh">配 Redis 一键</span>
+            <div>用 <code>RedisDistributedStore.fromJedis</code> 配 <code>RemoteFilesystemSpec</code>，启动并跑一轮对话。</div>
+          </li>
+          <li>
+            <span class="sh">看 key 前缀</span>
+            <div>在 Redis 里确认 session / store / snapshot / guard 四组 key，记录默认前缀与实际写入。</div>
+          </li>
+          <li>
+            <span class="sh">换 JDBC 一键</span>
+            <div>用 <code>JdbcDistributedStore.create(dataSource)</code> 跑同一轮，比较表结构与启动日志。</div>
+          </li>
+          <li>
+            <span class="sh">做一次混合</span>
+            <div>用 MongoDB 或 JDBC 管状态和文件，OSS 管快照，Redis 管锁；确认 builder 只要求状态与基础 KV。</div>
+          </li>
+          <li>
+            <span class="sh">测 CAS</span>
+            <div>对同一个 key 连续两次 <code>putIfVersion</code>，第一次成功、第二次失败；换 OSS 看行为差异。</div>
+          </li>
+          <li>
+            <span class="sh">写三行结论</span>
+            <div>分别写「状态落在哪」「快照为什么在那」「锁为什么不能省」，确保每行都能独立核对。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          分布式存储解决了「组件落在哪」，下一章把镜头拉近到 <code>AgentStateStore</code> 本身：它如何序列化
+          <code>AgentState</code>、如何按 <code>(userId, sessionId)</code> 寻址、版本化与 CAS 在 Redis / JDBC / MongoDB / OSS 上分别意味着什么。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="29-memory-integration.html">29 记忆接入</a></td><td>语义记忆与会话状态的分界</td></tr>
+              <tr><td>第 31 章 · Agent 状态存储</td><td><code>AgentStateStore</code> 的远端实现与 CAS</td></tr>
+              <tr><td><a href="26-production-operations.html">26 生产部署与运维</a></td><td>共享卷、备份与多副本边界</td></tr>
+              <tr><td>官方「分布式存储」</td><td>能力矩阵与混合后端示例<span class="src" data-src="docs/v2/zh/integration/distributed/index.md:6-108">index.md:6-108</span></td></tr>
+              <tr><td><a href="../appendix/errata.html">附录 E · 勘误汇总</a></td><td>MongoDB TTL / 15MB、MysqlDistributedStore 这类差异的核对方式</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的分布式存储文档在 2.0.4 仓库里仍按旧类与旧 TTL 描述；正文以源码为准，
+          默认值、容量、前缀与弃用状态都标了具体出处。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
