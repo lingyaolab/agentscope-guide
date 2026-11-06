@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 35 章拆 AgentScope Java 2.0.4 的技能仓库：AgentSkillRepository 的读取 / 写入契约、Git 的自动同步与只读边界、MySQL / PostgreSQL 的表结构与 metadata_json 兼容，以及多仓库优先级与动态刷新。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="35 技能仓库：Git / MySQL / PostgreSQL · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 35 章拆 AgentScope Java 2.0.4 的技能仓库：AgentSkillRepository 的读取 / 写入契约、Git 的自动同步与只读边界、MySQL / PostgreSQL 的表结构与 metadata_json 兼容，以及多仓库优先级与动态刷新。"
+    />
+    <title>35 技能仓库：Git / MySQL / PostgreSQL · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="35-skill-repositories" data-root="..">
+    <main>
+      <article class="article">
+        <h1>35 · 技能仓库：Git / MySQL / PostgreSQL</h1>
+        <p class="lede">
+          第 16 章讲技能本身：<code>SKILL.md</code> 怎么写、怎么加载、怎么变成工具。这一章讲「技能放在哪、怎么读、能不能改」。
+          <code>AgentSkillRepository</code> 只有一个很薄的仓库契约，但三种实现的边界完全不同：
+          Git 是只读的版本化来源，MySQL / PostgreSQL 是可在线编辑的数据库；选错仓库，问题不在 Agent，而在内容运营流程。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 <code>AgentSkillRepository</code> 的读取、写入、删除与可写标志各自由谁实现</li>
+          <li>解释 Git 仓库为什么是只读的，以及 <code>autoSync</code> 的 remote 检查与 pull 时机</li>
+          <li>按 MySQL / PostgreSQL 的表结构理解技能、资源与 <code>metadata_json</code> 的兼容模式</li>
+          <li>识别文档里 MySQL 构造器写错的地方，并用 builder 或三参构造器替代</li>
+          <li>说清多仓库的优先级：后注册的仓库覆盖同名技能，失败仓库会被跳过</li>
+          <li>按「版本审阅」还是「在线运营」选择 Git、MySQL、PostgreSQL 或 Nacos</li>
+        </ul>
+
+        <h2 id="why">技能仓库管的是「来源」，不是「技能内容」</h2>
+        <p>
+          <code>AgentSkill</code> 用 Markdown + 资源文件描述可复用技能；<code>AgentSkillRepository</code> 负责把这些技能从外部存储加载进来，
+          再交给 Toolkit / ReActAgent 使用
+          <span class="src" data-src="docs/v2/zh/integration/skill/overview.md:6">overview.md:6</span>。
+          所以仓库层的核心问题不是「怎么让模型学会技能」，而是「技能从哪来、什么时候刷新、谁能改」。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>仓库</th><th>典型内容来源</th><th>写入</th><th>刷新方式</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Git</td><td>远程仓库里的技能目录</td><td>只读</td><td>读操作前检查 remote ref，变化才 pull</td></tr>
+              <tr><td>MySQL</td><td>数据库两张表</td><td>可写（可关）</td><td>每次调用重新加载</td></tr>
+              <tr><td>PostgreSQL</td><td>schema 下两张表</td><td>可写（可关）</td><td>每次调用重新加载</td></tr>
+              <tr><td>Nacos</td><td>配置中心</td><td>由 Nacos 管理</td><td>由 Nacos 客户端刷新</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="contract">契约：读取、写入、可写标志</h2>
+        <p>
+          <code>AgentSkillRepository</code> 继承 <code>AutoCloseable</code>，核心方法是按名取、列全部名称、取全部技能、保存、删除、判断存在，
+          再加仓库信息、来源标识与可写标志
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/skill/repository/AgentSkillRepository.java:35-132">AgentSkillRepository.java:35-132</span>。
+          技能 ID 的格式是 <code>name_version_source</code>，这也是多仓库共存时区分同名技能的关键
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/skill/repository/AgentSkillRepository.java:46-53">AgentSkillRepository.java:46-53</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>方法</th><th>语义</th><th>失败 / 边界</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>getSkill(name)</code></td><td>按名取单个技能</td><td>名字非法抛 <code>IllegalArgumentException</code></td></tr>
+              <tr><td><code>getAllSkills()</code> / <code>getAllSkillNames()</code></td><td>列出全部技能 / ID</td><td>返回空列表而不是 null</td></tr>
+              <tr><td><code>save(skills, force)</code></td><td>upsert；同名更新</td><td>只读仓库返回 false，不抛错</td></tr>
+              <tr><td><code>delete(name)</code></td><td>删除技能</td><td>只读仓库返回 false</td></tr>
+              <tr><td><code>setWriteable</code> / <code>isWriteable</code></td><td>控制是否允许写</td><td>Git 永远 false；数据库可配置</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="loading">加载：每次调用重建技能视图</h2>
+        <p>
+          <code>ReActAgent.builder().skillRepository(repo)</code> 可以注册一个或多个仓库；后注册的优先级更高，
+          同名技能由后者覆盖。至少注册一个仓库且动态技能开启时，<code>build()</code> 会挂上
+          <code>DynamicSkillMiddleware</code>，在每次 <code>call()</code> 前重建技能 prompt
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5346-5354">ReActAgent.java:5346-5354</span>。
+        </p>
+        <pre data-lang="java" data-file="注册技能仓库（示意）">ReActAgent agent = ReActAgent.builder()
+    .name("assistant")
+    .model(model)
+    .skillRepository(repo)
+    .build();</pre>
+        <p>
+          中间件按仓库顺序逐个 <code>getAllSkills()</code>，按技能名合并，后面的覆盖前面的；单个仓库加载失败只记日志并跳过，
+          不会让整个 Agent 启动失败
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/skill/DynamicSkillMiddleware.java:165-192">DynamicSkillMiddleware.java:165-192</span>。
+          这也解释了数据库仓库「改完即生效」的说法：下一次 <code>call()</code> 会重新读表。
+        </p>
+
+        <h2 id="git">Git：版本化来源，只读</h2>
+        <p>
+          Git 仓库把一个远程仓库克隆到本地，HTTPS / SSH 都支持；默认使用临时目录，公开仓库可以直接用单参构造器
+          <span class="src" data-src="docs/v2/zh/integration/skill/git-repository.md:6">git-repository.md:6</span>
+          <span class="src" data-src="docs/v2/zh/integration/skill/git-repository.md:32-43">git-repository.md:32-43</span>。
+          技能目录的约定是：每个技能一个文件夹，里面放 <code>SKILL.md</code>；没有显式 <code>skillsRoot</code> 时，
+          先找仓库下的 <code>skills/</code>，没有就把仓库根当技能根
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/src/main/java/io/agentscope/core/skill/repository/GitSkillRepository.java:220-227">GitSkillRepository.java:220-227</span>。
+        </p>
+        <pre data-lang="java" data-file="Git 技能仓库（示意）">GitSkillRepository repo = new GitSkillRepository(
+    "https://github.com/agentscope/skills.git",
+    "develop",
+    Path.of("/var/skills/repo"),
+    "agentscope-public",
+    true);</pre>
+        <p>
+          Git 仓库是<strong>只读</strong>的：<code>save</code> / <code>delete</code> 只打警告并返回 false，<code>isWriteable()</code>
+          恒为 false
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/src/main/java/io/agentscope/core/skill/repository/GitSkillRepository.java:308-328">GitSkillRepository.java:308-328</span>。
+          要改技能，走 Git 提交与合并，而不是在 Java 侧调用 save。
+        </p>
+
+        <h2 id="git-sync">Git 同步：先看 remote ref，再决定 pull</h2>
+        <p>
+          <code>autoSync=true</code>（默认）时，<code>getSkill</code> / <code>getAllSkills</code> / <code>skillExists</code>
+          等读操作前会先 <code>ls-remote</code> 查远端 HEAD；只有变化时才真正 pull
+          <span class="src" data-src="docs/v2/zh/integration/skill/git-repository.md:73-76">git-repository.md:73-76</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/src/main/java/io/agentscope/core/skill/repository/GitSkillRepository.java:711-738">GitSkillRepository.java:711-738</span>。
+          <code>autoSync=false</code> 时不会自动 pull，读之前必须自己调 <code>sync()</code>，否则会抛
+          <code>IllegalStateException</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/src/main/java/io/agentscope/core/skill/repository/GitSkillRepository.java:530-538">GitSkillRepository.java:530-538</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模式</th><th>读操作前做什么</th><th>适合</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>autoSync=true</code></td><td>ls-remote 比对远端 HEAD，变化才 pull</td><td>希望技能随 Git 更新</td></tr>
+              <tr><td><code>autoSync=false</code></td><td>不检查；必须显式 <code>sync()</code></td><td>启动时同步一次，或外部定时同步</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          临时目录会在 JVM 退出时自动删除，<code>close()</code> 也能提前清理；强制 kill 进程可能残留，需要外部清理
+          <span class="src" data-src="docs/v2/zh/integration/skill/git-repository.md:84-88">git-repository.md:84-88</span>。
+          私有仓库复用系统 Git 配置：HTTPS 走 credential helper，SSH 走 <code>~/.ssh/</code> 与 agent
+          <span class="src" data-src="docs/v2/zh/integration/skill/git-repository.md:57-71">git-repository.md:57-71</span>。
+        </p>
+
+        <h2 id="mysql">MySQL：在线 CRUD，表结构固定</h2>
+        <p>
+          MySQL 仓库适合「管理后台在线编辑、Agent 立即读取」的流程。它用两张表：<code>agentscope_skills</code> 存技能本身，
+          <code>agentscope_skill_resources</code> 存资源文件，资源表通过 <code>id</code> 外键级联删除
+          <span class="src" data-src="docs/v2/zh/integration/skill/mysql-repository.md:46-74">mysql-repository.md:46-74</span>。
+          <code>skill_content</code> 存 <code>SKILL.md</code> 全文，<code>metadata_json</code> 存完整 metadata 树。
+        </p>
+        <div class="callout danger">
+          <span class="ct">文档里的 MySQL 构造器在源码里不存在</span>
+          <p>
+            文档快速上手写的是 <code>new MysqlSkillRepository(ds, true)</code>
+            <span class="src" data-src="docs/v2/zh/integration/skill/mysql-repository.md:36-37">mysql-repository.md:36-37</span>，
+            自定义表名又写成五参构造器
+            <span class="src" data-src="docs/v2/zh/integration/skill/mysql-repository.md:83-90">mysql-repository.md:83-90</span>。
+            但 2.0.4 源码只有一个 public 构造器：
+            <code>(DataSource, boolean createIfNotExist, boolean writeable)</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:174-183">MysqlSkillRepository.java:174-183</span>。
+            自定义库名 / 表名请用 <code>builder(ds)</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:1199-1217">MysqlSkillRepository.java:1199-1217</span>。
+            照文档两参 / 五参写法会直接编译失败。
+          </p>
+        </div>
+        <pre data-lang="java" data-file="MySQL 技能仓库（正确写法）">MysqlSkillRepository repo = MysqlSkillRepository.builder(dataSource)
+    .databaseName("skill_center")
+    .skillsTableName("ops_skills")
+    .resourcesTableName("ops_skill_resources")
+    .createIfNotExist(true)
+    .writeable(true)
+    .build();</pre>
+        <p>
+          builder 默认库名 <code>agentscope</code>、表名 <code>agentscope_skills</code> / <code>agentscope_skill_resources</code>，
+          <code>createIfNotExist</code> 与 <code>writeable</code> 都默认 true
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:1210-1217">MysqlSkillRepository.java:1210-1217</span>。
+          保存与删除都在事务里执行，资源表 <code>ON DELETE CASCADE</code> 防止孤儿资源
+          <span class="src" data-src="docs/v2/zh/integration/skill/mysql-repository.md:93-109">mysql-repository.md:93-109</span>。
+        </p>
+
+        <h2 id="postgres">PostgreSQL：schema 隔离，同一套 CRUD</h2>
+        <p>
+          PostgreSQL 仓库与 MySQL 版结构几乎一样，差异在命名空间：它用 <strong>schema</strong> 而不是 database 隔离，
+          数据库由 JDBC URL 决定；默认 schema <code>agentscope</code>，默认表名与 MySQL 相同
+          <span class="src" data-src="docs/v2/zh/integration/skill/postgresql-repository.md:51-86">postgresql-repository.md:51-86</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-postgresql-repository/src/main/java/io/agentscope/core/skill/repository/postgresql/PostgresSkillRepository.java:128-134">PostgresSkillRepository.java:128-134</span>。
+        </p>
+        <pre data-lang="java" data-file="PostgreSQL 技能仓库（示意）">PostgresSkillRepository repo = PostgresSkillRepository.builder(dataSource)
+    .schemaName("my_schema")
+    .skillsTableName("my_skills")
+    .resourcesTableName("my_resources")
+    .createIfNotExist(true)
+    .writeable(true)
+    .build();</pre>
+        <p>
+          builder 默认 <code>schemaName=agentscope</code>、<code>createIfNotExist=true</code>、<code>writeable=true</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-postgresql-repository/src/main/java/io/agentscope/core/skill/repository/postgresql/PostgresSkillRepository.java:1299-1306">PostgresSkillRepository.java:1299-1306</span>。
+          <code>createIfNotExist=true</code> 会先建 schema，再建两张表；已有表不会自动加 <code>metadata_json</code>
+          <span class="src" data-src="docs/v2/zh/integration/skill/postgresql-repository.md:83-86">postgresql-repository.md:83-86</span>。
+        </p>
+
+        <h2 id="compare">对比：只读版本化 vs 在线可写</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>维度</th><th>Git</th><th>MySQL</th><th>PostgreSQL</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>可写</td><td>否（save/delete 返回 false）</td><td>可配置</td><td>可配置</td></tr>
+              <tr><td>隔离边界</td><td>仓库 + 分支 + <code>skillsRoot</code></td><td>database</td><td>schema</td></tr>
+              <tr><td>刷新</td><td>读前 ls-remote，变化才 pull</td><td>下次 call 重新读表</td><td>下次 call 重新读表</td></tr>
+              <tr><td>版本审阅</td><td>原生 Git PR</td><td>靠业务表 / 审计</td><td>靠业务表 / 审计</td></tr>
+              <tr><td>资源文件</td><td>仓库文件系统</td><td><code>agentscope_skill_resources</code></td><td><code>agentscope_skill_resources</code></td></tr>
+              <tr><td>适合</td><td>跨项目共享、可 review</td><td>已有 MySQL、后台运营</td><td>已有 PG、schema 隔离</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="metadata">metadata_json：完整模式与兼容模式</h2>
+        <p>
+          新表会带 <code>metadata_json</code>，用来保存完整 metadata 树；已有表如果没有这一列，仓库不会自动
+          <code>ALTER TABLE</code>，而是降级成「只往返 name + description」的兼容模式
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:78-83">MysqlSkillRepository.java:78-83</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:415-435">MysqlSkillRepository.java:415-435</span>。
+          PostgreSQL 行为一致。
+        </p>
+        <div class="callout warn">
+          <span class="ct">兼容模式不是「无损」</span>
+          <p>
+            没有 <code>metadata_json</code> 时，技能仍能加载，但 version / homepage / license 等扩展 metadata 可能丢失。
+            需要完整往返时，自己执行文档给出的 <code>ALTER TABLE ... ADD COLUMN metadata_json ...</code>，再重启仓库。
+          </p>
+        </div>
+
+        <h2 id="writeable">writeable：连接级开关，不是权限系统</h2>
+        <p>
+          数据库仓库的 <code>writeable</code> 是进程内开关：为 false 时 <code>save</code> / <code>delete</code> 直接返回 false，
+          不会改库；<code>setWriteable(true/false)</code> 可以运行时切换
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:600-609">MysqlSkillRepository.java:600-609</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:903-909">MysqlSkillRepository.java:903-909</span>。
+          它不能替代数据库账号权限：真正只读的服务仍应使用只读数据库用户。
+        </p>
+
+        <h2 id="multi-repo">多仓库：后注册的覆盖同名技能</h2>
+        <p>
+          一个 Agent 可以注册多个仓库，顺序从低优先级到高优先级；同名技能由后面的仓库覆盖
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5346-5354">ReActAgent.java:5346-5354</span>。
+          这适合「基础技能集 + 团队覆盖层」：Git 放通用技能，数据库放少量团队定制。
+        </p>
+        <pre data-lang="java" data-file="分层技能仓库（示意）">ReActAgent agent = ReActAgent.builder()
+    .name("assistant")
+    .model(model)
+    .skillRepositories(List.of(gitRepo, mysqlRepo)) // mysqlRepo 优先
+    .build();</pre>
+        <p>
+          加载失败不会中断整个 Agent：中间件会记录哪个仓库失败、继续用其余仓库
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/skill/DynamicSkillMiddleware.java:169-183">DynamicSkillMiddleware.java:169-183</span>。
+          但「少了一个仓库」不一定报错，所以生产上要监控加载日志，而不是只看 Agent 能否回复。
+        </p>
+
+        <h2 id="operations">运维：凭据、临时目录与连接池</h2>
+        <p>
+          <strong>Git 凭据。</strong>Java 侧不管账号密码，HTTPS 用系统 Git credential helper，SSH 用 <code>~/.ssh/</code> 与 agent；
+          CI runner 要提前准备好这些配置
+          <span class="src" data-src="docs/v2/zh/integration/skill/git-repository.md:57-71">git-repository.md:57-71</span>。
+        </p>
+        <p>
+          <strong>临时目录。</strong>默认克隆到临时目录，JVM 退出或 <code>close()</code> 时清理；多实例各自一份 clone，没有锁竞争
+          <span class="src" data-src="docs/v2/zh/integration/skill/git-repository.md:84-88">git-repository.md:84-88</span>。
+          强制 kill 可能残留，磁盘告警时要检查临时目录。
+        </p>
+        <p>
+          <strong>数据库。</strong>用 HikariCP / PgBouncer 等连接池；<code>createIfNotExist=true</code> 会执行 DDL，生产要确认账号有建库 / 建表权限，
+          或者预先建好 schema 再用 false。
+        </p>
+
+        <h2 id="failure">故障边界：先分清读不到、写不进、刷新不了</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>症状</th><th>更可能的原因</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Git 加载失败</td><td>URL / 分支错、凭据不可用、临时目录不可写</td><td>手动 <code>git ls-remote</code>、SSH agent、临时目录权限</td></tr>
+              <tr><td>Git 一直不更新</td><td><code>autoSync=false</code> 且没调 <code>sync()</code></td><td>同步策略与 <code>sync()</code> 调用</td></tr>
+              <tr><td>数据库 save 返回 false</td><td><code>writeable=false</code>，或 Git 仓库只读</td><td><code>isWriteable()</code></td></tr>
+              <tr><td>MySQL 代码编译失败</td><td>照文档用了不存在的构造器</td><td>改用三参构造器或 builder</td></tr>
+              <tr><td>技能 metadata 丢失</td><td>旧表没有 <code>metadata_json</code></td><td>表结构 / 兼容模式</td></tr>
+              <tr><td>同名技能被覆盖</td><td>多仓库优先级：后者胜出</td><td>仓库注册顺序与 source</td></tr>
+              <tr><td>Agent 少了一个技能</td><td>某个仓库加载失败被跳过</td><td>中间件日志中的「failed to load」</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="selection">选型：版本审阅还是在线运营</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>需求</th><th>优先</th><th>注意</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>技能要走 PR、可 review、可回滚</td><td>Git</td><td>只读；多实例各自 clone；autoSync 有 remote 检查</td></tr>
+              <tr><td>已有 MySQL，后台在线编辑</td><td>MySQL</td><td>用 builder；注意 metadata_json 兼容模式</td></tr>
+              <tr><td>已有 PostgreSQL，想按 schema 隔离</td><td>PostgreSQL</td><td>schema 是隔离边界，不是 database</td></tr>
+              <tr><td>已经在用 Nacos 做配置中心</td><td>Nacos 技能仓库</td><td>与配置一起治理，写入走 Nacos</td></tr>
+              <tr><td>基础技能 + 少量团队覆盖</td><td>多仓库分层</td><td>后注册的覆盖同名技能</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cheatsheet">速查：默认值与关键边界</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>值 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>技能 ID 格式</td><td><code>name_version_source</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/skill/repository/AgentSkillRepository.java:46-53">AgentSkillRepository.java:46-53</span></td></tr>
+              <tr><td>Git autoSync 默认</td><td><code>true</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/src/main/java/io/agentscope/core/skill/repository/GitSkillRepository.java:123-124">GitSkillRepository.java:123-124</span></td></tr>
+              <tr><td>Git 技能根</td><td>默认 <code>skills/</code>，没有就用仓库根</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/src/main/java/io/agentscope/core/skill/repository/GitSkillRepository.java:220-227">GitSkillRepository.java:220-227</span></td></tr>
+              <tr><td>MySQL 默认库 / 表</td><td><code>agentscope</code> / <code>agentscope_skills</code> / <code>agentscope_skill_resources</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:1210-1217">MysqlSkillRepository.java:1210-1217</span></td></tr>
+              <tr><td>PostgreSQL 默认 schema / 表</td><td><code>agentscope</code> / 同名两张表</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-postgresql-repository/src/main/java/io/agentscope/core/skill/repository/postgresql/PostgresSkillRepository.java:1299-1306">PostgresSkillRepository.java:1299-1306</span></td></tr>
+              <tr><td>数据库默认可写 / 建表</td><td>都默认 <code>true</code>（builder）</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:1216-1217">MysqlSkillRepository.java:1216-1217</span></td></tr>
+              <tr><td>Git 可写</td><td><code>false</code>；save/delete 返回 false</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/src/main/java/io/agentscope/core/skill/repository/GitSkillRepository.java:308-328">GitSkillRepository.java:308-328</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">六个坑：把仓库当文件系统</h2>
+        <p>
+          <strong>坑一：对 Git 仓库调 save。</strong>它只读，save 只打警告并返回 false，不会提交任何东西
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/src/main/java/io/agentscope/core/skill/repository/GitSkillRepository.java:308-328">GitSkillRepository.java:308-328</span>。
+        </p>
+        <p>
+          <strong>坑二：关掉 autoSync 却不调 sync。</strong>读操作会直接抛「Repository is not synchronized」
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/src/main/java/io/agentscope/core/skill/repository/GitSkillRepository.java:530-538">GitSkillRepository.java:530-538</span>。
+        </p>
+        <p>
+          <strong>坑三：照文档写 MySQL 二参构造器。</strong>源码没有这个重载；用三参构造器或 builder
+          <span class="src" data-src="docs/v2/zh/integration/skill/mysql-repository.md:36-37">mysql-repository.md:36-37</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:174-183">MysqlSkillRepository.java:174-183</span>。
+        </p>
+        <p>
+          <strong>坑四：以为旧表自动加 metadata_json。</strong>不会；旧表会降级到只往返 name + description
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:78-83">MysqlSkillRepository.java:78-83</span>。
+        </p>
+        <p>
+          <strong>坑五：以为 writeable=false 是权限系统。</strong>它只是进程内开关；数据库账号仍应使用只读用户。
+        </p>
+        <p>
+          <strong>坑六：同名技能被覆盖却不自知。</strong>多仓库按注册顺序合并，后者覆盖前者；用 source / 日志确认最终生效的是哪一个
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/skill/DynamicSkillMiddleware.java:169-192">DynamicSkillMiddleware.java:169-192</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>Git 技能仓库可以直接 <code>save</code> 新技能吗？</summary>
+          <p>
+            不能。它只读，<code>save</code> / <code>delete</code> 只打警告并返回 false；要改技能走 Git 提交
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-git-repository/src/main/java/io/agentscope/core/skill/repository/GitSkillRepository.java:308-328">GitSkillRepository.java:308-328</span>。
+          </p>
+        </details>
+        <details>
+          <summary><code>new MysqlSkillRepository(ds, true)</code> 在 2.0.4 里能编译吗？</summary>
+          <p>
+            不能。公开构造器只有三参版本；自定义库名 / 表名用 <code>builder(ds)</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:174-183">MysqlSkillRepository.java:174-183</span>。
+          </p>
+        </details>
+        <details>
+          <summary>多个仓库有同名技能时，谁生效？</summary>
+          <p>
+            后注册的仓库优先；中间件按仓库顺序加载，后面的覆盖前面的同名技能
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5346-5354">ReActAgent.java:5346-5354</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：给技能选一条来源与刷新策略</h2>
+        <p>目标不是把技能读出来，而是能解释「谁能改、什么时候变、冲突谁赢」。建议 45 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">列技能来源</span>
+            <div>把一个通用技能与一个团队技能分别归到 Git 与数据库，写下理由。</div>
+          </li>
+          <li>
+            <span class="sh">跑 Git 仓库</span>
+            <div>用默认 autoSync 读一次，改远端后读第二次，确认 ls-remote + pull 生效。</div>
+          </li>
+          <li>
+            <span class="sh">试只读</span>
+            <div>对 Git 仓库调 save，确认返回 false 且没有提交。</div>
+          </li>
+          <li>
+            <span class="sh">建 MySQL 仓库</span>
+            <div>用 builder 建库建表，保存一个带资源文件的技能，检查两张表与级联删除。</div>
+          </li>
+          <li>
+            <span class="sh">验证 metadata</span>
+            <div>检查 <code>metadata_json</code>；再模拟旧表没有该列，观察兼容模式。</div>
+          </li>
+          <li>
+            <span class="sh">分层覆盖</span>
+            <div>Git 与数据库放同名技能，注册顺序不同，确认后者覆盖前者。</div>
+          </li>
+          <li>
+            <span class="sh">关一次写入</span>
+            <div>把 writeable 设为 false，调 save / delete，确认返回 false 且库不变。</div>
+          </li>
+          <li>
+            <span class="sh">写三行结论</span>
+            <div>分别写「技能从哪来」「何时刷新」「同名谁赢」，确保每行都能在日志或表里找到证据。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          技能仓库讲完，下一章收尾整个集成生态：Nacos、Higress、Scheduler、Studio 与 Training。
+          它们不再补某一种能力，而是把 Agent 接进注册发现、网关、调度、调试与训练流水线。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="16-skill.html">16 技能</a></td><td><code>SKILL.md</code> 的结构与加载机制</td></tr>
+              <tr><td><a href="34-channels.html">34 渠道</a></td><td>内容平台与技能来源的边界</td></tr>
+              <tr><td>第 36 章 · 基础设施与生态</td><td>Nacos / Higress / Scheduler / Studio / Training</td></tr>
+              <tr><td>官方「技能仓库」</td><td>三种实现的依赖与配置<span class="src" data-src="docs/v2/zh/integration/skill/overview.md:6-38">overview.md:6-38</span></td></tr>
+              <tr><td><a href="../appendix/errata.html">附录 E · 勘误汇总</a></td><td>MySQL 构造器这类文档与源码差异的核对方式</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的技能文档在 2.0.4 仓库里仍带预览提示；凡文档与源码有出入的地方，正文以源码为准，
+          构造器、默认值、表结构与可写边界都标了具体出处。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
