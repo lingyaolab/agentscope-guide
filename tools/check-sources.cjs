@@ -11,7 +11,8 @@
  *   2. 行号 / 行号区间不越界
  *   3. 可见文字里的行号与 data-src 的起行一致
  *   4. 引用起点不是空行、不是孤立的 } / }); / ] 等收尾符号
- *   5. （--context）chip 前最近的 <code> 标识符是否出现在引用行 ±15 行内
+ *   5. 路径大小写与磁盘真实文件名完全一致（Windows 也不放过）
+ *   6. （--context）chip 前最近的 <code> 标识符是否出现在引用行 ±15 行内
  *
  * 注意：图例里的 <span class="src">文件名:行号</span> 只是样式示例，没有 data-src，
  * 按约定跳过，不算问题。
@@ -82,6 +83,28 @@ function resolveSource(p) {
   return null;
 }
 
+/* Windows 的 existsSync 不区分大小写；这里逐段对照真实目录名，
+ * 避免 AGENTS.md / agents.md 这类问题在 Windows 上被放过、到 Linux CI 才炸。 */
+function exactWalk(base, relPath) {
+  let dir = base;
+  for (const part of relPath.split("/").filter(Boolean)) {
+    if (part === ".") continue;
+    if (!fs.existsSync(dir)) return false;
+    const names = fs.readdirSync(dir);
+    if (!names.includes(part)) return false;
+    dir = path.join(dir, part);
+  }
+  return fs.existsSync(dir);
+}
+
+function exactPathExists(p) {
+  const clean = p.replace(/^\.\//, "");
+  if (clean.startsWith("agentscope-java-2.0.4/")) {
+    return exactWalk(ROOT, clean);
+  }
+  return exactWalk(SRC, clean) || exactWalk(ROOT, clean);
+}
+
 /* ---------- 收集 chip ---------- */
 
 const chips = [];
@@ -111,6 +134,8 @@ let badFormat = 0;
 let noRaw = 0;
 const mismatch = [];
 const reviews = [];
+const caseSeen = new Set();
+const caseIssues = [];
 
 for (const c of chips) {
   if (!c.raw) {
@@ -135,6 +160,10 @@ for (const c of chips) {
     missingFile++;
     reviews.push({ type: "缺文件", page: c.page, raw: c.raw, msg: "源码里找不到 " + p });
     continue;
+  }
+  if (!caseSeen.has(p)) {
+    caseSeen.add(p);
+    if (!exactPathExists(p)) caseIssues.push(p);
   }
 
   const lines = linesOf(file);
@@ -204,6 +233,7 @@ console.log(
     "，行号越界 " + badRange +
     "，格式错误 " + badFormat +
     "，显示行号不一致 " + mismatch.length +
+    "，大小写不符 " + caseIssues.length +
     "，空白/收尾行 " + blankLike +
     (contextMode ? "，上下文可疑 " + (byType["上下文"] || 0) : "") +
     (noRaw ? "（" + noRaw + " 条图例无 data-src，已跳过）" : "")
@@ -212,6 +242,11 @@ console.log(
 if (mismatch.length) {
   console.log("\n显示行号不一致：");
   mismatch.slice(0, LIMIT).forEach((v) => console.log("  " + v));
+}
+
+if (caseIssues.length) {
+  console.log("\n大小写不符：");
+  caseIssues.slice(0, LIMIT).forEach((v) => console.log("  " + v));
 }
 
 for (const type of ["格式", "缺文件", "行号", "空行", "收尾行"]) {
@@ -227,7 +262,7 @@ if (ctx.length) {
   ctx.slice(0, LIMIT).forEach((r) => console.log("  " + r.page + " :: " + r.raw + " :: " + r.msg));
 }
 
-const hard = missingFile + badRange + badFormat;
+const hard = missingFile + badRange + badFormat + caseIssues.length;
 if (hard || (strict && blankLike)) {
   console.log("\n结论：有 " + hard + " 条硬错误" + (strict && blankLike ? "，" + blankLike + " 条空白/收尾行" : ""));
   process.exit(1);

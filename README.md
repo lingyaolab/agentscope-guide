@@ -20,7 +20,7 @@ agentscope-java-learn/     站点本体（发布时把这个目录作为站点�
 
 tools/                     零依赖 Node 脚本
 ├── check-site.cjs         静态检查 + headless 浏览器回归
-├── check-sources.cjs      校验每处 file:line 能否在 2.0.4 源码里定位
+├── check-sources.cjs      校验每处 file:line 能否在 2.0.4 源码里定位，并检查路径大小写
 └── build-search-index.cjs 从各页正文生成全文搜索索引
 
 agentscope-java-2.0.4/     上游源码副本（仅本地核对出处用，不入库）

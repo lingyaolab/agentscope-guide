@@ -3,12 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="19 章正文里散落着 60 条「官方文档这么说、2.0.4 源码那么写」的核对结果，这一页把它们按章收进一张表：默认值、触发时机、参数名、未接线字段，每条都同时给出文档行号与源码行号，遇到对不上的描述先来这里查。" />
+    <meta name="description" content="全书 19 个有偏差章节里共 78 条「官方文档这么说、2.0.4 源码那么写」的核对结果，这一页把它们按章收进一张表：默认值、触发时机、参数名、未接线字段，每条都同时给出文档行号与源码行号，遇到对不上的描述先来这里查。" />
     <meta property="og:type" content="article" />
     <meta property="og:locale" content="zh_CN" />
     <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
     <meta property="og:title" content="附录 E 勘误汇总：官方文档 vs 2.0.4 源码 · AgentScope Java 2.0.4 学习站" />
-    <meta property="og:description" content="19 章正文里散落着 60 条「官方文档这么说、2.0.4 源码那么写」的核对结果，这一页把它们按章收进一张表：默认值、触发时机、参数名、未接线字段，每条都同时给出文档行号与源码行号，遇到对不上的描述先来这里查。" />
+    <meta property="og:description" content="全书 19 个有偏差章节里共 78 条「官方文档这么说、2.0.4 源码那么写」的核对结果，这一页把它们按章收进一张表：默认值、触发时机、参数名、未接线字段，每条都同时给出文档行号与源码行号，遇到对不上的描述先来这里查。" />
     <title>附录 E 勘误汇总：官方文档 vs 2.0.4 源码 · AgentScope Java 2.0.4 学习站</title>
     <script>
       try {
@@ -26,17 +26,17 @@
       <article class="article">
         <h1>附录 E · 勘误汇总：官方文档 vs 2.0.4 源码</h1>
         <p class="lede">
-          这是全站最「不客气」的一页：把写到第 19 章时逐条核对出来的偏差集中成一张表。左边是
+          这是全站最「不客气」的一页：把全书逐条核对出来的偏差集中成一张表。左边是
           <code>docs/v2/zh/**</code> 的原话，右边是 <code>agentscope-java-2.0.4</code> 里真正执行的代码，中间那句是「照文档写会怎么坑你」。
-          一共 <strong>60 条</strong>，去掉三组跨章重复后是 57 条独立偏差。每条都带文档与源码两套行号，可以自己复核。
+          一共 <strong>78 条</strong>，去掉三组跨章重复后是 75 条独立偏差。每条都带文档与源码两套行号，可以自己复核。
         </p>
         <div class="callout warn">
-          <span class="ct">范围说明：本页是第 1–19 章写作阶段的快照</span>
+          <span class="ct">范围说明：只列真正有偏差的 19 章</span>
           <p>
-            下面的 60 条只覆盖 04、08–10、12–18 等早期章节。第 20–36 章新增的差异——比如 A2A starter 名、RAG 的
+            下面的 78 条覆盖 04、08–10、12–18、21、29–33、35–36。第 20–36 章新增的差异——A2A starter 名、RAG 的
             <code>RAGMode</code> 枚举、MySQL 技能仓库构造器、Nacos A2A 构造器、Scheduler 的
-            <code>pause</code> / <code>resume</code>、Chat Completions 适配器签名——写在各自章节的「文档 vs 源码」框里，没有回填本表。
-            这样处理是为了让这张表保持「当时逐条核对过」的可信度，而不是把没复核的条目混进来。
+            <code>pause</code> / <code>resume</code>、Studio 自动 Hook、Training 影子流量、Chat Completions 适配器签名——已经回填到本表。
+            没有列出的章节，是正文没有发现「文档与源码不一致」的条目，不代表它们没有坑。
           </p>
         </div>
 
@@ -109,7 +109,7 @@
 
         <h2 id="by-chapter">按章查</h2>
         <p>
-          只列有偏差的 11 章（04、08、09、10、12–18）。01–03、05–07、11 与附录 A–D 没有发现「文档与源码不一致」的条目，不代表它们没有坑，
+          只列有偏差的 19 章（04、08–10、12–18、21、29–33、35–36）。01–03、05–07、11、19–20、22–28、34 与附录 A–D 没有发现「文档与源码不一致」的条目，不代表它们没有坑，
           而是那些坑在正文的「陷阱与窍门」里，不属于勘误。同一处文档被两章引用时（Docker 镜像、isolationScope、本地状态存储强度），
           两章都会列一次，方便按章阅读。
         </p>
@@ -535,9 +535,187 @@
           </table>
         </div>
 
+        <h3 id="ch21">21 · Managed Agent 定义（1 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch21-maxiters">
+                <td>控制台范围 1–64，未配置时表单显示 <code>maxIters=12</code><span class="src" data-src="docs/v2/zh/service/managed-agent-configuration.md:21">managed-agent-configuration.md:21</span></td>
+                <td>Go 侧落库前对 <code>maxIters &lt;= 0</code> 直接赋 <strong>20</strong><span class="src" data-src="agentscope-service/aistio/internal/product/managed_definition.go:91-94">managed_definition.go:91-94</span></td>
+                <td>表单提交 12，API / 脚本不填或填 0 得到 20；写脚本时显式设置，别依赖默认值</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch29">29 · 记忆接入（1 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch29-longterm-memory">
+                <td>记忆概览仍把 <code>LongTermMemory</code> 作为跨会话持久化接口，并列出 Mem0、百炼、ReMe 三种实现<span class="src" data-src="docs/v2/zh/integration/memory/overview.md:6-14">overview.md:6-14</span></td>
+                <td><code>LongTermMemory</code> 标了 <code>@Deprecated(forRemoval = true, since = "2.0.0")</code>，注释说明长期记忆已移除，跨会话持久化应在应用层集成<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemory.java:66-71">LongTermMemory.java:66-71</span>；<code>LongTermMemoryMode</code> 同时弃用<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/memory/LongTermMemoryMode.java:51-54">LongTermMemoryMode.java:51-54</span></td>
+                <td>三种适配器仍能运行，但新项目应把它当迁移对象；不要据此设计新的记忆架构</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch30">30 · 分布式存储（2 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch30-mysql-distributed">
+                <td>MySQL 分布式页仍用 <code>MysqlDistributedStore.create(dataSource)</code><span class="src" data-src="docs/v2/zh/integration/distributed/mysql.md:20-33">mysql.md:20-33</span></td>
+                <td>该类已标 <code>@Deprecated(since = "2.1", forRemoval = true)</code>，并建议改用 <code>agentscope-extensions-jdbc</code> 的 <code>JdbcDistributedStore</code><span class="src" data-src="agentscope-extensions/agentscope-extensions-mysql/src/main/java/io/agentscope/extensions/mysql/MysqlDistributedStore.java:54-60">MysqlDistributedStore.java:54-60</span></td>
+                <td>新项目用 <code>JdbcDistributedStore</code>；旧类只覆盖 MySQL，且未来会移除</td>
+              </tr>
+              <tr id="ch30-mongo-ttl">
+                <td>MongoDB 页写会话 TTL 30 天、快照上限 15MB<span class="src" data-src="docs/v2/zh/integration/distributed/mongodb.md:64">mongodb.md:64</span><span class="src" data-src="docs/v2/zh/integration/distributed/mongodb.md:89">mongodb.md:89</span></td>
+                <td>会话 TTL 默认关闭，要显式 <code>ttlDays(n)</code> 才创建 TTL 索引<span class="src" data-src="agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:84-98">MongoAgentStateStore.java:84-98</span>；快照走 GridFS，255KB 分块，单文件上限 16GB，且无独立 TTL<span class="src" data-src="agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/snapshot/MongoRemoteSnapshotClient.java:40-50">MongoRemoteSnapshotClient.java:40-50</span></td>
+                <td>按 30 天 / 15MB 做容量与保留策略会算错；会话不会自动过期，快照可能远超 15MB</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch31">31 · Agent 状态存储（1 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch31-mysql-schema">
+                <td>分布式 MySQL 页的表结构写 <code>user_id</code>、<code>state_value</code>、<code>state_type</code><span class="src" data-src="docs/v2/zh/integration/distributed/mysql.md:52">mysql.md:52</span></td>
+                <td>旧 <code>MysqlAgentStateStore</code> 实际建的是 <code>session_id</code>、<code>state_key</code>、<code>item_index</code>、<code>state_data</code>（外加 version）<span class="src" data-src="agentscope-extensions/agentscope-extensions-mysql/src/main/java/io/agentscope/extensions/mysql/state/MysqlAgentStateStore.java:42-56">MysqlAgentStateStore.java:42-56</span><span class="src" data-src="agentscope-extensions/agentscope-extensions-mysql/src/main/java/io/agentscope/extensions/mysql/state/MysqlAgentStateStore.java:197-203">:197-203</span>；新 JDBC 同样按 <code>(session_id, state_key, item_index)</code> 存<span class="src" data-src="agentscope-extensions/agentscope-extensions-jdbc/src/main/java/io/agentscope/extensions/jdbc/dialect/table/SessionStateDialect.java:21-26">SessionStateDialect.java:21-26</span></td>
+                <td>按旧文档列名写 SQL 报表或迁移脚本会失败；以 <code>item_index</code> 模型为准</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch32">32 · RAG（3 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch32-ragmode">
+                <td>RAG 概览示例注释写「或 <code>STATIC</code>、<code>NONE</code>」<span class="src" data-src="docs/v2/zh/integration/rag/overview.md:23">overview.md:23</span></td>
+                <td>枚举只有 <code>GENERIC</code>、<code>AGENTIC</code>、<code>NONE</code><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/rag/RAGMode.java:40-55">RAGMode.java:40-55</span></td>
+                <td>照文档写 <code>RAGMode.STATIC</code> 会直接编译失败</td>
+              </tr>
+              <tr id="ch32-metadata">
+                <td>Simple 检索参数表列了 <code>metadata</code><span class="src" data-src="docs/v2/zh/integration/rag/simple.md:97-101">simple.md:97-101</span></td>
+                <td><code>RetrieveConfig</code> 只有 limit、scoreThreshold、vectorName、conversationHistory，没有 metadata<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/rag/model/RetrieveConfig.java:34-37">RetrieveConfig.java:34-37</span></td>
+                <td>需要 metadata 过滤时走 provider 配置或向量库层，不要往 <code>RetrieveConfig</code> 上传</td>
+              </tr>
+              <tr id="ch32-knowledge">
+                <td>RAG 概览仍按 <code>Knowledge</code> 介绍五种实现，并给 <code>.knowledge(...)</code> + <code>.ragMode(...)</code> 接入方式<span class="src" data-src="docs/v2/zh/integration/rag/overview.md:6-25">overview.md:6-25</span></td>
+                <td><code>Knowledge</code>、<code>RAGMode</code>、<code>RetrieveConfig</code> 都标了 <code>@Deprecated(forRemoval = true, since = "2.0.0")</code>，注释写明 rag 包已移除，检索应在应用层集成<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/rag/Knowledge.java:30-34">Knowledge.java:30-34</span><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/rag/RAGMode.java:28-32">RAGMode.java:28-32</span><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/rag/model/RetrieveConfig.java:28-32">RetrieveConfig.java:28-32</span></td>
+                <td>适配器仍能用，但整条内置 RAG 管线是 legacy；新项目把检索做成应用层工具</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch33">33 · 协议（1 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch33-a2a-starter">
+                <td>A2A 文档写 starter 为 <code>agentscope-spring-boot-starter-a2a-server</code><span class="src" data-src="docs/v2/zh/integration/protocol/a2a.md:108-110">a2a.md:108-110</span></td>
+                <td>仓库实际 artifact 是 <code>agentscope-a2a-spring-boot-starter</code><span class="src" data-src="agentscope-extensions/agentscope-spring-boot-starters/agentscope-a2a-spring-boot-starter/pom.xml:28">pom.xml:28</span></td>
+                <td>照文档写依赖会解析失败</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch35">35 · 技能仓库（1 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch35-mysql-constructor">
+                <td>快速上手写 <code>new MysqlSkillRepository(ds, true)</code><span class="src" data-src="docs/v2/zh/integration/skill/mysql-repository.md:36-37">mysql-repository.md:36-37</span>，自定义表名又写五参构造器<span class="src" data-src="docs/v2/zh/integration/skill/mysql-repository.md:83-90">mysql-repository.md:83-90</span></td>
+                <td>源码只有一个 public 构造器 <code>(DataSource, boolean createIfNotExist, boolean writeable)</code><span class="src" data-src="agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:174-183">MysqlSkillRepository.java:174-183</span>；库名 / 表名走 <code>builder(ds)</code><span class="src" data-src="agentscope-extensions/agentscope-extensions-skills/agentscope-extensions-skill-mysql-repository/src/main/java/io/agentscope/core/skill/repository/mysql/MysqlSkillRepository.java:1199-1217">:1199-1217</span></td>
+                <td>照文档两参 / 五参写法会编译失败</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="ch36">36 · 基础设施与生态（8 条）</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>官方说法</th><th>2.0.4 源码事实</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+              <tr id="ch36-nacos-constructors">
+                <td>文档写 <code>new NacosA2aRegistryProperties()</code><span class="src" data-src="docs/v2/zh/integration/infrastructure/nacos.md:36-38">nacos.md:36-38</span>，又写 <code>new NacosAgentCardResolver(props, "translator-agent")</code><span class="src" data-src="docs/v2/zh/integration/infrastructure/nacos.md:48-52">nacos.md:48-52</span></td>
+                <td><code>NacosA2aRegistryProperties</code> 是四字段 record，没有无参构造器<span class="src" data-src="agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/registry/NacosA2aRegistryProperties.java:34-38">NacosA2aRegistryProperties.java:34-38</span>；解析器只有 <code>(Properties)</code> / <code>(AiService)</code> 两个构造器，Agent 名由 <code>A2aAgent.builder().name(...)</code> 提供<span class="src" data-src="agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/discovery/NacosAgentCardResolver.java:75-88">NacosAgentCardResolver.java:75-88</span></td>
+                <td>照文档写两处都会编译失败；properties 用 <code>builder()</code>，resolver 用 <code>(Properties)</code>，名字交给 <code>A2aAgent</code></td>
+              </tr>
+              <tr id="ch36-higress-build">
+                <td>Higress 快速上手以 <code>.build()</code> 结尾<span class="src" data-src="docs/v2/zh/integration/infrastructure/higress.md:31-34">higress.md:31-34</span></td>
+                <td>builder 只提供返回 <code>Mono</code> 的 <code>buildAsync()</code><span class="src" data-src="agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientBuilder.java:311">HigressMcpClientBuilder.java:311</span>与阻塞式 <code>buildSync()</code><span class="src" data-src="agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientBuilder.java:357">:357</span></td>
+                <td>照文档写 <code>.build()</code> 会编译失败；响应式用 async，脚本 / 测试用 sync</td>
+              </tr>
+              <tr id="ch36-scheduler-pause">
+                <td>文档称 <code>AgentScheduler</code> 核心接口包含 <code>pause(...)</code> / <code>resume(...)</code><span class="src" data-src="docs/v2/zh/integration/infrastructure/scheduler.md:15-20">scheduler.md:15-20</span>，示例还把变量声明成接口后调用 <code>pause</code><span class="src" data-src="docs/v2/zh/integration/infrastructure/scheduler.md:66-73">scheduler.md:66-73</span></td>
+                <td>接口只有 schedule / cancel / get / getAll / shutdown / type，没有 pause / resume<span class="src" data-src="agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-common/src/main/java/io/agentscope/extensions/scheduler/AgentScheduler.java:77-190">AgentScheduler.java:77-190</span>；pause / resume 只在 Quartz 实现类上<span class="src" data-src="agentscope-extensions/agentscope-extensions-scheduler/agentscope-extensions-scheduler-quartz/src/main/java/io/agentscope/extensions/scheduler/quartz/QuartzAgentScheduler.java:429-470">QuartzAgentScheduler.java:429-470</span></td>
+                <td>声明成 <code>AgentScheduler</code> 再调 pause 会编译失败；用具体 Quartz 类型或 <code>ScheduleAgentTask.cancel()</code></td>
+              </tr>
+              <tr id="ch36-studio-autohook">
+                <td>文档让初始化后手动挂 <code>.hook(new StudioMessageHook(...))</code><span class="src" data-src="docs/v2/zh/integration/ecosystem/studio.md:37-42">studio.md:37-42</span></td>
+                <td><code>StudioManager.initialize()</code> 成功后会自己 <code>AgentBase.addSystemHook(new StudioMessageHook(...))</code>，并注册 Tracer<span class="src" data-src="agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioManager.java:246-260">StudioManager.java:246-260</span></td>
+                <td>自动 Hook 与手动 Hook 同时生效时，同一条最终消息会被推两次</td>
+              </tr>
+              <tr id="ch36-studio-message">
+                <td>文档说每条 user / assistant / tool 消息都被同步到 Studio<span class="src" data-src="docs/v2/zh/integration/ecosystem/studio.md:48-52">studio.md:48-52</span></td>
+                <td><code>StudioMessageHook</code> 只处理 <code>PostCallEvent</code>，取 <code>getFinalMessage()</code> 推送；失败只记日志<span class="src" data-src="agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioMessageHook.java:66-95">StudioMessageHook.java:66-95</span></td>
+                <td>消息 Hook 只覆盖一次调用的最终回复；工具与推理过程看 trace，不要指望这个 Hook</td>
+              </tr>
+              <tr id="ch36-training-shadow">
+                <td>文档说命中采样后「调用替换为 Trinity 后端」<span class="src" data-src="docs/v2/zh/integration/ecosystem/training.md:68-74">training.md:68-74</span></td>
+                <td>生产调用不变；路由器克隆影子 Agent、换成 <code>TrinityModelAdapter</code>，在异步线程池里再跑一遍<span class="src" data-src="agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRouter.java:277-298">TrainingRouter.java:277-298</span>，生产响应不等影子完成<span class="src" data-src="agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/runner/TrainingRouter.java:221-249">:221-249</span></td>
+                <td>Training 是影子流量，不是替换生产模型；采样命中只会多跑一次异步影子</td>
+              </tr>
+              <tr id="ch36-training-reward">
+                <td>文档说 <code>rewardCalculator</code> 是 <code>Function&lt;AgentBase, Double&gt;</code><span class="src" data-src="docs/v2/zh/integration/ecosystem/training.md:52-58">training.md:52-58</span></td>
+                <td>实际接口是 <code>RewardCalculator</code>，方法为 <code>double calculate(Agent agent)</code><span class="src" data-src="agentscope-extensions/agentscope-extensions-training/src/main/java/io/agentscope/core/training/reward/RewardCalculator.java:26-34">RewardCalculator.java:26-34</span></td>
+                <td>Lambda 仍可写，但参数类型是 <code>Agent</code>；自定义类实现 <code>RewardCalculator</code>，不是 <code>Function</code></td>
+              </tr>
+              <tr id="ch36-chat-adapter">
+                <td>文档示例是 <code>adapter.stream(agent, request)</code><span class="src" data-src="docs/v2/zh/integration/ecosystem/chat-completions-web.md:33-37">chat-completions-web.md:33-37</span></td>
+                <td>源码只有一个 <code>stream</code> 重载：<code>stream(ReActAgent, List&lt;Msg&gt;, String requestId, String model)</code><span class="src" data-src="agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-chat-completions-web/src/main/java/io/agentscope/core/chat/completions/streaming/ChatCompletionsStreamingAdapter.java:86-104">ChatCompletionsStreamingAdapter.java:86-104</span></td>
+                <td>照文档写会编译失败；先用 <code>ChatMessageConverter</code> 把请求转成 <code>List&lt;Msg&gt;</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
 
         <h2 id="why">为什么会有这些差异</h2>
-        <p>把 60 条放在一起看，成因其实只有三类，认出类型就能猜出该信哪边：</p>
+        <p>把 78 条放在一起看，成因其实只有三类，认出类型就能猜出该信哪边：</p>
         <ol class="steps">
           <li>
             <span class="sh">文档滞后于代码</span>
@@ -550,7 +728,7 @@
             <span class="sh">示例从 1.x 或别的语言搬来</span>
             <div>
               1.x 的 <code>memory.addMessage()</code>、<code>StaticLongTermMemoryHook</code>、Python 部署页的示例，都还在文档站里。典型：09 章示例缺
-              <code>RuntimeContext</code> 参数（07 章 1.x 记忆 API 整包换成新接口，不在这 60 条里，正文有专段说）。这类先看包级 <code>@Deprecated</code> 与签名。
+              <code>RuntimeContext</code> 参数（07 章 1.x 记忆 API 整包换成新接口，不在这 78 条里，正文有专段说）。这类先看包级 <code>@Deprecated</code> 与签名。
             </div>
           </li>
           <li>

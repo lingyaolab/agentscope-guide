@@ -5,7 +5,7 @@
  *   node tools/check-site.cjs --static   只跑静态检查（CI/没装浏览器时）
  *   node tools/check-site.cjs --browser  只跑浏览器回归
  *
- * 静态：站内链接与深链、重复 id、description/OG、标题唯一性、nav.js 与实际页面一致、
+ * 静态：站内链接与深链、重复 id、description/OG、标题唯一性、nav.js 与实际页面及小节标题一致、
  *       首页分组卡与 nav 组名对齐、发布入口与元文件（根跳转页 / 404 / robots / .nojekyll / favicon / Pages 工作流）
  * 浏览器：headless Edge/Chrome + CDP，验证 skip link、aria-current、抽屉 Esc 与焦点回收、
  *        搜索播报、页内 Tab 键盘、页面级方向键不抢键、reduced-motion、390/1200 横向溢出、
@@ -57,6 +57,24 @@ const pages = walk(SITE)
   .filter((p) => path.basename(p) !== "404.html")
   .sort();
 const rel = (p) => path.relative(SITE, p).replace(/\\/g, "/");
+
+const ENTITY_MAP = {
+  "&nbsp;": " ",
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+  "&hellip;": "…",
+  "&rarr;": "→",
+};
+function plain(html) {
+  return html
+    .replace(/<[^>]+>/g, "")
+    .replace(/&[a-z#0-9]+;/gi, (m) => (m in ENTITY_MAP ? ENTITY_MAP[m] : m))
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 /* ---------- 静态检查 ---------- */
 
@@ -168,6 +186,39 @@ function staticChecks() {
   const ready = flat.filter((x) => x.status === "ready").length;
   check("static", "nav.js 与实际页面一致", navBad.length === 0, flat.length + " 条目录，" + ready + " 条 ready");
   navBad.slice(0, 10).forEach((b) => console.log("      " + b));
+
+  // 5a nav 里的 sections 是搜索索引与页内 TOC 的唯一来源；标题改名却漏改 nav 时，
+  // 页面能打开，但 TOC 与搜索会继续显示旧标题。这里逐条比对 id 与纯文本标题。
+  const sectionBad = [];
+  for (const it of flat) {
+    if (it.status !== "ready" || !Array.isArray(it.sections) || !it.sections.length) continue;
+    const html = fs.readFileSync(path.join(SITE, it.href), "utf8");
+    const found = new Map();
+    for (const m of html.matchAll(/<h2\b[^>]*\bid="([^"]+)"[^>]*>([\s\S]*?)<\/h2>/g)) {
+      found.set(m[1], plain(m[2]));
+    }
+    for (const s of it.sections) {
+      const id = Array.isArray(s) ? s[0] : s.id;
+      const title = Array.isArray(s) ? s[1] : s.title;
+      if (!found.has(id)) {
+        sectionBad.push(it.href + ": nav 小节 #" + id + " 在页面上不存在");
+      } else if (plain(title) !== found.get(id)) {
+        sectionBad.push(it.href + ": #" + id + " nav=「" + title + "」 page=「" + found.get(id) + "」");
+      }
+    }
+    for (const id of found.keys()) {
+      if (!it.sections.some((s) => (Array.isArray(s) ? s[0] : s.id) === id)) {
+        sectionBad.push(it.href + ": 页面小节 #" + id + " 未进 nav");
+      }
+    }
+  }
+  check(
+    "static",
+    "nav 小节标题与页面 h2 一致",
+    sectionBad.length === 0,
+    sectionBad.length ? sectionBad.length + " 条不一致" : flat.length + " 条目录逐项对齐"
+  );
+  sectionBad.slice(0, 10).forEach((b) => console.log("      " + b));
 
   // 5b 首页卡片位与 nav 组名对齐：组名重复会让同名组被渲染两次，
   // 卡片位的 data-cards 写错则整组静默消失（site.js 找不到组就渲染空）。
