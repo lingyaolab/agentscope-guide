@@ -1,0 +1,28 @@
+CHANGELOG.md
+  h_000d6d73c03ff5 7,14,17,21
+DEPLOY.md
+  h_000d6d73c03ff5 73,98
+README.md
+  h_000d6d73c03ff5 17
+agentscope-java-learn/assets/nav.js
+  h_000d6d73c03ff5 1169-1171,1173-1197
+agentscope-java-learn/assets/search-index.js
+  h_000d6d73c03ff5 2
+agentscope-java-learn/chapters/32-rag-integration.html
+  h_000d6d73c03ff5 529
+agentscope-java-learn/chapters/33-protocols.html
+  h_000d6d73c03ff5 1-513
+agentscope-java-learn/index.html
+  h_000d6d73c03ff5 101,204,206,208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3e571e0e9a7839ac5e84ab516d4b1ed3ac917618",
+  "prompts": {},
+  "humans": {
+    "h_000d6d73c03ff5": {
+      "author": "lingyao <lingyao@tianmagroup.com>"
+    }
+  }
+}
