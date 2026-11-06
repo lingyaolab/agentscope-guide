@@ -1,0 +1,18 @@
+agentscope-java-learn/assets/nav.js
+  h_000d6d73c03ff5 1187-1301
+agentscope-java-learn/assets/search-index.js
+  h_000d6d73c03ff5 2
+agentscope-java-learn/index.html
+  h_000d6d73c03ff5 112-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "85d7d51fe4ef541c684231c0f34d2aa2dd4ed9dd",
+  "prompts": {},
+  "humans": {
+    "h_000d6d73c03ff5": {
+      "author": "lingyao <lingyao@tianmagroup.com>"
+    }
+  }
+}
