@@ -1,0 +1,28 @@
+CHANGELOG.md
+  h_000d6d73c03ff5 7,14,17,21
+DEPLOY.md
+  h_000d6d73c03ff5 73,98
+README.md
+  h_000d6d73c03ff5 17
+agentscope-java-learn/assets/nav.js
+  h_000d6d73c03ff5 1235-1237,1239-1262
+agentscope-java-learn/assets/search-index.js
+  h_000d6d73c03ff5 2
+agentscope-java-learn/chapters/34-channels.html
+  h_000d6d73c03ff5 483
+agentscope-java-learn/chapters/35-skill-repositories.html
+  h_000d6d73c03ff5 1-463
+agentscope-java-learn/index.html
+  h_000d6d73c03ff5 101,204,206,208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1a6edc2a3e6c462b7b647b4165b9b965b8b1969f",
+  "prompts": {},
+  "humans": {
+    "h_000d6d73c03ff5": {
+      "author": "lingyao <lingyao@tianmagroup.com>"
+    }
+  }
+}
