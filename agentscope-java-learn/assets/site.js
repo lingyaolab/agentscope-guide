@@ -1302,6 +1302,19 @@
     article.insertBefore(c, article.firstChild);
   }
 
+  /* ---------- 预计阅读时间 ---------- */
+
+  function buildReadTime() {
+    var article = document.querySelector(".article");
+    if (!article || item < 0) return;
+    var h1 = article.querySelector("h1");
+    var mins = flat[item].mins;
+    if (!h1 || !mins) return;
+    var p = el("p", "read-time");
+    p.innerHTML = "预计阅读 <strong>" + mins + "</strong> 分钟";
+    h1.insertAdjacentElement("afterend", p);
+  }
+
   /* ---------- 上下章 + 标记已读 ---------- */
 
   function buildPager() {
@@ -1862,6 +1875,7 @@
     initExercise();
     buildPager();
     buildCrumbs();
+    buildReadTime();
     buildCards();
     buildProgressCard();
     initReadProgress();

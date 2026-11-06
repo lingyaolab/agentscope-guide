@@ -131,11 +131,11 @@
             out += span("c", tag);
           } else {
             out += esc(tag)
-              .replace(/^(&lt;\/?)([\w:.\-]+)/, function (_a, lt, name) {
-                return lt + '<span class="tk-k">' + name + "</span>";
-              })
               .replace(/([\w:.:-]+)=(&quot;|")/g, function (_a, attr) {
                 return '<span class="tk-a">' + attr + "</span>=";
+              })
+              .replace(/^(&lt;\/?)([\w:.\-]+)/, function (_a, lt, name) {
+                return lt + '<span class="tk-k">' + name + "</span>";
               });
           }
           i += tag.length;

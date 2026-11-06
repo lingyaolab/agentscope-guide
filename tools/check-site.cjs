@@ -431,6 +431,11 @@ async function browserChecks() {
     );
     check("browser", "TOC 激活项 aria-current=location", /^[1-9]\d*\|.+$/.test(String(tocCur)), tocCur);
 
+    const readTime = await ev(
+      `(function(){var n=document.querySelector('.read-time');return n?n.textContent.replace(/\\s+/g,' ').trim():'none';})()`
+    );
+    check("browser", "章节显示预计阅读时间", /^预计阅读 \d+ 分钟$/.test(String(readTime)), readTime);
+
     const search = await ev(
       `(function(){var q=document.getElementById('q');q.focus();q.value='权限';
         q.dispatchEvent(new Event('input',{bubbles:true}));
@@ -541,6 +546,22 @@ async function browserChecks() {
       `(function(){var n=document.querySelector('.toc-compact-note');return n?n.textContent.trim():'none';})()`
     );
     check("browser", "无 h3 页面显示「仅二级」提示", tocNote === "仅二级", tocNote);
+
+    // XML 高亮：属性替换不能把刚插入的 <span class="tk-k"> 再当成属性改写
+    await send(
+      "Page.navigate",
+      { url: pathToFileURL(path.join(SITE, "chapters", "01-setup.html")).href },
+      sessionId
+    );
+    await sleep(250);
+    const hl = await ev(
+      `(function(){var p=document.querySelector('pre[data-lang="xml"]');if(!p)return 'no-xml';
+        var h=p.innerHTML;
+        if(h.indexOf('class=tk-k')>-1||h.indexOf('<span <span')>-1||h.indexOf('tk-a">class')>-1)return 'bad';
+        return h.indexOf('tk-k')>-1?'ok':'no-highlight';})()`
+    );
+    check("browser", "代码高亮不破坏 XML 标签", hl === "ok", hl);
+
     await send("Page.navigate", { url: pathToFileURL(p02).href }, sessionId);
     await sleep(250);
 

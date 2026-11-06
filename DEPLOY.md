@@ -94,7 +94,7 @@ location ~* \.(css|js|svg)$ { add_header Cache-Control "public, max-age=86400"; 
 
 ```powershell
 node tools/build-search-index.cjs   # 正文改过就必须重建
-node tools/check-site.cjs           # 静态 + 浏览器回归（当前 40 项）
+node tools/check-site.cjs           # 静态 + 浏览器回归（当前 42 项）
 node tools/check-sources.cjs        # 3421 条出处是否都能定位（含路径大小写）
 ```
 
