@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="第 31 章拆 AgentScope Java 2.0.4 的 AgentStateStore：AgentState 里到底存什么、各后端 key / 表 / 对象怎么排、乐观并发与 ConflictPolicy 怎么选，以及 Redis / JDBC / MongoDB / OSS / JSON 的能力边界。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="31 Agent 状态存储：Redis / MySQL / OSS · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="第 31 章拆 AgentScope Java 2.0.4 的 AgentStateStore：AgentState 里到底存什么、各后端 key / 表 / 对象怎么排、乐观并发与 ConflictPolicy 怎么选，以及 Redis / JDBC / MongoDB / OSS / JSON 的能力边界。"
+    />
+    <title>31 Agent 状态存储：Redis / MySQL / OSS · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="31-agent-state-store" data-root="..">
+    <main>
+      <article class="article">
+        <h1>31 · Agent 状态存储：Redis / MySQL / OSS</h1>
+        <p class="lede">
+          第 30 章解决「组件落在哪」，这一章把镜头拉近到 <code>AgentStateStore</code> 本身。
+          它保存的不是一份聊天记录，而是 Agent 恢复一次会话所需的完整状态：上下文、摘要、权限、工具组、任务与 Plan Mode。
+          多副本下真正的难点也不是「连上 Redis」，而是 <code>(userId, sessionId)</code> 怎么寻址、版本怎么比较、冲突时覆盖还是失败。
+        </p>
+
+        <h2 id="goals">读完你能做到</h2>
+        <ul class="goals">
+          <li>说清 <code>AgentState</code> 的字段与 JSON 形态，知道恢复会话为什么不能只存消息列表</li>
+          <li>列出 <code>AgentStateStore</code> 的方法边界：单值、列表、会话删除、按 key 删除、按用户列会话</li>
+          <li>看懂 Redis / JDBC / MongoDB / OSS / JSON 五套 key 或表结构，并能按落点排障</li>
+          <li>解释 <code>UNVERSIONED</code>、<code>saveIfVersion</code> 的三种 expectedVersion 语义，以及为什么列表没有版本</li>
+          <li>在 <code>OVERWRITE</code>、<code>FAIL</code>、<code>APPEND_MERGE</code> 之间做出有依据的选择</li>
+          <li>把 SessionTurnGate、CAS 与多副本部署组合成一条可解释的一致性方案</li>
+        </ul>
+
+        <h2 id="why">状态不是聊天记录</h2>
+        <p>
+          <code>AgentState</code> 是「单个 Agent 恢复一次会话所需的运行时状态」：对话缓冲区、滚动摘要、当前回复 id、迭代计数、
+          权限上下文、工具上下文、任务上下文与 Plan Mode 上下文
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:29-42">AgentState.java:29-42</span>。
+          只存 <code>messages</code>，恢复后会丢掉工具组激活状态、权限规则与任务进度。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>字段</th><th>JSON 名</th><th>恢复时为什么需要</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>会话 / 用户</td><td><code>session_id</code> / <code>user_id</code></td><td>定位槽位，避免串会话</td></tr>
+              <tr><td>摘要</td><td><code>summary</code></td><td>压缩后的历史不能被丢掉</td></tr>
+              <tr><td>上下文</td><td><code>context</code></td><td>消息、工具调用与结果</td></tr>
+              <tr><td>回复与迭代</td><td><code>reply_id</code> / <code>cur_iter</code></td><td>中断恢复与轮次判断</td></tr>
+              <tr><td>权限 / 工具 / 任务 / Plan</td><td><code>permission_context</code> / <code>tool_context</code> / <code>tasks_context</code> / <code>plan_mode_context</code></td><td>恢复后仍知道「能做什么、做到哪」</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>context</code> 对外通过 <code>getContext()</code> 返回防御性副本，通过 <code>contextMutable()</code> 提供可变句柄；
+          存储层可以整体替换 <code>AgentState</code>，也可以原地改内部集合
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:36-39">AgentState.java:36-39</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:170-177">AgentState.java:170-177</span>。
+          JSON 里的字段名是 snake_case，排障时直接看存储里的 <code>agent_state</code> 就能对上
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:95-107">AgentState.java:95-107</span>。
+        </p>
+
+        <h2 id="contract">契约：一个槽位，几种操作</h2>
+        <p>
+          <code>AgentStateStore</code> 用 <code>(userId, sessionId)</code> 寻址：<code>sessionId</code> 必须非空，
+          <code>userId</code> 可空，空表示匿名 / 单租户调用方
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:22-38">AgentStateStore.java:22-38</span>。
+          方法分成四组：
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>组</th><th>方法</th><th>边界</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>单值</td><td><code>save</code> / <code>get</code> / <code>getVersioned</code> / <code>saveIfVersion</code></td><td>主要存 <code>agent_state</code>；支持版本化的后端才有 CAS</td></tr>
+              <tr><td>列表</td><td><code>save(List)</code> / <code>getList</code></td><td>按 key 存列表；实现决定增量 append 还是整体重写</td></tr>
+              <tr><td>会话</td><td><code>exists</code> / <code>delete</code> / <code>listSessionIds</code></td><td>只能按单个用户列会话，没有跨用户列表 API</td></tr>
+              <tr><td>清理</td><td><code>delete(userId, sessionId, key)</code> / <code>close</code></td><td>按 key 删除默认是 no-op，不是每个后端都覆盖</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          按 key 删除的默认实现是空操作
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:201-210">AgentStateStore.java:201-210</span>；
+          <code>listSessionIds(null)</code> 只列匿名会话，列某个用户要传具体 userId，跨用户统计是管理端的职责
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:212-222">AgentStateStore.java:212-222</span>。
+          不要假设「接口有 delete(key)」就等于「所有后端真的删了」。
+        </p>
+
+        <h2 id="keys">落点：同一个槽位，五种排法</h2>
+        <p>
+          Agent 层只传 <code>(userId, sessionId)</code>，具体怎么拼 key 由后端决定。排障时第一件事就是找到这个槽位的实际落点。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>后端</th><th>槽位</th><th>单值 / 列表</th><th>索引 / 版本</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Redis</td><td><code>{user}/{session}</code>（匿名 <code>__anon__</code>）</td><td><code>{prefix}{slot}:{key}</code>；列表加 <code>:list</code></td><td>列表 hash；<code>_keys</code> Set 记录该会话所有 key<span class="src" data-src="docs/v2/zh/integration/session/redis.md:98-109">redis.md:98-109</span></td></tr>
+              <tr><td>JDBC</td><td><code>__anon__:session</code></td><td><code>(session_id, state_key, item_index)</code> 行；单值 <code>item_index=0</code></td><td>新 JDBC 表有 <code>version</code> 列<span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-jdbc/src/main/java/io/agentscope/extensions/jdbc/dialect/table/SessionStateDialect.java:21-26">SessionStateDialect.java:21-26</span></td></tr>
+              <tr><td>MongoDB</td><td>复合 <code>_id {user, session}</code></td><td><code>states.&lt;key&gt;</code>；列表是 BSON 数组</td><td><code>versions.&lt;key&gt;</code> / <code>hashes.&lt;key&gt;</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:62-69">MongoAgentStateStore.java:62-69</span></td></tr>
+              <tr><td>OSS</td><td><code>{prefix}{user}/{session}/</code></td><td><code>{key}.json</code> / <code>{key}.list.json</code></td><td><code>{key}.list.hash</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-oss/src/main/java/io/agentscope/extensions/oss/OssAgentStateStore.java:45-47">OssAgentStateStore.java:45-47</span></td></tr>
+              <tr><td>JSON 文件</td><td><code>__anon__/&lt;session&gt;/</code> 或 <code>&lt;user&gt;/&lt;session&gt;/</code></td><td><code>agent_state.json</code> 等</td><td><code>*.hash</code>；路径会做安全编码<span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:47-64">JsonFileAgentStateStore.java:47-64</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Redis 的实际槽位是 <code>normalizeUser(userId) + "/" + sessionId</code>，匿名用户固定为 <code>__anon__</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-redis/src/main/java/io/agentscope/extensions/redis/state/RedisAgentStateStore.java:439-450">RedisAgentStateStore.java:439-450</span>；
+          JDBC 则是 <code>__anon__:session</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-jdbc/src/main/java/io/agentscope/extensions/jdbc/state/JdbcAgentStateStore.java:571-582">JdbcAgentStateStore.java:571-582</span>。
+          MongoDB 特意用结构化 <code>_id</code>，避免 userId 或 sessionId 里出现分隔符时跨租户碰撞
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:563-573">MongoAgentStateStore.java:563-573</span>。
+        </p>
+
+        <h2 id="lifecycle">一次调用：先读 agent_state，再按版本写回</h2>
+        <p>
+          ReActAgent 启动一次调用时，先读 <code>agent_state</code>。读到就用它和它的版本；读不到就尝试旧版 key
+          <code>memory_messages</code> + <code>toolkit_activeGroups</code>，再读不到才创建新状态
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:414-445">ReActAgent.java:414-445</span>。
+          旧格式没有版本，迁移时按「create-if-absent」的版本 0 处理
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:437-445">ReActAgent.java:437-445</span>。
+        </p>
+        <p>
+          调用结束时，把当前 <code>AgentState</code> 写回同一个槽位；如果后端支持版本化，会带上本轮加载时观察到的版本做 CAS
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:475-495">ReActAgent.java:475-495</span>。
+          Agent 进程内还会按槽位缓存状态与版本，避免每次调用都重新反序列化
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:286-293">ReActAgent.java:286-293</span>。
+        </p>
+        <div class="callout">
+          <span class="ct">列表状态走另一条路</span>
+          <p>
+            单值有 <code>getVersioned</code> / <code>saveIfVersion</code>，列表没有。列表保存靠实现里的 hash + 计数判断
+            「增量 append 还是整体重写」；Redis、JDBC、Mongo、OSS、JSON 各有自己的 hash 字段或列
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:140-157">AgentStateStore.java:140-157</span>。
+            所以「单值 CAS 成功」不代表「同一会话里的列表也原子」。
+          </p>
+        </div>
+
+        <h2 id="versioning">版本：UNVERSIONED、0 与 expectedVersion</h2>
+        <p>
+          <code>AgentStateStore</code> 用 <code>UNVERSIONED = -1</code> 表示「这个后端不支持乐观并发」，
+          也用于「CAS 冲突且什么都没写」。默认 <code>supportsVersioning()</code> 返回 false，
+          <code>saveIfVersion</code> 会退化成无条件 <code>save</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:63-67">AgentStateStore.java:63-67</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:81-138">AgentStateStore.java:81-138</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>expectedVersion</th><th>语义</th><th>返回</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>0</code></td><td>create-if-absent；已有 version 0 的旧行也允许写入</td><td>成功返回新版本；已有非零版本则冲突</td></tr>
+              <tr><td><code>UNVERSIONED</code>（-1）</td><td>无条件覆盖，等同于 <code>save</code></td><td>支持版本的后端返回本次写入的版本</td></tr>
+              <tr><td>其他正整数</td><td>只有当前版本等于它才写</td><td>成功返回新版本；冲突返回 <code>UNVERSIONED</code> 且不写</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          当前实现里，InMemory、Redis、JDBC、MongoDB 都提供版本化；JSON 文件与 OSS 在文档里仍按 last-writer-wins 描述
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:103-106">index.md:103-106</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/InMemoryAgentStateStore.java:61">InMemoryAgentStateStore.java:61</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-jdbc/src/main/java/io/agentscope/extensions/jdbc/state/JdbcAgentStateStore.java:200">JdbcAgentStateStore.java:200</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:160">MongoAgentStateStore.java:160</span>。
+          选后端时，如果同一会话会被多个副本并发写，版本化不是可选项。
+        </p>
+
+        <h2 id="conflict">冲突：覆盖、失败还是合并</h2>
+        <p>
+          默认 <code>conflictPolicy</code> 是 <code>OVERWRITE</code>，保留旧的 last-writer-wins 行为
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:347-348">ReActAgent.java:347-348</span>。
+          但 CAS 冲突发生在轮次末尾，回复可能已经流式输出、工具副作用可能已经发生，所以「冲突」不是可以静默忽略的小事
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/ConflictPolicy.java:22-31">ConflictPolicy.java:22-31</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>策略</th><th>冲突时做什么</th><th>适合</th><th>风险</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>OVERWRITE</code>（默认）</td><td>无条件再写一次</td><td>单副本、可接受最后写入者</td><td>静默丢掉另一轮的状态</td></tr>
+              <tr><td><code>FAIL</code></td><td>抛 <code>ConcurrentSessionModificationException</code>，跳过写</td><td>启用了分布式 SessionTurnGate</td><td>调用方必须处理异常</td></tr>
+              <tr><td><code>APPEND_MERGE</code></td><td>重读最新基线，追加本轮新增消息，再重试 CAS</td><td>普通聊天轮次</td><td>压缩 / 摘要轮会重写历史，不安全</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>FAIL</code> 的异常会带 userId、sessionId、key 与 expectedVersion，方便定位是哪一轮撞了
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/ConcurrentSessionModificationException.java:22-61">ConcurrentSessionModificationException.java:22-61</span>。
+          <code>APPEND_MERGE</code> 的合并逻辑只把 <code>loadedContextSize</code> 之后的新消息追加到最新基线，
+          再保留本轮的权限上下文，然后重试 CAS
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:607-639">ReActAgent.java:607-639</span>。
+        </p>
+
+        <h2 id="gate">SessionTurnGate：先把同一会话的轮次排队</h2>
+        <p>
+          <code>SessionTurnGate</code> 是按 key 的互斥：同一个会话同一时间只允许一个 turn，
+          本地实现是进程内公平信号量，分布式实现由控制面托管
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/gateway/SessionTurnGate.java:18-24">SessionTurnGate.java:18-24</span>。
+          它和 CAS 解决的不是同一个问题：gate 减少并发轮次，CAS 负责在写入时发现版本不一致。
+        </p>
+        <p>
+          使用分布式 gate 时，官方建议把 <code>conflictPolicy</code> 设为 <code>FAIL</code>，让并发写以错误暴露，
+          而不是被 <code>OVERWRITE</code> 静默吞掉
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/ConflictPolicy.java:26-31">ConflictPolicy.java:26-31</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:5172-5177">ReActAgent.java:5172-5177</span>。
+          <code>DistributedStore.sessionTurnGate()</code> 默认返回 <code>null</code>，此时回退到本地 gate
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/DistributedStore.java:152-167">DistributedStore.java:152-167</span>。
+        </p>
+
+        <h2 id="redis">Redis：key 结构清楚，CAS 用 Lua</h2>
+        <p>
+          Redis 状态存储支持 Jedis、Lettuce、Redisson 三类客户端，也可注入自定义 <code>RedisClientAdapter</code>
+          <span class="src" data-src="docs/v2/zh/integration/session/redis.md:15">redis.md:15</span>
+          <span class="src" data-src="docs/v2/zh/integration/session/redis.md:45-85">redis.md:45-85</span>。
+          单值存 String，列表存 List，列表另有 hash key；<code>_keys</code> Set 记录该会话下所有 stateKey，删除和存在性判断都不用扫全库
+          <span class="src" data-src="docs/v2/zh/integration/session/redis.md:98-109">redis.md:98-109</span>。
+        </p>
+        <pre data-lang="java" data-file="Redis 状态存储（示意）">AgentStateStore stateStore = RedisAgentStateStore.builder()
+    .jedisClient(new JedisPooled("redis://localhost:6379"))
+    .keyPrefix("myapp:session:")
+    .build();
+
+ReActAgent agent = ReActAgent.builder()
+    .name("assistant")
+    .model(model)
+    .stateStore(stateStore)
+    .build();</pre>
+        <p>
+          <code>RedisAgentStateStore</code> 的版本化由 <code>RedisStateVersionSupport</code> 配合 Lua 脚本完成；
+          单值有版本 key，<code>saveIfVersion</code> 通过 Lua 脚本原子比较再写；列表只用 hash 做增量判断，不走版本化
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-redis/src/main/java/io/agentscope/extensions/redis/state/RedisAgentStateStore.java:226-291">RedisAgentStateStore.java:226-291</span>。
+          默认前缀是 <code>agentscope:session:</code>，多项目共享 Redis 时要改。
+        </p>
+
+        <h2 id="jdbc">JDBC：当前是 JdbcAgentStateStore，不是旧 Mysql 那张表</h2>
+        <p>
+          这里有三层容易混：<code>MysqlDistributedStore</code> 已标记未来移除（第 30 章），
+          <code>MysqlAgentStateStore</code> 是旧 MySQL 实现，
+          新统一路径是 <code>agentscope-extensions-jdbc</code> 的 <code>JdbcAgentStateStore</code>，支持 MySQL / PostgreSQL / H2 / SQLite
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-jdbc/src/main/java/io/agentscope/extensions/jdbc/JdbcDistributedStore.java:31-42">JdbcDistributedStore.java:31-42</span>。
+        </p>
+        <p>
+          表结构也有文档差异。分布式 MySQL 页写的是 <code>user_id</code>、<code>state_value</code>、<code>state_type</code>
+          <span class="src" data-src="docs/v2/zh/integration/distributed/mysql.md:52">mysql.md:52</span>；
+          旧 <code>MysqlAgentStateStore</code> 源码实际建的是
+          <code>session_id</code>、<code>state_key</code>、<code>item_index</code>、<code>state_data</code>（外加 version）
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mysql/src/main/java/io/agentscope/extensions/mysql/state/MysqlAgentStateStore.java:42-56">MysqlAgentStateStore.java:42-56</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mysql/src/main/java/io/agentscope/extensions/mysql/state/MysqlAgentStateStore.java:240-247">MysqlAgentStateStore.java:240-247</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mysql/src/main/java/io/agentscope/extensions/mysql/state/MysqlAgentStateStore.java:197-203">MysqlAgentStateStore.java:197-203</span>；
+          新 JDBC 同样按 <code>(session_id, state_key, item_index)</code> 存，单值 <code>item_index=0</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-jdbc/src/main/java/io/agentscope/extensions/jdbc/dialect/table/SessionStateDialect.java:21-26">SessionStateDialect.java:21-26</span>。
+          不要按旧文档的列名写 SQL 报表。
+        </p>
+        <div class="callout warn">
+          <span class="ct">以源码的 item_index 模型为准</span>
+          <p>
+            当前两代实现都是「一行一个 item」：单值一行 <code>item_index=0</code>，列表每项一行；
+            hash 另存一行做增量判断。新 JDBC 多一个 <code>version</code> 列支持 CAS
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-jdbc/src/main/java/io/agentscope/extensions/jdbc/dialect/table/SessionStateDialect.java:69-96">SessionStateDialect.java:69-96</span>。
+            列名对不上时，先怀疑文档版本，而不是数据库坏了。
+          </p>
+        </div>
+
+        <h2 id="mongodb">MongoDB：结构化 _id + versions 子文档</h2>
+        <p>
+          MongoDB 每个会话一个文档，复合 <code>_id</code> 是 <code>{user, session}</code>；
+          状态在 <code>states.&lt;key&gt;</code>，版本在 <code>versions.&lt;key&gt;</code>，列表 hash 在 <code>hashes.&lt;key&gt;</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:62-69">MongoAgentStateStore.java:62-69</span>。
+          结构化 <code>_id</code> 的好处是 userId / sessionId 里出现分隔符也不会串租户
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:563-573">MongoAgentStateStore.java:563-573</span>。
+        </p>
+        <p>
+          状态 key 会作为字段名写进 <code>states</code> 子文档，所以必须匹配
+          <code>^[a-zA-Z_][a-zA-Z0-9_]*$</code>：不能有点、美元符号或 Unicode
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:84-98">MongoAgentStateStore.java:84-98</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:575-593">MongoAgentStateStore.java:575-593</span>。
+          会话 TTL 默认关闭，只有显式 <code>ttlDays(n)</code> 才创建 TTL 索引
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:688-703">MongoAgentStateStore.java:688-703</span>。
+        </p>
+        <pre data-lang="java" data-file="Mongo 状态存储（示意）">AgentStateStore stateStore = MongoAgentStateStore.builder()
+    .mongoClient(mongoClient)
+    .databaseName("agentscope")
+    .collectionName("agentscope_sessions")
+    .ttlDays(30)   // 可选；不传则不自动过期
+    .build();</pre>
+
+        <h2 id="oss">OSS：对象布局简单，但没有版本化</h2>
+        <p>
+          OSS 把单值写成 <code>{key}.json</code>、列表写成 <code>{key}.list.json</code>、hash 写成 <code>{key}.list.hash</code>，
+          路径前缀是 <code>{prefix}{user}/{session}/</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-oss/src/main/java/io/agentscope/extensions/oss/OssAgentStateStore.java:45-47">OssAgentStateStore.java:45-47</span>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-oss/src/main/java/io/agentscope/extensions/oss/OssAgentStateStore.java:243-259">OssAgentStateStore.java:243-259</span>。
+          它没有覆盖 <code>supportsVersioning()</code>，走默认 false，因此 <code>saveIfVersion</code> 会退化成无条件写；
+          文档也把 OSS 列为 last-writer-wins
+          <span class="src" data-src="docs/v2/zh/integration/distributed/index.md:103-106">index.md:103-106</span>。
+        </p>
+        <pre data-lang="java" data-file="OSS 状态存储（示意）">AgentStateStore stateStore = OssAgentStateStore.builder()
+    .ossClient(ossClient)
+    .bucketName("my-bucket")
+    .keyPrefix("agentscope/state/")
+    .build();</pre>
+        <p>
+          OSS 更适合「状态写不频繁、容量大、可接受 last-writer-wins」的场景；高并发写同一会话时，
+          应选 Redis / JDBC / Mongo，或至少用 SessionTurnGate 把同一会话串起来。
+        </p>
+
+        <h2 id="local">本地实现：JSON 与 InMemory 的边界</h2>
+        <p>
+          <code>JsonFileAgentStateStore</code> 是 HarnessAgent 的默认状态存储，根目录默认在
+          <code>~/.agentscope/state</code>，按 <code>__anon__/&lt;session&gt;</code> 或 <code>&lt;user&gt;/&lt;session&gt;</code> 分目录；
+          它支持列表的 hash 增量 append，但不支持版本化
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:47-84">JsonFileAgentStateStore.java:47-84</span>。
+          <code>InMemoryAgentStateStore</code> 只用于测试，但它反而实现了版本化与 CAS
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/InMemoryAgentStateStore.java:61-95">InMemoryAgentStateStore.java:61-95</span>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>实现</th><th>版本化</th><th>持久化</th><th>适合</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>JsonFileAgentStateStore</td><td>否</td><td>本地文件</td><td>单机开发 / Harness 默认</td></tr>
+              <tr><td>InMemoryAgentStateStore</td><td>是</td><td>进程内</td><td>单元测试</td></tr>
+              <tr><td>RedisAgentStateStore</td><td>是</td><td>Redis</td><td>多副本低延迟</td></tr>
+              <tr><td>JdbcAgentStateStore</td><td>是</td><td>关系型库</td><td>已有 JDBC 基础设施</td></tr>
+              <tr><td>MongoAgentStateStore</td><td>是</td><td>MongoDB</td><td>文档型 / 大历史</td></tr>
+              <tr><td>OssAgentStateStore</td><td>否</td><td>OSS</td><td>低频写、大容量</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          远程文件系统不能配 JSON / InMemory 状态存储；Harness 会在启动时直接抛异常
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431-2438">HarnessAgent.java:2431-2438</span>。
+          这条规则把「本地能跑」和「多副本能跑」彻底分开。
+        </p>
+
+        <h2 id="compare">横向对比：版本、列表与清理</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>能力</th><th>Redis</th><th>JDBC</th><th>MongoDB</th><th>OSS</th><th>JSON</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>单值 CAS</td><td>有</td><td>有</td><td>有</td><td>无</td><td>无</td></tr>
+              <tr><td>列表增量</td><td>hash + List</td><td>item_index + hash</td><td>数组 + hash</td><td>list.json + hash</td><td>jsonl + hash</td></tr>
+              <tr><td>按会话删除</td><td>有</td><td>有</td><td>有</td><td>有</td><td>有</td></tr>
+              <tr><td>按 key 删除</td><td>默认 no-op</td><td>默认 no-op</td><td>有</td><td>有</td><td>有</td></tr>
+              <tr><td>自动 TTL</td><td>需 Redis 策略</td><td>需自建清理</td><td>可选 ttlDays</td><td>需 bucket 生命周期</td><td>需外部清理</td></tr>
+              <tr><td>多副本</td><td>适合</td><td>适合</td><td>适合</td><td>低频写</td><td>不适合</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          「按会话删除」和「按 key 删除」要分开看：前者是 <code>delete(userId, sessionId)</code>，多数后端都实现；
+          后者是 <code>delete(userId, sessionId, key)</code>，接口默认是 no-op，只有部分后端覆盖
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:193-210">AgentStateStore.java:193-210</span>。
+        </p>
+
+        <h2 id="recipe">多副本配方：共享存储 + 轮次闸门 + 明确冲突策略</h2>
+        <p>
+          把第 30 章和前文的结论合成一条可执行链路：
+        </p>
+        <ol class="steps">
+          <li>
+            <span class="sh">选版本化状态存储</span>
+            <div>Redis / JDBC / MongoDB 三选一；OSS 只用于低频写，JSON 只用于单机。</div>
+          </li>
+          <li>
+            <span class="sh">接 RemoteFilesystemSpec</span>
+            <div>文件走 <code>BaseStore</code>，状态走 <code>AgentStateStore</code>；两者来自同一个 <code>DistributedStore</code> 最省心。</div>
+          </li>
+          <li>
+            <span class="sh">开分布式 SessionTurnGate</span>
+            <div>用控制面托管 gate 或自己实现按会话互斥；没有 gate 时本地 gate 只在一个进程内有效。</div>
+          </li>
+          <li>
+            <span class="sh">把 conflictPolicy 设为 FAIL</span>
+            <div>让并发写显式失败，而不是 OVERWRITE 静默覆盖；调用方要能处理 <code>ConcurrentSessionModificationException</code>。</div>
+          </li>
+          <li>
+            <span class="sh">确认 TTL 与备份</span>
+            <div>Mongo 要显式 ttlDays，OSS 要配生命周期，Redis / JDBC 要自建清理；备份要覆盖状态存储本身。</div>
+          </li>
+        </ol>
+        <pre data-lang="java" data-file="多副本组合（示意）">HarnessAgent agent = HarnessAgent.builder()
+    .name("assistant")
+    .model("dashscope:qwen-plus")
+    .distributedStore(store)
+    .conflictPolicy(ConflictPolicy.FAIL)
+    .filesystem(new RemoteFilesystemSpec().isolationScope(IsolationScope.USER))
+    .build();</pre>
+
+        <h2 id="failure">故障边界：先分清「找不到」「写冲突」「写不进去」</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>症状</th><th>更可能的原因</th><th>先查什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>换用户 / 会话后历史没了</td><td>userId 或 sessionId 传错，落到另一个槽位</td><td>槽位拼接规则与 <code>RuntimeContext</code></td></tr>
+              <tr><td>同一会话偶尔回退到旧状态</td><td>后端不支持版本化，或用了 OVERWRITE</td><td><code>supportsVersioning()</code> 与冲突策略</td></tr>
+              <tr><td>抛 <code>ConcurrentSessionModificationException</code></td><td>两轮并发写同一会话</td><td>SessionTurnGate 是否生效、expectedVersion</td></tr>
+              <tr><td>压缩轮之后历史被重复</td><td>APPEND_MERGE 被用在 compaction / summary 轮</td><td>冲突策略与轮次类型</td></tr>
+              <tr><td>按 key 删除没反应</td><td>后端没覆盖默认 no-op</td><td>该后端的 delete(key) 实现</td></tr>
+              <tr><td>Mongo 写入报 key 非法</td><td>state key 含点、美元符号或 Unicode</td><td><code>^[a-zA-Z_][a-zA-Z0-9_]*$</code></td></tr>
+              <tr><td>OSS 高并发下状态互相覆盖</td><td>OSS 没有版本化</td><td>换 Redis / JDBC / Mongo，或加 gate</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cheatsheet">速查：默认值与关键常量</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>项</th><th>值 / 规则</th><th>出处</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>主状态 key</td><td><code>agent_state</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:432-433">ReActAgent.java:432-433</span></td></tr>
+              <tr><td>未版本化哨兵</td><td><code>UNVERSIONED = -1</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:63-67">AgentStateStore.java:63-67</span></td></tr>
+              <tr><td>新会话版本</td><td>版本化后端从 <code>0</code> 开始，create-if-absent</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:444-445">ReActAgent.java:444-445</span></td></tr>
+              <tr><td>默认冲突策略</td><td><code>OVERWRITE</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:347-348">ReActAgent.java:347-348</span></td></tr>
+              <tr><td>Redis 默认前缀</td><td><code>agentscope:session:</code></td><td><span class="src" data-src="docs/v2/zh/integration/session/redis.md:151">redis.md:151</span></td></tr>
+              <tr><td>JSON 默认根目录</td><td><code>~/.agentscope/state</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:84">JsonFileAgentStateStore.java:84</span></td></tr>
+              <tr><td>Mongo state key 正则</td><td><code>^[a-zA-Z_][a-zA-Z0-9_]*$</code></td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:582-592">MongoAgentStateStore.java:582-592</span></td></tr>
+              <tr><td>Mongo TTL 默认</td><td><code>null</code>（不过期）</td><td><span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mongodb/src/main/java/io/agentscope/extensions/mongodb/state/MongoAgentStateStore.java:688-703">MongoAgentStateStore.java:688-703</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="pitfalls">六个坑：状态存储不是「把 JSON 丢进去」</h2>
+        <p>
+          <strong>坑一：只存消息。</strong><code>AgentState</code> 还带摘要、权限、工具组、任务与 Plan；
+          只存 <code>messages</code>，恢复后工具与权限状态会丢
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentState.java:59-69">AgentState.java:59-69</span>。
+        </p>
+        <p>
+          <strong>坑二：以为所有后端都有 CAS。</strong>JSON 与 OSS 默认不版本化；<code>saveIfVersion</code> 会退化成无条件写
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:81-138">AgentStateStore.java:81-138</span>。
+        </p>
+        <p>
+          <strong>坑三：对压缩轮用 APPEND_MERGE。</strong>它只追加本轮新消息，压缩 / 摘要轮会重写历史，合并会破坏语义
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/ConflictPolicy.java:41-44">ConflictPolicy.java:41-44</span>。
+        </p>
+        <p>
+          <strong>坑四：假设 delete(key) 一定生效。</strong>接口默认是 no-op；按 key 清理前先确认后端实现
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:201-210">AgentStateStore.java:201-210</span>。
+        </p>
+        <p>
+          <strong>坑五：RemoteFilesystemSpec 配 JSON 状态。</strong>Harness 会直接拒绝；多副本必须用远端状态存储
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2431-2438">HarnessAgent.java:2431-2438</span>。
+        </p>
+        <p>
+          <strong>坑六：按旧文档的 MySQL 列名写查询。</strong>源码是 <code>session_id / state_key / item_index / state_data</code>，
+          不是 <code>user_id / state_value / state_type</code>
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-mysql/src/main/java/io/agentscope/extensions/mysql/state/MysqlAgentStateStore.java:42-56">MysqlAgentStateStore.java:42-56</span>。
+        </p>
+
+        <h2 id="quiz">自测：三个判断题</h2>
+        <details>
+          <summary>列表状态的保存也有 <code>saveIfVersion</code> 吗？</summary>
+          <p>
+            没有。版本化方法只覆盖单值；列表保存是 <code>save(List)</code>，靠 hash 判断增量 append 还是整体重写，
+            不受单值 CAS 保护
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:140-181">AgentStateStore.java:140-181</span>。
+          </p>
+        </details>
+        <details>
+          <summary><code>conflictPolicy</code> 默认是 FAIL 吗？</summary>
+          <p>
+            不是。默认是 <code>OVERWRITE</code>，保留旧的 last-writer-wins；官方建议在启用分布式 SessionTurnGate 时改成
+            <code>FAIL</code>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:347-348">ReActAgent.java:347-348</span>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/ConflictPolicy.java:26-31">ConflictPolicy.java:26-31</span>。
+          </p>
+        </details>
+        <details>
+          <summary>JSON 文件存储支持 CAS 吗？</summary>
+          <p>
+            不支持。它没有覆盖默认的 <code>supportsVersioning()</code>，仍是 last-writer-wins；需要 CAS 时换 InMemory、Redis、JDBC 或 Mongo
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:81-89">AgentStateStore.java:81-89</span>
+            <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:45-69">JsonFileAgentStateStore.java:45-69</span>。
+          </p>
+        </details>
+
+        <h2 id="exercise">练习：看清一次状态写入</h2>
+        <p>目标不是「换一个 store」，而是能追踪一个 <code>agent_state</code> 从加载到写回的全过程。建议 50 分钟：</p>
+        <ol class="steps">
+          <li>
+            <span class="sh">先看 JSON 形态</span>
+            <div>用 JsonFileAgentStateStore 跑一轮，打开 <code>agent_state.json</code>，对照字段表确认 summary / context / tool_context。</div>
+          </li>
+          <li>
+            <span class="sh">换 Redis</span>
+            <div>切到 RedisAgentStateStore，跑同一轮，找到 <code>agentscope:session:&lt;user&gt;/&lt;session&gt;:agent_state</code> 与 <code>_keys</code>。</div>
+          </li>
+          <li>
+            <span class="sh">观察版本</span>
+            <div>连续跑两轮，记录 <code>agent_state</code> 的版本变化；确认第二轮拿着第一轮的版本做 CAS。</div>
+          </li>
+          <li>
+            <span class="sh">制造冲突</span>
+            <div>两个线程同时写同一 session，先用 OVERWRITE，再用 FAIL，记录日志与异常文本。</div>
+          </li>
+          <li>
+            <span class="sh">试 APPEND_MERGE</span>
+            <div>普通聊天轮用 APPEND_MERGE，确认新消息被追加；再想一遍压缩轮为什么不能用。</div>
+          </li>
+          <li>
+            <span class="sh">测删除</span>
+            <div>对 Redis 调 <code>delete(user, session, key)</code>，再对 Mongo 调一次，比较是否真的删除。</div>
+          </li>
+          <li>
+            <span class="sh">测会话列表</span>
+            <div>分别用 <code>listSessionIds(null)</code> 与具体 userId，确认匿名与具名会话不会混在一起。</div>
+          </li>
+          <li>
+            <span class="sh">写三行结论</span>
+            <div>分别写「槽位怎么拼」「版本怎么变」「冲突怎么处理」，确保每行都能在存储里找到证据。</div>
+          </li>
+        </ol>
+
+        <h2 id="next">下一章看什么</h2>
+        <p>
+          状态存储讲完，下一章进入 RAG：<code>Knowledge</code> 接口、五种知识库实现，以及这条接口同样从 2.0.0 起被标记弃用后，
+          检索应该放在 Agent 内部还是应用层。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="30-distributed-store.html">30 分布式存储</a></td><td>组件选择、混合后端与托管 Store</td></tr>
+              <tr><td><a href="29-memory-integration.html">29 记忆接入</a></td><td>语义记忆与会话状态的分界</td></tr>
+              <tr><td>第 32 章 · RAG</td><td><code>Knowledge</code> 的五种实现与弃用边界</td></tr>
+              <tr><td>官方「分布式存储」</td><td>状态、文件、快照、锁的能力矩阵<span class="src" data-src="docs/v2/zh/integration/distributed/index.md:6-108">index.md:6-108</span></td></tr>
+              <tr><td><a href="../appendix/errata.html">附录 E · 勘误汇总</a></td><td>MySQL 表结构、Mongo TTL 这类差异的核对方式</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本章引用的会话状态文档部分已迁移到分布式存储页；凡文档与源码有出入的地方，正文以源码为准，
+          版本、表结构、默认值与冲突策略都标了具体出处。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>
