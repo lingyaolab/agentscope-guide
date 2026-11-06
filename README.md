@@ -14,7 +14,7 @@ agentscope-java-learn/     站点本体（发布时把这个目录作为站点�
 ├── index.html             首页（学习进度、章节入口、更新记录）
 ├── 404.html               站内 404（自包含样式，任意深度可用）
 ├── robots.txt
-├── chapters/              第 00–36 章 + 36A（含 5 个深挖子页）
+├── chapters/              第 00–36 章 + 00A 信息流实验室 + 36A（含 5 个深挖子页）
 ├── appendix/              附录 A–F
 └── assets/                base.css / site.js / nav.js / search-index.js / favicon.svg
 

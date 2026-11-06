@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="00A 信息流实验室：用可播放的分步演示看清 AgentScope Java 2.0.4 里一条消息从用户输入、ReAct 循环、Formatter、模型、权限、工具、状态到事件流的每一步输入输出，并扩展到 Harness 与 Nacos / Higress / Studio / Training 等外围设施。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="00A 信息流实验室：一条消息怎么走完 Agent · AgentScope Java 2.0.4 学习站" />
+    <meta
+      property="og:description"
+      content="00A 信息流实验室：用可播放的分步演示看清 AgentScope Java 2.0.4 里一条消息从用户输入、ReAct 循环、Formatter、模型、权限、工具、状态到事件流的每一步输入输出，并扩展到 Harness 与 Nacos / Higress / Studio / Training 等外围设施。"
+    />
+    <title>00A 信息流实验室：一条消息怎么走完 Agent · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+    <link rel="stylesheet" href="../assets/flow-demo.css" />
+  </head>
+  <body data-page="00a-agent-flow" data-root="..">
+    <main>
+      <article class="article">
+        <h1>00A · 信息流实验室：一条消息怎么走完 Agent</h1>
+        <p class="lede">
+          读代码时最容易断片的地方，是「这一步的输出到底交给了谁」。这一页把 AgentScope 的一次调用拆成可播放的节点：
+          从一条 <code>Msg</code> 进入，到模型、工具、状态、事件，再到 Harness 与外围设施。
+          三档场景从最小 ReAct 到全依赖，可以逐步看，也可以自动播放。
+        </p>
+
+        <h2 id="goals">这一页怎么用</h2>
+        <ul class="goals">
+          <li>用「最小」场景看清一次 ReAct 调用的 9 个节点，以及每个节点吐出什么</li>
+          <li>用「工程化」场景看 Harness 在工作区、中间件、沙箱、子 Agent、状态上加了哪几层</li>
+          <li>用「全依赖」场景看 Nacos、Higress、Studio、Training 等外围设施接在哪个位置</li>
+          <li>用「上一步 / 下一步 / 播放」把信息流走一遍，而不是只看一张静态图</li>
+          <li>知道每一步应该看哪一章、哪个源码入口</li>
+        </ul>
+
+        <h2 id="demo">信息流实验室</h2>
+        <div class="fd" id="fd">
+          <div class="fd-toolbar">
+            <div class="fd-modes" role="group" aria-label="选择演示场景">
+              <button type="button" class="fd-mode" data-scenario="minimal" aria-pressed="true">最小</button>
+              <button type="button" class="fd-mode" data-scenario="harness" aria-pressed="false">工程化</button>
+              <button type="button" class="fd-mode" data-scenario="full" aria-pressed="false">全依赖</button>
+            </div>
+            <div class="fd-controls">
+              <button type="button" id="fd-prev">← 上一步</button>
+              <button type="button" id="fd-play" aria-pressed="false">▶ 播放</button>
+              <button type="button" id="fd-next">下一步 →</button>
+              <button type="button" id="fd-reset">重置</button>
+            </div>
+          </div>
+
+          <p class="fd-blurb" id="fd-blurb"></p>
+
+          <div class="fd-rail" id="fd-rail" aria-label="信息流节点"></div>
+
+          <div class="fd-panel" aria-live="polite">
+            <div class="fd-step" id="fd-step"></div>
+            <h3 class="fd-title" id="fd-title"></h3>
+            <dl class="fd-detail">
+              <dt>输入</dt><dd id="fd-input"></dd>
+              <dt>输出</dt><dd id="fd-output"></dd>
+              <dt>交给谁</dt><dd id="fd-next-node"></dd>
+            </dl>
+            <p class="fd-link" id="fd-link"></p>
+          </div>
+        </div>
+        <p class="footnote">
+          提示：节点条可以横向滚动；播放会每 1.4 秒前进一格，到末尾自动停止。
+          在 <code>prefers-reduced-motion</code> 下，高亮仍会切换，但不会平滑滚动。
+        </p>
+
+        <h2 id="minimal">最小链路：一次 ReAct 调用</h2>
+        <p>
+          最小场景只有一个 <code>ReActAgent</code>：消息进来，拼上下文，模型决定「说话还是调工具」，工具结果回填后再让模型收尾。
+          这条链路里没有 Workspace、没有沙箱、没有子 Agent，也没有 Gateway。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>节点</th><th>它做什么</th><th>输出给谁</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>Msg</code></td><td>用户输入的统一消息结构</td><td>ReActAgent.call</td></tr>
+              <tr><td>ReActAgent</td><td>拼历史、system prompt 与工具 schema</td><td>Middleware / Formatter</td></tr>
+              <tr><td>Formatter</td><td>把 Msg 翻译成厂商需要的 JSON</td><td>Model</td></tr>
+              <tr><td>PermissionEngine</td><td>决定工具调用是放行、询问还是拒绝</td><td>ToolExecutor / HITL</td></tr>
+              <tr><td>ToolExecutor</td><td>执行工具，产出 <code>ToolResultBlock</code></td><td>下一轮 Model</td></tr>
+              <tr><td>AgentStateStore</td><td>保存本轮状态；事件流同时对外发出</td><td>调用方 / 下一个请求</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="harness">工程化：Harness 加了什么</h2>
+        <p>
+          <code>HarnessAgent</code> 不重写 ReAct 循环，而是在它外面加壳：工作区投影、中间件链、文件系统 / 沙箱、子 Agent、
+          状态落盘与消息总线。信息流还是同一条，只是每一段前后多了「谁在读、谁在写」。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>新增层</th><th>插在哪</th><th>它改变什么</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>RuntimeContext</td><td>进入 Agent 之前</td><td>userId / sessionId / 会话状态与请求级上下文</td></tr>
+              <tr><td>Workspace 投影</td><td>system prompt 之前</td><td>把 AGENTS.md、技能、文件说明投进上下文</td></tr>
+              <tr><td>Middleware 链</td><td>模型与工具前后</td><td>压缩、技能、计划模式、权限、动态工具面</td></tr>
+              <tr><td>Sandbox / Filesystem</td><td>工具执行时</td><td>把文件与命令关进隔离环境</td></tr>
+              <tr><td>Subagent / Team</td><td>工具调用内</td><td>把一部分工作委派给另一个 Agent</td></tr>
+              <tr><td>Gateway / MessageBus</td><td>Agent 之外</td><td>入站路由、会话排队、后台结果唤醒</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="full">全依赖：外围设施也接上</h2>
+        <p>
+          全依赖场景把「请求从哪来、工具从哪出、谁触发、谁观测、谁训练」都接上。
+          注意它们不是都塞进 ReAct 循环：Nacos 在配置 / 注册层，Higress 在工具层，Scheduler 在触发层，
+          Studio 与 Training 在旁路。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>外围设施</th><th>接在哪</th><th>对信息流的影响</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Channel / Chat Completions / Endpoint</td><td>入站</td><td>把平台事件或 OpenAI 请求转成 Msg</td></tr>
+              <tr><td>Gateway</td><td>入站之后</td><td>选 Agent、定会话、给同一会话排队</td></tr>
+              <tr><td>Nacos</td><td>启动 / 配置</td><td>Prompt、Skill、A2A 注册发现</td></tr>
+              <tr><td>Higress</td><td>工具面</td><td>MCP 工具与工具搜索</td></tr>
+              <tr><td>Studio</td><td>旁路</td><td>最终消息、trace、HITL</td></tr>
+              <tr><td>Training</td><td>旁路</td><td>采样后跑影子 Agent，再 feedback / commit</td></tr>
+              <tr><td>Scheduler</td><td>触发</td><td>没有人类消息，也能按时间造一次调用</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="truth">每一步的输出从哪来</h2>
+        <p>
+          这张实验室不是另写一套流程，而是把前面章节里的调用链压缩成节点。入口与契约可以按下面几处回查：
+        </p>
+        <ul class="goals">
+          <li><code>ReActAgent</code> 的主循环与 builder：<span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:218">ReActAgent.java:218</span></li>
+          <li><code>HarnessAgent</code> 的外壳与默认装配：<span class="src" data-src="agentscope-java-2.0.4/agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:169">HarnessAgent.java:169</span></li>
+          <li><code>AgentStateStore</code> 的状态契约：<span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/AgentStateStore.java:22-38">AgentStateStore.java:22-38</span></li>
+          <li><code>RuntimeContext</code> 的请求级上下文：<span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/agent/RuntimeContext.java:20">RuntimeContext.java:20</span></li>
+          <li>外围设施的入口：<a href="36a-integration-playbooks.html">36A 集成落地手册</a> 与 <a href="../appendix/artifacts.html">附录 F</a></li>
+        </ul>
+
+        <h2 id="next">继续读什么</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>接着看什么</th><th>为什么是它</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><a href="02-first-agent.html">02 第一个 Agent</a></td><td>最小链路真正跑起来</td></tr>
+              <tr><td><a href="04-message-and-event.html">04 消息与事件</a></td><td>每个节点为什么吐 Msg / Event</td></tr>
+              <tr><td><a href="06-tool.html">06 工具系统</a></td><td>ToolUseBlock 到 ToolResultBlock</td></tr>
+              <tr><td><a href="09-middleware-hook.html">09 Middleware 与 Hook</a></td><td>在哪一步能改写信息流</td></tr>
+              <tr><td><a href="10-react-vs-harness.html">10 ReAct 与 Harness</a></td><td>从最小到工程化到底多了什么</td></tr>
+              <tr><td><a href="36a-integration-playbooks.html">36A 集成落地手册</a></td><td>外围设施真正接起来</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">
+          本页是可交互的阅读辅助，不替代章节里的默认值、源码行号与排障细节；
+          每条链路的具体默认值仍以对应章节和 <code>2.0.4</code> 源码为准。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+    <script src="../assets/flow-demo.js"></script>
+  </body>
+</html>

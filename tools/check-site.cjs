@@ -570,6 +570,28 @@ async function browserChecks() {
     );
     check("browser", "代码高亮不破坏 XML 标签", hl === "ok", hl);
 
+    await send(
+      "Page.navigate",
+      { url: pathToFileURL(path.join(SITE, "chapters", "00a-agent-flow.html")).href },
+      sessionId
+    );
+    await sleep(250);
+    const flow = await ev(
+      `(function(){var step=document.getElementById('fd-step');if(!step)return 'no-demo';
+        var before=step.textContent;
+        document.querySelector('[data-scenario="full"]').click();
+        var after=step.textContent;
+        var nodes=document.querySelectorAll('.fd-node').length;
+        document.getElementById('fd-next').click();
+        return [before,after,nodes,step.textContent].join('|');})()`
+    );
+    check(
+      "browser",
+      "信息流实验室可切换场景与步进",
+      /^第 1 \/ 9 步\|第 1 \/ 13 步\|13\|第 2 \/ 13 步$/.test(String(flow)),
+      flow
+    );
+
     await send("Page.navigate", { url: pathToFileURL(p02).href }, sessionId);
     await sleep(250);
 

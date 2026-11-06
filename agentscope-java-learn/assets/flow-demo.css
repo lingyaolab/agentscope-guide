@@ -1,0 +1,231 @@
+/* 00A 信息流实验室：零依赖、可播放的节点条 */
+.fd {
+  margin: 18px 0 10px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--bg-panel);
+}
+
+.fd-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.fd-modes,
+.fd-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.fd-modes {
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg);
+}
+
+.fd-mode,
+.fd-controls button {
+  border: 1px solid transparent;
+  background: none;
+  color: var(--fg-soft);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1;
+  padding: 7px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.fd-mode:hover,
+.fd-controls button:hover {
+  color: var(--brand);
+  border-color: var(--line);
+}
+
+.fd-mode[aria-pressed="true"] {
+  background: var(--brand-soft);
+  color: var(--brand);
+  font-weight: 600;
+}
+
+.fd-controls button {
+  border-color: var(--line);
+  background: var(--bg);
+}
+
+.fd-controls button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.fd-blurb {
+  margin: 12px 0 10px;
+  color: var(--fg-soft);
+  font-size: 13.5px;
+}
+
+.fd-rail {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  overflow-x: auto;
+  padding: 8px 2px 14px;
+  scroll-snap-type: x proximity;
+}
+
+.fd-node {
+  flex: 0 0 132px;
+  min-height: 78px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  scroll-snap-align: center;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.fd-node:hover {
+  border-color: var(--brand);
+}
+
+.fd-node.done {
+  opacity: 0.72;
+}
+
+.fd-node.active {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 14%, transparent);
+}
+
+.fd-node .fd-idx {
+  display: block;
+  color: var(--fg-faint);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  margin-bottom: 5px;
+}
+
+.fd-node .fd-name {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.fd-node .fd-out {
+  display: block;
+  margin-top: 5px;
+  color: var(--fg-soft);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.fd-arrow {
+  flex: 0 0 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-faint);
+  font-size: 13px;
+}
+
+.fd-panel {
+  margin-top: 4px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.fd-step {
+  color: var(--fg-faint);
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.fd-title {
+  margin: 4px 0 10px;
+  font-size: calc(18px * var(--read-scale));
+}
+
+.fd-detail {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  gap: 7px 12px;
+  margin: 0;
+  font-size: 13.5px;
+}
+
+.fd-detail dt {
+  color: var(--fg-faint);
+  font-size: 12px;
+  padding-top: 2px;
+}
+
+.fd-detail dd {
+  margin: 0;
+  color: var(--fg-soft);
+}
+
+.fd-detail code {
+  font-size: 12.5px;
+}
+
+.fd-link {
+  margin: 12px 0 0;
+  font-size: 12.5px;
+}
+
+.fd-link a {
+  color: var(--brand);
+}
+
+@media (max-width: 700px) {
+  .fd {
+    padding: 12px;
+  }
+  .fd-toolbar {
+    align-items: flex-start;
+  }
+  .fd-controls {
+    width: 100%;
+  }
+  .fd-controls button {
+    flex: 1 1 auto;
+  }
+  .fd-rail {
+    flex-direction: column;
+    overflow-x: visible;
+    padding: 4px 0 10px;
+  }
+  .fd-node {
+    flex: 0 0 auto;
+    width: 100%;
+    min-height: 0;
+  }
+  .fd-arrow {
+    flex: 0 0 16px;
+    transform: rotate(90deg);
+  }
+  .fd-detail {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fd-node {
+    transition: none;
+  }
+}
