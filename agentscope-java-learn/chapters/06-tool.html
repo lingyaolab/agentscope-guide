@@ -142,7 +142,7 @@ System.out.println(reply.getTextContent());</pre>
               <tr><td><code>externalTool</code></td><td><code>false</code></td><td>执行交给框架之外（人工/外部系统）。框架只发 <code>TOOL_SUSPENDED</code>，不跑方法体。</td></tr>
               <tr><td><code>stateInjected</code></td><td><code>false</code></td><td>为 <code>true</code> 时必须有一个 <code>AgentState</code> 参数，否则<strong>注册时就抛异常</strong>。</td></tr>
               <tr><td><code>returnDirect</code></td><td><code>false</code></td><td>结果直接当本轮最终回答，跳过下一轮模型调用。批次里要<strong>全部</strong>工具都为 true 且全部成功才生效。</td></tr>
-              <tr><td><code>dangerousFiles</code></td><td><code>{}</code></td><td>追加敏感文件名，命中后权限系统会要求确认。</td></tr>
+              <tr><td><code>dangerousFiles</code></td><td><code>{}</code></td><td>追加敏感文件名；默认<strong>不会</strong>自动触发权限确认，继承 <code>ToolBase</code> 并在 <code>checkPermissions</code> 里调 <code>isDangerousPath(...)</code> 才生效。</td></tr>
               <tr><td><code>dangerousDirectories</code></td><td><code>{}</code></td><td>追加敏感目录名，按路径段匹配。</td></tr>
               <tr><td><code>converter</code></td><td><code>DefaultToolResultConverter</code></td><td>自定义返回值到 <code>ToolResultBlock</code> 的转换器，适合脱敏、截断、改格式。</td></tr>
             </tbody>

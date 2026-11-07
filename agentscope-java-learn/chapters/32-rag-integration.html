@@ -173,9 +173,10 @@ knowledge.addDocuments(new TikaReader().read(input).block()).block();</pre>
         <p>
           写入时它逐条文档生成 embedding，再批量写入向量库
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-simple/src/main/java/io/agentscope/core/rag/knowledge/SimpleKnowledge.java:97-132">SimpleKnowledge.java:97-132</span>。
-          检索时它把 <code>scoreThreshold</code> 先置空交给向量库，再在 Java 侧按阈值过滤、按分数倒序，最后应用 limit
+          检索时它把 <code>scoreThreshold</code> 先置空交给向量库，并在查询阶段就应用 <code>limit</code>；
+          之后在 Java 侧按阈值过滤、按分数倒序，不会在过滤后补足条数
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-simple/src/main/java/io/agentscope/core/rag/knowledge/SimpleKnowledge.java:135-173">SimpleKnowledge.java:135-173</span>。
-          这也解释了为什么阈值改变会直接影响返回条数，而不是「让向量库少查一点」。
+          这也解释了为什么阈值升高后返回条数可能小于 <code>limit</code>：向量库先按 limit 查，过滤只减不增。
         </p>
 
         <h2 id="bailian">百炼：托管索引，Java 只检索</h2>
@@ -250,7 +251,7 @@ HayStackKnowledge knowledge = HayStackKnowledge.builder().config(config).build()
         <h2 id="ragflow">RAGFlow：复杂文档解析与可配置重排</h2>
         <p>
           RAGFlow 适合扫描件、复杂排版 PDF、含图片表格比例高的知识库。它调用
-          <code>POST /api/v1/datasets/{dataset_id}/retrieve-chunks</code>，支持向量相似度、topK、服务端相似度阈值、
+          <code>POST /api/v1/retrieval</code>（请求体带 <code>dataset_ids</code>），支持向量相似度、topK、服务端相似度阈值、
           metadata 过滤与可选 rerank
           <span class="src" data-src="docs/v2/zh/integration/rag/ragflow.md:6-58">ragflow.md:6-58</span>。
           配置自身默认 topK 是 1024、相似度阈值 0.2、向量权重 0.3、分页 30、超时 30 秒
@@ -259,14 +260,14 @@ HayStackKnowledge knowledge = HayStackKnowledge.builder().config(config).build()
         <pre data-lang="java" data-file="RAGFlow 知识库（示意）">RAGFlowConfig config = RAGFlowConfig.builder()
     .apiKey("ragflow-xxxxxxxx")
     .baseUrl("http://localhost:9380")
-    .knowledgeBaseId("kb-xxxxx")
+    .addDatasetId("kb-xxxxx")
     .topK(10)
     .similarityThreshold(0.5)
     .build();</pre>
         <p>
           <code>addDocuments</code> 同样不可用；文档上传与索引走 RAGFlow 控制台或它自己的 API
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-rag/agentscope-extensions-rag-ragflow/src/main/java/io/agentscope/core/rag/integration/ragflow/RAGFlowKnowledge.java:182-184">RAGFlowKnowledge.java:182-184</span>。
-          RAGFlow 的 retrieve-chunks 接口不支持把对话历史传过去做上下文感知检索；需要时只能自己在 query 前拼指令
+          RAGFlow 的 retrieval 接口不支持把对话历史传过去做上下文感知检索；需要时只能自己在 query 前拼指令
           <span class="src" data-src="docs/v2/zh/integration/rag/ragflow.md:58">ragflow.md:58</span>。
         </p>
 

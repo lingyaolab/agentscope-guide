@@ -289,13 +289,13 @@ public Flux&lt;AgentEvent&gt; onReasoning(
           事件类型清单（31 个）：<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/event/AgentEvent.java:36">AgentEvent.java:36</span>
         </p>
 
-        <h3 id="on-system-prompt">4. onSystemPrompt 是管道：按注册顺序接力，order() 管不着</h3>
+        <h3 id="on-system-prompt">4. onSystemPrompt 是管道：按 order 降序接力</h3>
         <p>
-          它不是洋葱，没有 <code>next</code>。框架把上一个中间件的输出喂给下一个，按<strong>注册顺序</strong>串行执行。
-          <code>order()</code> 对这条管道无效——排序只作用于那四个洋葱 hook。
+          它不是洋葱，没有 <code>next</code>。框架把上一个中间件的输出喂给下一个，按 <code>order()</code> 降序串行执行
+          （相同 order 才退回注册顺序）。排序作用于同一份 <code>middlewares</code> 列表，四个洋葱 hook 与这条管道共用。
         </p>
         <pre data-lang="java" data-file="applySystemPromptMiddlewares.java">Mono&lt;String&gt; result = Mono.just(prompt);
-for (MiddlewareBase mw : middlewares) {          // 列表顺序，不是 order 顺序
+for (MiddlewareBase mw : middlewares) {          // 已按 order 降序排序的列表
     result = result.flatMap(p -&gt; mw.onSystemPrompt(this, ctx, p));
 }
 return result;</pre>
@@ -786,9 +786,9 @@ public class StopOnAllDeniedMiddleware implements MiddlewareBase {
           <div class="pf-h">3. 以为 <code>onSystemPrompt</code> 每轮都跑</div>
           <dl>
             <dt>你会看到</dt>
-            <dd>把「当前时间」「本轮任务」写进 <code>onSystemPrompt</code>，结果整轮对话里时间一直不变；或者调了 <code>order(10)</code> 想让它最后执行，没反应。</dd>
+            <dd>把「当前时间」「本轮任务」写进 <code>onSystemPrompt</code>，结果整轮对话里时间一直不变。</dd>
             <dt>因为</dt>
-            <dd>它在 <code>PreCall</code> 阶段由 <code>seedSystemMsg()</code> 调一次，<strong>每次 call 只跑一次</strong>；管道按注册顺序执行，<code>order()</code> 不参与。</dd>
+            <dd>它在 <code>PreCall</code> 阶段由 <code>seedSystemMsg()</code> 调一次，<strong>每次 call 只跑一次</strong>；管道按 <code>order()</code> 降序执行（同序才按注册顺序）。</dd>
             <dt>改成</dt>
             <dd>要「每轮变」的内容放 <code>onReasoning</code>，往 messages 里补一条临时消息；<code>onSystemPrompt</code> 只放整次 call 不变的东西。</dd>
           </dl>

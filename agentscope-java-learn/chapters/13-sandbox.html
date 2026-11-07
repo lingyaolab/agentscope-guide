@@ -144,12 +144,13 @@ agent.streamEvents(
             </div>
           </li>
           <li>
-            <span class="sh">alice 的第二次 call 还在同一个容器里</span>
+            <span class="sh">alice 的第二次 call 会新建容器，不是复用同一个</span>
             <div>
-              示例紧接着问「<code>/workspace/hello.txt</code> 还在吗」，期望答 yes<span class="src" data-src="agentscope-examples/documentation/src/main/java/io/agentscope/examples/documentation2/harness/workspace/WorkspaceSandboxExample.java:130">:130</span>。
-              靠的不是快照，而是 <code>USER</code> 键 <code>alice</code> 在状态后端里查到了上一次的
-              <code>SandboxState</code>（里面记着 containerId），于是走 Priority 3 的
-              <code>resume</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/sandbox/SandboxManager.java:102-120">SandboxManager.java:102-120</span>。
+              示例紧接着问「<code>/workspace/hello.txt</code> 还在吗」。call 1 结束时 <code>SandboxManager</code> 已
+              <code>stop()</code> / <code>shutdown()</code>，<code>DockerSandbox</code> 会强制删除容器；状态后端里的
+              <code>containerId</code> 只能让下一次尝试 resume，失败后仍会新建容器。默认 <code>DockerFilesystemSpec</code>
+              用的是 <code>NoopSnapshotSpec</code>，所以 <code>/workspace</code> 不会保留文件，期望答案应是 no；
+              要跨 call 保留，必须配置 <code>snapshotSpec(...)</code> 或使用 <code>externalSandbox</code>。
             </div>
           </li>
           <li>
@@ -670,8 +671,9 @@ agent.streamEvents(
           </table>
         </div>
         <p>
-          「沙箱中间件第一个装」这件事有实际后果：任何想读工作区文件的中间件（工作区上下文、转写、压缩）都在容器已经起来之后才跑，所以它们能直接用
-          <code>read_file</code> 背后那套抽象；反过来，你在更前面插自己的中间件是插不进去的——<code>build()</code> 里没有比它更早的安装点。
+          「沙箱中间件第一个装」只对 <code>build()</code> 内部安装点成立：用户通过 <code>.middleware(...)</code> 注册的中间件会更早装进去，
+          因此拿不到 per-call 的沙箱绑定；工作区上下文、转写、压缩这些内部中间件则排在沙箱之后，可以直接用
+          <code>read_file</code> 背后那套抽象。
         </p>
 
         <h2 id="doc-gap">官方说了什么 vs 源码实际是什么</h2>

@@ -123,7 +123,7 @@
         </p>
         <p>
           进程被强制 kill 时，最后一次 commit 不会发生；对训练数据完整性要求高时，优雅停机比刷日志更重要。
-          也可以显式调 <code>runner.commit()</code> 做手动提交。
+          也可以显式调 <code>runner.commit().block()</code> 做手动提交（<code>commit()</code> 返回惰性的 <code>Mono</code>）。
         </p>
 
         <h2 id="verify">验收：只训练该训练的样本</h2>
@@ -146,7 +146,7 @@
               <tr><td>有样本没奖励</td><td>RewardCalculator 抛错 / 返回常数</td><td>看日志与实现</td></tr>
               <tr><td>一直不 commit</td><td>interval &lt;= 0 / 线程被阻塞</td><td>检查配置与 commit 日志</td></tr>
               <tr><td>影子拖慢生产</td><td>误以为同步执行</td><td>它应异步；检查线程池与阻塞点</td></tr>
-              <tr><td>训练递归</td><td>影子 Agent 名不含 <code>-shadow</code></td><td>保留命名约定</td></tr>
+              <tr><td>训练递归</td><td>自定义 cloner 或手工改写影子 Agent 名，未保留 <code>-shadow</code></td><td>使用默认 cloner，或确保名字含 <code>-shadow</code></td></tr>
             </tbody>
           </table>
         </div>

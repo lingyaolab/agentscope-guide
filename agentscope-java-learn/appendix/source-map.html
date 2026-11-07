@@ -94,7 +94,7 @@
               <tr><td><code>core</code>（根）</td><td>2</td><td>模块的公开入口与版本号</td><td><code>ReActAgent</code>；还有一个 <code>Version</code></td></tr>
               <tr><td><code>agent</code></td><td>27</td><td>Agent 契约、基类生命周期、运行时上下文、运行控制</td><td><code>Agent</code> / <code>AgentBase</code> / <code>RuntimeContext</code></td></tr>
               <tr><td><code>middleware</code></td><td>8</td><td>中间件契约：四类 Input + 链式执行 + 两个内置实现</td><td><code>MiddlewareBase</code>（一个类包住四个切点）</td></tr>
-              <tr><td><code>hook</code></td><td>20</td><td>旧版切点回调：20 个 <code>HookEvent</code> 与分发器</td><td><code>Hook</code> / <code>HookEventType</code>；新代码优先用 middleware</td></tr>
+              <tr><td><code>hook</code></td><td>20</td><td>旧版切点回调：<code>HookEventType</code> 有 12 个枚举常量，另有 15 个 <code>HookEvent</code> 类与分发器；20 是含 <code>recorder/</code> 子包的文件数</td><td><code>Hook</code> / <code>HookEventType</code>；新代码优先用 middleware</td></tr>
               <tr><td><code>interruption</code></td><td>3</td><td>中断的「谁在中断、中断到哪一步」</td><td><code>InterruptControl</code></td></tr>
               <tr><td><code>shutdown</code></td><td>10</td><td>优雅停机：JVM 钩子、在跑请求收尾、状态落盘</td><td><code>GracefulShutdownManager</code></td></tr>
             </tbody>
@@ -198,7 +198,7 @@
               <tr><th>子包</th><th>文件</th><th>管什么</th><th>内含</th></tr>
             </thead>
             <tbody>
-              <tr><td><code>middleware</code></td><td>20</td><td>Harness 的全部「加装行为」：压缩、记忆、计划模式、子 agent、团队、收件箱</td><td>20 个中间件，一文件一个</td></tr>
+              <tr><td><code>middleware</code></td><td>20</td><td>Harness 的全部「加装行为」：压缩、记忆、计划模式、子 agent、团队、收件箱</td><td>18 个中间件类 + 1 个接口 + 1 个 record；20 是文件数</td></tr>
               <tr><td><code>tool</code></td><td>18</td><td>内置工具：文件、Shell、联网、记忆、计划、子 agent、团队、异步等待</td><td>—</td></tr>
               <tr><td><code>tools</code></td><td>9</td><td>工具配置与 MCP 注册：<code>ToolsConfig</code>、<code>McpServerRegistrar</code>、<code>ToolFilter</code></td><td>注意：单数 <code>tool</code> 是工具，复数 <code>tools</code> 是配置</td></tr>
               <tr><td><code>workspace</code></td><td>7</td><td>工作区管理、路径策略、索引、路径归一化</td><td><code>plan</code> 1（计划模式）</td></tr>

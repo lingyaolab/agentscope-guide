@@ -2,6 +2,31 @@
 
 本站内容对应 **AgentScope Java 2.0.4**。日期为发布日，站点版本与框架版本分开记。
 
+## v1.1.0 — 2026-11-07
+
+对照 AgentScope Java 2.0.4 源码做全站复核，并补两项可用性增强。
+
+### 内容校正
+
+- 50 个正文/附录页面逐条回源，修正 API 签名、默认值、配置开关与行为描述：
+  - 构建与模型：`agentscope-bom` 实际存在并管理 `io.agentscope` 构件；`maxRetries` 与
+    `ExecutionConfig.maxAttempts` 同为「含首次」的尝试次数；`model` 未设置时 `build()` 仍成功、首次调用才 NPE。
+  - 权限与中间件：`checkRunning` 已是弃用 no-op；`DONT_ASK` 只降级默认 ASK，显式 ask 规则仍会暂停；
+    `onSystemPrompt` 按 `order()` 降序执行；轻量权限路径同样会拦截 DENY。
+  - 沙箱与工作区：跨 call 不复用容器，默认 Noop 快照不保留文件；`SANDBOXED` 会把越界绝对路径重新锚定；
+    `AGENTS.md` 走 namespaced upper → project → workspace 的 overlay 顺序。
+  - Harness/Service/集成：Higress 注册链与缓存、Nacos A2A 父开关与 transport、RAGFlow `/api/v1/retrieval`、
+    GitLab `webhookToken` 必填、Chat Completions 单例 Agent、`HarnessAgent` 无 `conflictPolicy(...)`、
+    `Channel` 10 个方法、`ToolCallState` 实际状态、`replyId` 与 `Msg.id` 的区别等。
+  - 附录 A–F：API 速查的默认值、报错速查的异常文本与触发条件、术语表、源码地图的文件/类计数、勘误表的文档行数。
+- 出处总数保持 **3425 条**，`check-sources --strict` 全部可定位。
+
+### 可用性
+
+- 搜索索引把章节编号纳入页面与小节的匹配文本，输入 `02`、`36A`、`36A-3` 可直接定位。
+- 出处胶囊的 GitHub 链接自动去掉本地目录前缀 `agentscope-java-2.0.4/`，Ctrl/Cmd + 点击不再 404。
+- 静态检查与 44 项浏览器回归全部通过。
+
 ## v1.0.0 — 2026-11-05
 
 当前内容：51 页（44 章页 + 6 附录 + 首页），零构建纯静态，`file://` 直接可读。

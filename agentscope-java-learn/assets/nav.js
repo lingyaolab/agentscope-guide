@@ -595,7 +595,7 @@ window.AS_SITE = {
             ["turngate", "同会话串行：一个公平信号量，和一种「静默丢弃」"],
             ["router", "ChannelRouter：1 层显式 + 7 层 binding + 2 层兜底"],
             ["dmscope", "DmScope：同一句「你好」会分裂成几个会话"],
-            ["channel", "Channel：三个必须实现，六个已有默认"],
+            ["channel", "Channel：三个必须实现，七个已有默认"],
             ["chatui", "ChatUiChannel：两种发送姿势，走两条完全不同的路"],
             ["bootstrap", "GatewayBootstrap：装配顺序，以及它会替你做的三件事"],
             ["bus", "MessageBus：三种消费模型，四组域助手"],

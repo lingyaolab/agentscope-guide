@@ -110,9 +110,9 @@ Msg result = remote.call(new UserMessage("Translate to English: 你好")).block(
           它默认用内存 <code>TaskStore</code>、<code>QueueManager</code> 与 push config；生产要换成持久化实现
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-protocol/agentscope-extensions-a2a/agentscope-extensions-a2a-server/src/main/java/io/agentscope/core/a2a/server/AgentScopeA2aServer.java:241-287">AgentScopeA2aServer.java:241-287</span>。
         </p>
-        <pre data-lang="java" data-file="A2A 服务端（示意）">AgentScopeA2aServer server = AgentScopeA2aServer.builder()
-    .agentBuilder(ReActAgent.builder().name("backend-agent").model(model))
-    .transportProperties(new JsonRpcTransportProperties())
+        <pre data-lang="java" data-file="A2A 服务端（示意）">AgentScopeA2aServer server = AgentScopeA2aServer.builder(
+        ReActAgent.builder().name("backend-agent").model(model))
+    .withTransport(TransportProperties.builder("JSONRPC").build())
     .build();
 
 TransportWrapper wrapper = server.getTransportWrapper("JSONRPC");

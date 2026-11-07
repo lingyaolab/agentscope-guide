@@ -128,7 +128,7 @@
               <tr><td>飞书</td><td><code>X-Lark-Signature</code> + 可选 AES-256-CBC 解密</td><td>验签失败拒绝</td></tr>
               <tr><td>企微</td><td><code>token</code> + <code>timestamp</code> + <code>nonce</code> + 加密体</td><td>解密 / 验签失败拒绝</td></tr>
               <tr><td>GitHub</td><td><code>X-Hub-Signature-256</code> 对 body 做 HMAC-SHA256</td><td>签名不匹配拒绝</td></tr>
-              <tr><td>GitLab</td><td>Secret token（可选）</td><td>配置后不匹配拒绝</td></tr>
+              <tr><td>GitLab</td><td>Secret token（本适配器必填，平台侧可留空）</td><td>不匹配拒绝</td></tr>
             </tbody>
           </table>
         </div>
@@ -244,13 +244,15 @@
         <h2 id="gitlab">GitLab：Note hook + bot 自身过滤</h2>
         <p>
           GitLab 适配器响应 issue / merge request 评论（Note），Agent 以新 note 回复。PAT 需要 <code>api</code> 权限，
-          webhook 勾选 <strong>Note events</strong>；Secret token 是可选的
+          webhook 勾选 <strong>Note events</strong>；GitLab 平台侧的 Secret token 可留空，但本适配器构造时必须配置
+          <code>webhookToken</code>
           <span class="src" data-src="docs/v2/zh/integration/channel/gitlab.md:6-29">gitlab.md:6-29</span>。
         </p>
         <pre data-lang="java" data-file="GitLab（示意）">GitLabChannel channel = GitLabChannel.fromProperties(
     "my-gitlab",
     ChannelConfig.of("my-gitlab", "main"),
-    Map.of("token", "glpat-xxxxxxxxxxxx"));</pre>
+    Map.of("token", "glpat-xxxxxxxxxxxx",
+           "webhookToken", "your-webhook-token"));</pre>
         <p>
           入站管线是：<code>note.id</code> 去重 → bot 自身 note 过滤 → 映射 → 防循环 → Gateway
           <span class="src" data-src="docs/v2/zh/integration/channel/gitlab.md:61-65">gitlab.md:61-65</span>。
@@ -267,15 +269,16 @@
             </thead>
             <tbody>
               <tr><td>钉钉</td><td>平台消息 id</td><td>机器人消息（单聊 / 群 @）</td><td>文本 / Markdown 自动识别</td></tr>
-              <tr><td>飞书</td><td><code>event_id</code></td><td>事件订阅回调</td><td>当前仅文本</td></tr>
-              <tr><td>企微</td><td><code>MsgId</code></td><td>应用消息回调</td><td>文本</td></tr>
+              <tr><td>飞书</td><td><code>event_id</code></td><td>事件订阅回调</td><td>文本完整映射；图片 / 文件等映射为占位 + metadata</td></tr>
+              <tr><td>企微</td><td><code>MsgId</code></td><td>应用消息回调</td><td>文本完整映射；图片 / 语音 / 视频映射为占位 + metadata</td></tr>
               <tr><td>GitHub</td><td><code>comment.id</code></td><td><code>issue_comment</code> / <code>pull_request_review_comment</code>，仅 <code>created</code></td><td>评论正文</td></tr>
               <tr><td>GitLab</td><td><code>note.id</code></td><td>Note events</td><td>Note 正文</td></tr>
             </tbody>
           </table>
         </div>
         <p class="footnote">
-          飞书与企微当前只映射文本消息；图片、文件、卡片等类型不会自动变成 Agent 可读文本
+          飞书与企微会把媒体消息映射成占位文本并保留 <code>ChannelMediaMetadata</code>，不会自动下载媒体内容；
+          图片、文件、卡片仍需应用自己下载与转换
           <span class="src" data-src="docs/v2/zh/integration/channel/feishu.md:69">feishu.md:69</span>
           <span class="src" data-src="docs/v2/zh/integration/channel/wecom.md:70">wecom.md:70</span>。
           需要多模态时，要自己在适配器外补下载与转换。
@@ -411,7 +414,8 @@
         <details>
           <summary>飞书和企微适配器会把图片、文件、卡片都转成文本给 Agent 吗？</summary>
           <p>
-            不会。当前飞书与企微只映射文本消息；图片、文件、卡片需要自己下载与转换
+            不会转换成可读内容。飞书与企微会把媒体消息映射为占位文本并保留 <code>ChannelMediaMetadata</code>，
+            图片、文件、卡片仍需自己下载与转换
             <span class="src" data-src="docs/v2/zh/integration/channel/feishu.md:69">feishu.md:69</span>
             <span class="src" data-src="docs/v2/zh/integration/channel/wecom.md:70">wecom.md:70</span>。
           </p>

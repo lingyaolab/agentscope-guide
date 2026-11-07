@@ -88,18 +88,20 @@
     .buildSync();</pre>
         <p>
           Top K 太小会漏工具，太大又回到「工具太多」；按业务场景选 8–12 通常比默认 10 更可控。
-          工具搜索返回的结果会缓存到本地，后续 <code>callTool</code> 直接复用
+          工具搜索返回的结果会缓存到 wrapper 里，供 <code>getCachedTool</code> 使用；真正的
+          <code>callTool</code> 仍然转发到 Higress 网关
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientWrapper.java:186-204">HigressMcpClientWrapper.java:186-204</span>。
         </p>
 
         <h2 id="register">注册：Toolkit 是最终生效点</h2>
         <p>
           客户端只是传输层；真正让 Agent 看到工具的是 <code>HigressToolkit</code>。
-          <code>registerMcpClient</code> 返回 <code>Mono&lt;Void&gt;</code>，注册成功后才会缓存客户端引用
+          <code>registerMcpClient</code> 返回 <code>Mono&lt;Void&gt;</code>；用 <code>registration().apply()</code>
+          时它内部会完成注册并 <code>block()</code> 等待
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressToolkit.java:99-120">HigressToolkit.java:99-120</span>。
         </p>
         <pre data-lang="java" data-file="注册并裁剪工具面">HigressToolkit toolkit = new HigressToolkit();
-toolkit.registerMcpClient(client).block();
+toolkit.createToolGroup("knowledge", "知识库工具");
 
 toolkit.registration()
     .mcpClient(client)

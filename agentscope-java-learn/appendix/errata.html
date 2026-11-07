@@ -226,7 +226,7 @@
                 <td>不写也能起，但默认镜像没有 python3、常用工具，<code>edit_file</code> 之类会莫名其妙失败</td>
               </tr>
               <tr id="ch12-plans">
-                <td>模式 1 的路由表列了 8 条，没有 <code>plans/</code><span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:62">filesystem.md:62</span></td>
+                <td>模式 1 的路由表列了 7 行（9 个路径项），没有 <code>plans/</code><span class="src" data-src="docs/v2/zh/docs/harness/filesystem.md:62">filesystem.md:62</span></td>
                 <td>源码路由表里有 <code>plans/</code> 这一条<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/filesystem/spec/RemoteFilesystemSpec.java:268">RemoteFilesystemSpec.java:268</span></td>
                 <td>按文档排查「计划文件写到哪去了」会找不到落点；实际 <code>plans/</code> 也进 KV</td>
               </tr>

@@ -382,7 +382,7 @@ default int getContextWindowSize() { ... }</pre>
               <tr>
                 <td>backoffMultiplier</td>
                 <td>2.0</td>
-                <td>每次退避时长翻倍：2s → 4s → 8s …</td>
+                <td>名义上按 2 倍指数增长（2s → 4s → 8s …），并叠加 0.5 抖动</td>
               </tr>
               <tr>
                 <td>retryOn</td>
@@ -464,12 +464,13 @@ return primaryFlux.switchOnFirst(
           <p>
             ① <strong>流到一半才断，不会切备用模型。</strong>只要主模型已经吐出过任何一条数据，<code>switchOnFirst</code>
             就走 <code>return flux</code> 分支，后面的错误原样往上传。<br />
-            ② <strong>备用模型共享同一份重试预算。</strong><code>ModelConfig</code> 的注释写明 fallback 与主模型共用
-            <code>maxRetries</code><span
+            ② <strong>备用模型有自己的一份重试预算。</strong><code>ModelConfig</code> 的注释说 fallback 与主模型共用
+            <code>maxRetries</code>，但实际路径是主模型耗尽后再次进入 <code>fallbackModel.stream(...)</code>，
+            备用模型会重新走自己的 <code>applyTimeoutAndRetry</code>；<code>maxRetries=3</code> 时最多可发 6 次请求<span
               class="src"
               data-src="agentscope-core/src/main/java/io/agentscope/core/agent/config/ModelConfig.java:22"
               >ModelConfig.java:22</span
-            >，不是「主模型用完 3 次、备用再给 3 次」。<br />
+            >，所以总请求数上限会比只用主模型时更高。<br />
             ③ <strong>监听器自己抛异常不会影响降级。</strong><code>notifyFailover</code> 会把异常吞掉只打 warn<span
               class="src"
               data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4327"

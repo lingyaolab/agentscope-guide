@@ -49,8 +49,8 @@
             class="src"
             data-src="docs/v2/zh/docs/harness/architecture.md:7"
             >architecture.md:7</span
-          >，这个说法在代码里能直接对上：<code>HarnessAgent</code> 的构造器只收一个已经建好的
-          <code>delegate</code><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:173">HarnessAgent.java:173</span>，
+          >，这个说法在代码里能直接对上：<code>HarnessAgent</code> 的构造器以已经建好的
+          <code>delegate</code> 为首参，另接收 workspace、sandbox、skill、plan-mode、memory、distributed store 等十几项装配产物<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:205-224">HarnessAgent.java:205-224</span>，
           而 <code>build()</code> 的最后一步就是 <code>inner.build()</code> 造出这个 delegate<span
             class="src"
             data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:2948"
@@ -431,7 +431,8 @@ agent.streamEvents("把这三个文件都改一遍", ctx)
         <div class="callout warn">
           <span class="ct">调 <code>maxIters</code> 的两个经验</span>
           <p>
-            第一，<code>maxIters(1)</code> 不是「只让模型说一句话」，而是「进来先判触顶，直接走摘要」，你会看到一次莫名其妙的模型调用和
+            第一，<code>maxIters(1)</code> 会正常执行一次 <code>reasoning(0)</code>，只有需要下一轮时才进入摘要；只有
+            <code>maxIters(0)</code> 才会首次调用就跳过推理直接走摘要，你会看到一次莫名其妙的模型调用和
             <code>MAX_ITERATIONS</code>。第二，触顶开销<strong>不是零</strong>：补工具结果 + 一次完整摘要调用都要花钱，
             所以它的定位是「兜底」而不是「省 token 的手段」。真要在预算上设闸，用 09 章的中间件在
             <code>onModelCall</code> 里计数更直接。
@@ -552,7 +553,7 @@ public class InterruptDemo {
               <tr><td>结果卸载</td><td>超大工具输出落盘 + 占位符，不把上下文塞爆</td><td><code>.toolResultEviction(...)</code></td></tr>
               <tr><td>计划模式</td><td>只读设计阶段 + 人工确认退出</td><td><code>.enablePlanMode()</code></td></tr>
               <tr><td>MCP</td><td>声明式 MCP server + 工具粒度允许 / 拒绝</td><td><code>workspace/tools.json</code></td></tr>
-              <tr><td>Channel</td><td>会话管理、per-session 并发、多 agent 路由、SSE</td><td><code>.channel(...)</code> / <code>HarnessGateway</code></td></tr>
+              <tr><td>Channel</td><td>会话管理、per-session 并发、多 agent 路由、SSE</td><td>先 <code>build()</code> 再 <code>agent.channel(channel)</code>，或用 <code>HarnessGateway</code></td></tr>
             </tbody>
           </table>
         </div>

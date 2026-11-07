@@ -104,8 +104,8 @@
 
 Msg answer = reviewer.call(inputMsg).block();</pre>
         <p>
-          <code>studioClient</code> 与 <code>webSocketClient</code> 必须同时设置，否则 Studio 通道不完整；
-          <code>inputTimeout</code> 默认 30 分钟
+          <code>studioClient</code> 与 <code>webSocketClient</code> 同时设置时才走 Studio 通道；
+          任一缺失都会静默回退到终端输入。<code>inputTimeout</code> 默认 30 分钟
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-studio/src/main/java/io/agentscope/core/studio/StudioUserAgent.java:244-327">StudioUserAgent.java:244-327</span>。
         </p>
 

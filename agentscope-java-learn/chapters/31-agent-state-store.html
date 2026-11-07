@@ -328,7 +328,8 @@ ReActAgent agent = ReActAgent.builder()
         <h2 id="local">本地实现：JSON 与 InMemory 的边界</h2>
         <p>
           <code>JsonFileAgentStateStore</code> 是 HarnessAgent 的默认状态存储，根目录默认在
-          <code>~/.agentscope/state</code>，按 <code>__anon__/&lt;session&gt;</code> 或 <code>&lt;user&gt;/&lt;session&gt;</code> 分目录；
+          <code>~/.agentscope/state</code>，HarnessAgent 实际按 <code>~/.agentscope/state/&lt;agentId&gt;/&lt;user&gt;/&lt;session&gt;/</code>
+          落盘；直接 new 的 store 才按 <code>__anon__/&lt;session&gt;</code> 或 <code>&lt;user&gt;/&lt;session&gt;</code> 分目录；
           它支持列表的 hash 增量 append，但不支持版本化
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-core/src/main/java/io/agentscope/core/state/JsonFileAgentStateStore.java:47-84">JsonFileAgentStateStore.java:47-84</span>。
           <code>InMemoryAgentStateStore</code> 只用于测试，但它反而实现了版本化与 CAS
@@ -407,9 +408,12 @@ ReActAgent agent = ReActAgent.builder()
     .name("assistant")
     .model("dashscope:qwen-plus")
     .distributedStore(store)
-    .conflictPolicy(ConflictPolicy.FAIL)
     .filesystem(new RemoteFilesystemSpec().isolationScope(IsolationScope.USER))
     .build();</pre>
+        <p class="footnote">
+          <code>HarnessAgent.Builder</code> 当前没有 <code>conflictPolicy(...)</code>；需要自定义冲突策略时，
+          直接在 <code>ReActAgent.Builder</code> 上设置。
+        </p>
 
         <h2 id="failure">故障边界：先分清「找不到」「写冲突」「写不进去」</h2>
         <div class="table-wrap">

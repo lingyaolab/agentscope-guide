@@ -184,7 +184,7 @@ TEXT_BLOCK_START             1</pre>
               <tr>
                 <td><code>id</code></td>
                 <td><code>getId()</code></td>
-                <td>消息的唯一标识。构造时不给就随机生成 UUID；事件里的 <code>replyId</code> 最终指的就是它。</td>
+                <td>消息的唯一标识。构造时不给就随机生成 UUID；事件里的 <code>replyId</code> 是每次调用的独立关联 id，<strong>不是</strong> <code>Msg.getId()</code>，数据库键请用后者。</td>
               </tr>
               <tr>
                 <td><code>name</code></td>

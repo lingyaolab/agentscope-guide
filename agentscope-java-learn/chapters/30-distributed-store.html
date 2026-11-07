@@ -201,8 +201,9 @@ HarnessAgent agent = HarnessAgent.builder()
         </p>
         <pre data-lang="java" data-file="JDBC 一键配置（示意）">DistributedStore store = JdbcDistributedStore.create(dataSource);</pre>
         <p>
-          旧 MySQL 文档里的细节仍适用于 MySQL 方言：状态表可自动创建，库名 / 表名限定
-          <code>[a-zA-Z_][a-zA-Z0-9_-]*</code> 且长度 ≤ 64；<code>JdbcStore</code> 的 <code>putIfVersion</code>
+          新 JDBC 实现的状态表可自动创建，库名 / 表名限定
+          <code>[A-Za-z_][A-Za-z0-9_]*</code>（不允许连字符）且长度 ≤ 64；旧 <code>MysqlAgentStateStore</code>
+          才允许连字符，迁移时需改名。<code>JdbcStore</code> 的 <code>putIfVersion</code>
           通过单语句 CAS 实现；在 MySQL 方言下，<code>JdbcSandboxExecutionGuard</code> 走
           <code>GET_LOCK()</code> / <code>RELEASE_LOCK()</code>，锁名超过 64 字符会自动 hash，
           且 named lock 是 server 级别，共享实例时要用唯一前缀

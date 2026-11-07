@@ -56,7 +56,7 @@
 运行后产生（都在用户目录下，不污染项目）：
 ~/.notes-agent/
 ├── notes/notes.txt          ← 笔记正文
-└── state/local/cli/         ← 会话状态：agent_state.json + memory_messages.jsonl</pre>
+└── state/local/cli/         ← 会话状态：agent_state.json</pre>
         <p>
           一次「删笔记」的完整链路长这样，六步里有三步是普通 CRUD 应用里没有的：
         </p>
@@ -83,7 +83,7 @@
           </li>
           <li>
             <span class="sh">存盘</span>
-            <div>本轮结束后，<code>stateStore</code> 把 <code>AgentState</code> 与消息列表写进磁盘；下次启动同 <code>sessionId</code>，模型能看到上次的上下文。</div>
+            <div>本轮结束后，<code>stateStore</code> 把 <code>AgentState</code> 写进磁盘；下次启动同 <code>sessionId</code>，模型能看到上次的上下文。</div>
           </li>
         </ol>
         <div class="callout tip">
@@ -587,8 +587,7 @@ mvn -q compile exec:java -Dexec.mainClass=com.example.notes.Cli</pre>
         <pre data-lang="text" data-file="磁盘布局">~/.notes-agent/state/
 └── local/                        ← userId
     └── cli/                      ← sessionId
-        ├── agent_state.json      ← 权限上下文、已注册规则等
-        └── memory_messages.jsonl ← 一条消息一行，追加写</pre>
+        ├── agent_state.json      ← 权限上下文、已注册规则等</pre>
         <p>
           <code>JsonFileAgentStateStore</code> 的根目录由构造器决定，槽位两级目录就是 <code>(userId, sessionId)</code>。
           名字里出现 <code>/</code>、中文、空格等不安全字符时，框架会做 Base64-URL 编码，所以不用担心路径炸掉。
@@ -780,7 +779,7 @@ public final class NotesAgent {
               <tr><td>把确认做成卡片</td><td><code>RequireUserConfirmEvent.getToolCalls()</code> 渲染，回传 <code>ConfirmResult</code></td></tr>
               <tr><td>重启后还记得</td><td><code>stateStore(...)</code> + 固定 <code>(userId, sessionId)</code></td></tr>
               <tr><td>换会话</td><td>新建 <code>RuntimeContext</code>，换 <code>sessionId</code>，其余不变</td></tr>
-              <tr><td>无人值守</td><td><code>PermissionMode.DONT_ASK</code>，把 ASK 降级成 DENY</td></tr>
+              <tr><td>无人值守</td><td><code>PermissionMode.DONT_ASK</code>：只把默认 ASK 降级成 DENY；显式 ask 规则命中仍会暂停</td></tr>
               <tr><td>只读分析</td><td><code>PermissionMode.EXPLORE</code> + 工具标 <code>readOnly = true</code></td></tr>
               <tr><td>识别触顶</td><td><code>msg.getGenerateReason() == GenerateReason.MAX_ITERATIONS</code></td></tr>
             </tbody>
@@ -886,7 +885,7 @@ public final class NotesAgent {
           <summary>为什么不直接看「有没有收到 <code>RequireUserConfirmEvent</code>」来判断暂停？</summary>
           <p>
             因为事件只是给 UI 的提示，不是状态本身。中间件可能把它过滤掉（09 章的坑）；<code>DONT_ASK</code> 模式下
-            本该 ASK 的调用会被降级成 DENY，也不会发这个事件。唯一权威的判据是
+            只有默认 ASK 会被降级成 DENY，显式 <code>addAskRule</code> 命中时仍会暂停并发事件。唯一权威的判据是
             <code>AgentResultEvent.getResult().getGenerateReason()</code>。事件用来「拿要确认的工具」，reason 用来「决定要不要问」。
           </p>
         </details>
@@ -931,8 +930,8 @@ public final class NotesAgent {
             <div>
               给 <code>main</code> 加一个 <code>--mode</code> 参数，把 <code>NotesAgent.build(home, mode)</code> 的
               <code>PermissionMode</code> 变成可配。分别跑 <code>DEFAULT</code> / <code>BYPASS</code> /
-              <code>DONT_ASK</code>，对同一句「把笔记清空」观察三种结局：问 / 直接删 / 直接被拒——尤其是
-              <code>DONT_ASK</code>，它把 ASK 降级成 DENY，不是「不问就放行」。
+              <code>DONT_ASK</code>，对同一句「把笔记清空」观察三种结局：问 / 直接删 / 默认 ASK 被拒——尤其是
+              <code>DONT_ASK</code>，它只降级默认 ASK，显式 <code>addAskRule</code> 命中时仍会问。
             </div>
           </li>
         </ol>

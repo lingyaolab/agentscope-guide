@@ -264,7 +264,8 @@ agentscope runtime probe</pre>
         <div class="callout warn">
           <span class="ct">重复 connect 不是「只加一个参数」</span>
           <p>
-            命令会先读已有配置，只覆盖显式传入的 URL、provider、pool、capacity、workspace 与 state 根目录；
+            命令会先读已有配置；重复执行时它会重新解析 control plane 并重新发现 provider，
+            只有 pool、capacity、workspace 与 state 根目录是「显式传入才覆盖」；
             如果旧守护进程在跑，它会先停掉旧进程，再保存配置并启动新进程<span
               class="src"
               data-src="agentscope-service/aistio/cmd/aistioctl/connect.go:55-60"
@@ -934,10 +935,10 @@ agentscope runtime probe</pre>
               <tr><th>命令</th><th>用途</th><th>关键细节</th></tr>
             </thead>
             <tbody>
-              <tr><td><code>agentscope runtime logs -f</code></td><td>跟踪守护进程日志</td><td><code>-n</code> 默认显示 50 行<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:141-152">local_runtime_process.go:141-152</span></td></tr>
-              <tr><td><code>agentscope runtime restart</code></td><td>停 10 秒再启动</td><td>先优雅终止，超时才 force kill<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:253-281">local_runtime_process.go:253-281</span></td></tr>
+              <tr><td><code>agentscope runtime logs -f</code></td><td>跟踪守护进程日志</td><td><code>--lines</code> 默认显示 50 行（<code>-n</code> 是全局 namespace 简写）<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:141-152">local_runtime_process.go:141-152</span></td></tr>
+              <tr><td><code>agentscope runtime restart</code></td><td>最多等 10 秒优雅退出，超时 force kill 后启动</td><td>先优雅终止，超时才 force kill<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/local_runtime_process.go:253-281">local_runtime_process.go:253-281</span></td></tr>
               <tr><td><code>agentscope runtime diagnose ATTEMPT_ID</code></td><td>收集 Attempt、Run graph 与最近 500 条事件</td><td>按 failure code 给出下一步建议<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/runtime.go:61-120">runtime.go:61-120</span></td></tr>
-              <tr><td><code>agentscope runtime host list</code></td><td>查看主机注册状态</td><td>可带 tenant / namespace 过滤<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/runtime.go:141-149">runtime.go:141-149</span></td></tr>
+              <tr><td><code>agentscope runtime host list</code></td><td>查看主机注册状态</td><td>只按 namespace 查询；tenant 由凭据/API 决定<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/runtime.go:141-149">runtime.go:141-149</span></td></tr>
               <tr><td><code>agentscope runtime profile/pool apply -f</code></td><td>维护 Profile 与 Pool</td><td>YAML / JSON 提交到控制面<span class="src" data-src="agentscope-service/aistio/cmd/aistioctl/runtime.go:150-176">runtime.go:150-176</span></td></tr>
             </tbody>
           </table>

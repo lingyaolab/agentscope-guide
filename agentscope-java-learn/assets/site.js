@@ -390,7 +390,7 @@
         href: it.href,
         kind: "page",
         disabled: it.status !== "ready",
-        hay: (it.title + " " + it.desc + " " + (it.kw || []).join(" ")).toLowerCase(),
+        hay: (it.num + " " + it.title + " " + it.desc + " " + (it.kw || []).join(" ")).toLowerCase(),
       });
       if (it.status === "ready") {
         (it.sections || []).forEach(function (s) {
@@ -400,7 +400,7 @@
             href: it.href + "#" + s[0],
             kind: "sec",
             disabled: false,
-            hay: (s[1] + " " + it.title).toLowerCase(),
+            hay: (it.num + " " + s[1] + " " + it.title).toLowerCase(),
           });
         });
       }
@@ -1064,12 +1064,13 @@
         return;
       }
       var path = m[1];
+      var repoPath = path.replace(/^agentscope-java-2\.0\.4\//, "");
       var line = m[2];
       s.setAttribute("title", "点击复制路径" + (line ? "（行 " + line + "）" : "") + "；Ctrl/Cmd + 点击在 GitHub 打开");
       s.textContent = path.split("/").pop() + (line ? ":" + line : "");
       s.addEventListener("click", function (e) {
         if (e.metaKey || e.ctrlKey) {
-          var w = window.open(SITE.repo + "/blob/main/" + path, "_blank");
+          var w = window.open(SITE.repo + "/blob/main/" + repoPath, "_blank");
           if (w) w.opener = null;
           return;
         }

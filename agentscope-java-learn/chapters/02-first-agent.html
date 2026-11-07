@@ -230,8 +230,7 @@ System.out.println(answer.getTextContent());</pre>
               data-src="agentscope-core/src/main/java/io/agentscope/core/message/Msg.java:579"
               >Msg.java:579</span
             >。「回了一句莫名其妙的话」很多时候就是 <code>MAX_ITERATIONS</code>，先读它再改代码。06 /
-            10 章会分别用到这两个。注意它们都是 <code>@Transient @JsonIgnore</code>，存在
-            <code>metadata</code> 里而不是序列化后的状态文件里。
+            10 章会分别用到这两个。注意它们不是单独序列化字段，而是放在 <code>metadata</code> 里，并会随状态文件一起持久化。
           </p>
         </div>
 
@@ -397,8 +396,8 @@ mvn -q compile exec:java -Dexec.mainClass=FirstAgent</pre>
               <tr>
                 <td><code>checkRunning</code></td>
                 <td><code>true</code></td>
-                <td><span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/HarnessAgent.java:1205">:1205</span></td>
-                <td>同一 session 正在跑时的保护，一般别关</td>
+                <td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:4898-4900">ReActAgent.java:4898-4900</span></td>
+                <td>已弃用：字段默认 <code>true</code>，但不再强制执行；同 session 并发由串行化门控处理</td>
               </tr>
               <tr>
                 <td><code>enablePendingToolRecovery</code></td>
@@ -789,7 +788,7 @@ agent.streamEvents(new UserMessage("帮我把今天的关键点列三条。"), c
           <p>
             <strong>能，也不需要。</strong>实例在调用之间无状态，每次调用传不同的
             <code>RuntimeContext</code> 就自动隔离上下文；同一 <code>(userId, sessionId)</code>
-            的请求会被串行化，不会互相踩状态<span class="src" data-src="docs/v2/zh/docs/quickstart.md:144">quickstart.md:144</span>。
+            的请求会被串行化，不会互相踩状态<span class="src" data-src="docs/v2/zh/docs/quickstart.md:173">quickstart.md:173</span>。
             要留意的是<strong>存储实现</strong>必须支持多副本共享，见陷阱 6。
           </p>
         </details>

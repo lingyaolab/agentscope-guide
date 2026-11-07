@@ -110,7 +110,8 @@
           Spring Boot 用户还可以直接引入 <code>agentscope-nacos-spring-boot-starter</code>，它使用
           <code>agentscope.nacos.prompt.*</code> 与 <code>agentscope.a2a.nacos.*</code> 两组前缀
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-nacos-spring-boot-starter/src/main/java/io/agentscope/spring/boot/nacos/constants/NacosConstants.java:29-38">NacosConstants.java:29-38</span>。
-          其中 Prompt starter 默认 <code>enabled=true</code>，并允许用 <code>sys-prompt-key</code>、<code>version</code>、<code>label</code> 覆盖 YAML 里的系统提示词
+          Prompt 属性类的 <code>enabled</code> 字段默认 true，但自动装配要求显式设置
+          <code>agentscope.nacos.prompt.enabled=true</code> 才会启用；并允许用 <code>sys-prompt-key</code>、<code>version</code>、<code>label</code> 覆盖 YAML 里的系统提示词
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-nacos-spring-boot-starter/src/main/java/io/agentscope/spring/boot/nacos/properties/AgentScopeNacosPromptProperties.java:53-81">AgentScopeNacosPromptProperties.java:53-81</span>。
         </p>
 
@@ -128,6 +129,11 @@ NacosA2aRegistryProperties props = NacosA2aRegistryProperties.builder()
     .setAsLatest(false)
     .enabledRegisterEndpoint(true)
     .build();
+props.addTransport(NacosA2aRegistryTransportProperties.builder()
+    .transport("HTTP")
+    .host("localhost")
+    .port(8080)
+    .build());
 
 registry.registerAgent(agentCard, props);
 
@@ -159,7 +165,7 @@ A2aAgent remote = A2aAgent.builder()
         <p>
           解析器内部有 <code>agentCardCaches</code> 与 <code>agentCardUpdaters</code> 两张表；第一次按名取时订阅，后续命中缓存，
           Nacos 侧更新会通过监听器回写缓存
-          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/discovery/NacosAgentCardResolver.java:61-98">NacosAgentCardResolver.java:61-98</span>。
+          <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-a2a/src/main/java/io/agentscope/core/nacos/a2a/discovery/NacosAgentCardResolver.java:61-121">NacosAgentCardResolver.java:61-121</span>。
           所以「改了 AgentCard 要不要重启」的答案是：解析器会更新缓存，但你的 <code>A2aAgent</code> 是否重新读卡，取决于它自己的调用时机。
         </p>
 
@@ -233,8 +239,8 @@ NacosSkillRepository repo = new NacosSkillRepository(
           </p>
         </div>
         <p>
-          与 Git 仓库一样，<code>getAllSkills()</code> 的每个技能都是一次网络调用；技能多时启动会变慢，
-          大规模目录更适合数据库仓库
+          与 Nacos 不同，Git 仓库是在本地克隆上读文件的：<code>getAllSkills()</code> 先做一次同步/HEAD 检查，
+          再读本地目录，不会为每个技能各发一次网络请求；Nacos 才是每个技能下载一个 ZIP，技能多时启动会变慢。
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-nacos/agentscope-extensions-nacos-skill/src/main/java/io/agentscope/core/nacos/skill/NacosSkillRepository.java:240-258">NacosSkillRepository.java:240-258</span>。
         </p>
 
@@ -533,7 +539,7 @@ runner.stop();</pre>
             <tbody>
               <tr><td><code>commitIntervalSeconds</code></td><td>300</td><td>每 5 分钟 commit 一次；<code>&lt;= 0</code> 关闭定时 commit</td></tr>
               <tr><td>HTTP 超时</td><td>300 秒</td><td>Trinity 请求超时</td></tr>
-              <tr><td><code>enableAutoCommit</code></td><td>true</td><td>是否自动 commit</td></tr>
+              <tr><td><code>enableAutoCommit</code></td><td>true</td><td>配置字段存在；当前生产代码实际由 <code>commitIntervalSeconds &lt;= 0</code> 决定是否启动定时 commit</td></tr>
               <tr><td>默认采样率</td><td>10%</td><td>不传 <code>selectionStrategy</code> 时使用</td></tr>
               <tr><td>影子线程池</td><td>10 / 1000</td><td>核心线程数 / 队列容量</td></tr>
               <tr><td><code>repeatTime</code></td><td>1</td><td>同一任务重复执行次数</td></tr>
@@ -594,7 +600,7 @@ runner.stop();</pre>
           </p>
         </div>
         <pre data-lang="java" data-file="直接调用核心适配器（正确签名）">ChatCompletionsStreamingAdapter adapter = new ChatCompletionsStreamingAdapter();
-List&lt;Msg&gt; messages = converter.convert(request.getMessages());
+List&lt;Msg&gt; messages = converter.convertMessages(request.getMessages());
 
 Flux&lt;ChatCompletionsChunk&gt; stream = adapter.stream(
     agent, messages, requestId, request.getModel());</pre>
@@ -614,11 +620,12 @@ Flux&lt;ChatCompletionsChunk&gt; stream = adapter.stream(
           </p>
         </div>
         <p>
-          starter 侧的自动配置假设 classpath 上已经有核心 starter，并提供了一个 prototype 作用域的
-          <code>ReActAgent</code> bean；Controller 用 <code>ObjectProvider</code> 每次取新实例
+          starter 侧的自动配置假设 classpath 上已经有核心 starter，并使用它提供的 singleton
+          <code>ReActAgent</code> bean；Controller 通过 <code>ObjectProvider</code> 取用同一个实例
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-chat-completions-web-starter/src/main/java/io/agentscope/spring/boot/chat/config/ChatCompletionsWebAutoConfiguration.java:36-37">ChatCompletionsWebAutoConfiguration.java:36-37</span>
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-chat-completions-web-starter/src/main/java/io/agentscope/spring/boot/chat/config/ChatCompletionsWebAutoConfiguration.java:139-148">ChatCompletionsWebAutoConfiguration.java:139-148</span>。
-          没有这个 bean，Controller 起不来；这不是「引入 starter 就自动有 Agent」。
+          没有这个 bean，应用本身仍能启动；但请求走到 <code>getObject()</code> 时会抛
+          <code>NoSuchBeanDefinitionException</code>（通常表现为 500）。这不是「引入 starter 就自动有 Agent」。
         </p>
 
         <h2 id="boundaries">边界：每个扩展「不做」什么</h2>

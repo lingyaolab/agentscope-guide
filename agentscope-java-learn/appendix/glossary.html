@@ -192,7 +192,7 @@
               <tr>
                 <td><code>ToolCallState</code></td>
                 <td>调用状态</td>
-                <td><code>PENDING</code> → <code>ASKING</code> → <code>ALLOWED</code> → <code>SUBMITTED</code> → <code>FINISHED</code>，<code>ASKING</code> 就是「等你批」</td>
+                <td><code>PENDING</code> → <code>ASKING</code> / <code>ALLOWED</code>，<code>ASKING</code> 就是「等你批」；<code>SUBMITTED</code>、<code>FINISHED</code> 在 2.0.4 未使用</td>
                 <td><a href="../chapters/08-permission-hitl.html">08</a></td>
               </tr>
               <tr>
@@ -485,7 +485,7 @@
               <tr>
                 <td><code>PermissionRule</code></td>
                 <td>权限规则</td>
-                <td>四元组：工具名 + 参数模式 + 动作 + 作用域标签</td>
+                <td>四元组：工具名 + 参数模式 + 动作 + 来源标签（如 <code>userSettings</code> / <code>suggested</code>）</td>
                 <td><a href="../chapters/08-permission-hitl.html">08</a></td>
               </tr>
               <tr>
@@ -541,7 +541,7 @@
               <tr>
                 <td><code>AgentEvent</code> <span class="tag-star">★</span></td>
                 <td>智能体事件</td>
-                <td>事件流里的最小单位，每个都带 <code>replyId</code>；2.0.4 里有 31 种类型</td>
+                <td>事件流里的最小单位，多数带 <code>replyId</code>；<code>AGENT_RESULT</code>、<code>REQUEST_STOP</code>、<code>CUSTOM</code>、<code>ALL_TOOLS_DENIED</code>、<code>SUBAGENT_EXPOSED</code> 不带。2.0.4 里有 31 种类型</td>
                 <td><a href="../chapters/04-message-and-event.html">04</a></td>
               </tr>
               <tr>

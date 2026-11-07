@@ -70,7 +70,8 @@
             <span class="lt">agentscope-extensions-model-*（按厂商选）</span>
             <div class="ld">
               DashScope / OpenAI / Anthropic / Gemini / Ollama 各一个模块，通过 <code>ServiceLoader</code> 在
-              <strong>运行时</strong>被发现。代码里永远只出现字符串，不出现厂商类。
+              <strong>运行时</strong>被发现。常见路径是只写字符串 id；需要显式 key / endpoint / timeout 时，也可以用
+              <code>.model(Model)</code> 与厂商 builder。
             </div>
           </div>
         </div>
@@ -130,11 +131,13 @@
         </p>
 
         <div class="callout warn">
-          <span class="ct">不要再去找一个叫 <code>agentscope-bom</code> 的东西来管版本</span>
+          <span class="ct">仓库里有两个 BOM，别搞混</span>
           <p>
-            仓库里确实有个 <code>agentscope-dependencies-bom</code>，但它管的是<strong>第三方</strong>依赖（Reactor、Jackson、
-            OkHttp 这些的版本对齐），里面<strong>没有</strong> <code>io.agentscope</code> 自己的构件。所以版本号请老老实实写死或
-            用属性，不要指望 <code>&lt;scope&gt;import&lt;/scope&gt;</code> 能替你管 harness 的版本。
+            仓库里确实有 <code>agentscope-dependencies-bom</code>，但它管的是<strong>第三方</strong>依赖（Reactor、Jackson、
+            OkHttp 这些的版本对齐）；<code>io.agentscope</code> 自己的构件由 <code>agentscope-bom</code> 管理，里面包含
+            <code>agentscope-harness</code><span class="src" data-src="agentscope-java-2.0.4/agentscope-distribution/agentscope-bom/pom.xml:89-93">agentscope-bom/pom.xml:89-93</span>。
+            根 POM 就是同时 import 两个 BOM<span class="src" data-src="agentscope-java-2.0.4/pom.xml:143-149">pom.xml:143-149</span>；
+            自己建工程时也可以 import <code>agentscope-bom</code> 统一版本，或者继续写死/用属性。
           </p>
         </div>
 
@@ -367,7 +370,7 @@ mvn -q compile exec:java -Dexec.mainClass=ResolveModel</pre>
             <dt>你会看到</dt>
             <dd>启动即抛 <code>IllegalArgumentException</code>，消息里夹着 7~8 行 Possible causes。</dd>
             <dt>因为</dt>
-            <dd>classpath 上没有任何 provider 认领这个 id：要么模型扩展没引，要么 id 拼错（比如写成 <code>dashscope:qwen_plus</code>）。</dd>
+            <dd>classpath 上没有任何 provider 认领这个 id：要么模型扩展没引，要么 id 不在 provider 的匹配模式里（比如只写 <code>qwen-plus</code>，或写成 <code>unknown:qwen-plus</code>）。注意 <code>dashscope:qwen_plus</code> 仍会被 <code>dashscope:.+</code> 匹配，能解析但会在服务端失败。</dd>
             <dt>改成</dt>
             <dd>先跑第 2 步的 <code>canResolve</code> 打印 <code>false</code> 就说明是依赖问题；依赖没问题再核对 id 大小写与连字符。</dd>
             <dt>延伸</dt>

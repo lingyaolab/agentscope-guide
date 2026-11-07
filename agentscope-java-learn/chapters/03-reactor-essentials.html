@@ -306,20 +306,20 @@ run.cancel();</pre>
               <tr>
                 <td>立即取消（订阅前也行）</td>
                 <td><code>run.cancel()</code></td>
-                <td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RunControl.java:69">RunControl.java:69</span></td>
+                <td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/AgentRun.java:128">AgentRun.java:128</span></td>
               </tr>
               <tr>
                 <td>在检查点协作式中断（会带恢复消息）</td>
                 <td><code>agent.interrupt(target)</code> / <code>agent.interrupt(target, msg)</code></td>
-                <td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RunControl.java:82">RunControl.java:82</span></td>
+                <td><span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:929">ReActAgent.java:929</span></td>
               </tr>
               <tr>
                 <td>查状态 / 等终态</td>
                 <td><code>run.status()</code>、<code>run.termination()</code></td>
                 <td>
-                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RunControl.java:44">RunControl.java:44</span>
+                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/AgentRun.java:113">AgentRun.java:113</span>
                   /
-                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/RunControl.java:119">RunControl.java:119</span>
+                  <span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/agent/AgentRun.java:123">AgentRun.java:123</span>
                 </td>
               </tr>
             </tbody>
@@ -364,7 +364,7 @@ run.cancel();</pre>
               </tr>
               <tr>
                 <td><code>block(Duration)</code></td>
-                <td>最多等这么久，超时返回 <code>null</code></td>
+                <td>最多等这么久；超时抛 <code>IllegalStateException</code>（cause 是 <code>TimeoutException</code>），不是返回 <code>null</code></td>
                 <td>命令行工具里防止挂死</td>
               </tr>
               <tr>

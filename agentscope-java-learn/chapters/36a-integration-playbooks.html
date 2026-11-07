@@ -190,6 +190,8 @@ NacosSkillRepository repo = new NacosSkillRepository(
     .buildSync();
 
 HigressToolkit toolkit = new HigressToolkit();
+toolkit.createToolGroup("knowledge", "知识库工具");
+
 toolkit.registration()
     .mcpClient(client)
     .enableTools(List.of("search-doc", "fetch-url"))
@@ -197,9 +199,10 @@ toolkit.registration()
     .apply();</pre>
         <p>
           工具搜索默认关闭；开启后 <code>listTools()</code> 会先调 <code>x_higress_tool_search</code>，
-          只返回相关工具，并把结果缓存到本地
+          只返回相关工具，并把结果缓存在 wrapper 里供 <code>getCachedTool</code> 使用
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressMcpClientWrapper.java:156-204">HigressMcpClientWrapper.java:156-204</span>。
-          <code>registerMcpClient</code> 返回 <code>Mono&lt;Void&gt;</code>，必须 <code>block()</code> 或组合，否则不会真正注册
+          <code>registerMcpClient</code> 返回 <code>Mono&lt;Void&gt;</code>；<code>registration().apply()</code>
+          内部会完成注册并等待结果
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-extensions-higress/src/main/java/io/agentscope/extensions/higress/HigressToolkit.java:99-120">HigressToolkit.java:99-120</span>。
         </p>
         <p>
@@ -334,7 +337,8 @@ runner.stop();</pre>
     enabled: true
     base-path: /v1/chat/completions</pre>
         <p>
-          Controller 用 <code>ObjectProvider&lt;ReActAgent&gt;</code> 每次取一个新的 prototype bean
+          Controller 用 <code>ObjectProvider&lt;ReActAgent&gt;</code> 取 Agent；核心 starter 默认提供的是
+          singleton bean，所以每次 <code>getObject()</code> 拿到的是同一个实例
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-chat-completions-web-starter/src/main/java/io/agentscope/spring/boot/chat/config/ChatCompletionsWebAutoConfiguration.java:36-37">ChatCompletionsWebAutoConfiguration.java:36-37</span>
           <span class="src" data-src="agentscope-java-2.0.4/agentscope-extensions/agentscope-spring-boot-starters/agentscope-chat-completions-web-starter/src/main/java/io/agentscope/spring/boot/chat/config/ChatCompletionsWebAutoConfiguration.java:139-148">:139-148</span>。
           自己写 Controller 时，核心适配器签名是
@@ -370,7 +374,7 @@ Flux&lt;ChatCompletionsChunk&gt; chunks = adapter.stream(
               <tr><td>XXL-Job</td><td>控制台出现 JobHandler</td><td>executor appname / admin 地址</td></tr>
               <tr><td>Studio</td><td>Studio 只出现一条最终消息</td><td>是否手动重复挂 Hook</td></tr>
               <tr><td>Training</td><td>只有标记样本进入反馈</td><td>策略、Context 标记、采样率</td></tr>
-              <tr><td>Chat Completions</td><td>SSE 以 <code>[DONE]</code> 结束</td><td>starter、prototype Agent bean</td></tr>
+              <tr><td>Chat Completions</td><td>SSE 以 <code>[DONE]</code> 结束</td><td>starter、agent bean 是否存在</td></tr>
             </tbody>
           </table>
         </div>

@@ -26,7 +26,7 @@
       <article class="article">
         <h1>附录 B · 报错速查：看到什么错，改什么地方</h1>
         <p class="lede">
-          这份表只收<strong>真的会挡住你</strong>的错：每一条都能在 2.0.4 源码里找到抛出点，错误文本和源码逐字一致。
+          这份表只收<strong>真的会挡住你</strong>的错：每一条都能在 2.0.4 源码里找到抛出点，错误文本与源码节选/前缀一致。
           顺序按「从写代码到跑起来」排：构建 → 权限 → 工具 → 状态 → 响应式 → 模型 HTTP。最后给一套三步定位法，
           遇到表里没有的错也能自己查。
         </p>
@@ -92,9 +92,11 @@
             <dt>你会看到</dt>
             <dd>构建阶段就失败，堆栈里是 <code>ModelRegistry.resolve</code>。</dd>
             <dt>因为</dt>
-            <dd><code>.model("")</code>、<code>.model("   ")</code>，或者把 null 传进了 <code>.model(String)</code> 的重载。</dd>
+            <dd><code>.model("")</code>、<code>.model("   ")</code> 会得到 <code>modelId must not be blank</code>；传 <code>null</code> 则先走
+            <code>Objects.requireNonNull</code>，抛 <code>NullPointerException: modelId</code>。</dd>
             <dt>改成</dt>
-            <dd>要么给一个合法的 id，要么干脆不写 <code>.model(...)</code>——但那样 <code>build()</code> 会因为缺少模型而失败，所以本质上必须给一个。</dd>
+            <dd>给一个合法的 id。完全不写 <code>.model(...)</code> 时 <code>build()</code> 仍能成功，但首次 <code>call()</code>
+            会因 <code>model == null</code> 抛 NPE，所以本质上仍必须给模型。</dd>
           </dl>
           <div class="pf-more">相关章节：<a href="../chapters/05-model.html#resolve">05 模型层 · 一个字符串怎么变成模型对象</a></div>
         </div>
@@ -233,7 +235,8 @@ Tip: capture the ToolUseBlocks from the RequireUserConfirmEvent emitted when the
           <div class="pf-h">13. 工具抛异常，模型收到一串 <code>InvocationTargetException</code></div>
           <dl>
             <dt>你会看到</dt>
-            <dd><code>ToolResultState.ERROR</code>，结果文本里是反射包装后的异常，模型看不懂、也无法自救。</dd>
+            <dd><code>ToolResultState.ERROR</code>，结果文本是 <code>Tool execution failed: &lt;cause message&gt;</code>；
+            框架会解包 <code>InvocationTargetException</code>，通常不含反射类名。</dd>
             <dt>因为</dt>
             <dd>工具方法声明了 <code>throws</code> 并真的抛了受检异常，框架用反射调用后包装了一层。</dd>
             <dt>改成</dt>
@@ -250,8 +253,9 @@ Tip: capture the ToolUseBlocks from the RequireUserConfirmEvent emitted when the
             <dt>你会看到</dt>
             <dd>堆栈指向 <code>JsonFileAgentStateStore</code> 或 <code>InMemoryAgentStateStore</code>。</dd>
             <dt>因为</dt>
-            <dd>调用时既没给 <code>RuntimeContext</code> 的 <code>sessionId</code>，builder 里也没配 <code>defaultSessionId</code>。
-            注意 <code>stateStore</code> 一定要有会话坐标才存得下去。</dd>
+            <dd>调用时既没给 <code>RuntimeContext</code> 的 <code>sessionId</code>，builder 里也没配 <code>defaultSessionId</code>；
+            此时会回退到 <code>name</code>，再回退到 <code>"ReActAgent"</code>，通常不会空白。只有显式 <code>name("")</code>
+            或直接调 <code>getAgentState(userId, null)</code> 这类路径才会触发。</dd>
             <dt>改成</dt>
             <dd>给一个稳定的 id：<code>RuntimeContext.builder().userId("local").sessionId("cli").build()</code>，
             或者在 builder 上 <code>.defaultSessionId("cli")</code>。</dd>
@@ -318,7 +322,7 @@ Tip: capture the ToolUseBlocks from the RequireUserConfirmEvent emitted when the
           <div class="pf-h">19. <code>TimeoutException: Did not observe any item or terminal signal within 300000ms</code></div>
           <dl>
             <dt>你会看到</dt>
-            <dd>一次调用卡 5 分钟后失败，重试 3 次还是一样。</dd>
+            <dd>一次调用卡 5 分钟后失败，共 3 次尝试（1 次首发 + 2 次重试）还是一样。</dd>
             <dt>因为</dt>
             <dd>模型默认的 <code>ExecutionConfig</code> 是「5 分钟超时 + 3 次尝试」，工具是「5 分钟 + 1 次」。超时被算作可重试错误，所以你会看到三次。</dd>
             <dt>改成</dt>
@@ -370,7 +374,7 @@ Tip: capture the ToolUseBlocks from the RequireUserConfirmEvent emitted when the
           <div class="pf-h">23. HTTP 429 或 5xx</div>
           <dl>
             <dt>你会看到</dt>
-            <dd>重试 3 次后失败，错误里带状态码；日志里能看到退避间隔从 2 秒涨到 30 秒。</dd>
+            <dd>共 3 次尝试（1 次首发 + 2 次重试）后失败，错误里带状态码；日志里能看到退避间隔从 2 秒涨到 30 秒。</dd>
             <dt>因为</dt>
             <dd>限流或服务端抖动，都属于<strong>可重试</strong>错误。</dd>
             <dt>改成</dt>

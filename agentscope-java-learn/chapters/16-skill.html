@@ -121,7 +121,7 @@ description: 当用户要求代码评审、风格反馈或 PR 审核时使用。
           两个容易忽略的点：
         </p>
         <ul>
-          <li><strong>技能的身份不是 name，而是 <code>skillId</code></strong>。它由 <code>getName() + "_" + getSource()</code> 拼成<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/skill/AgentSkill.java:263-269">AgentSkill.java:263-269</span>。同一个 <code>code-reviewer</code> 从 Git 市场来是 <code>code-reviewer_git</code>，从工作区来是 <code>code-reviewer_workspace-namespaced</code>，两者可以共存。所以调用工具时第一个参数是 <code>skillId</code>，不是目录名。</li>
+          <li><strong>技能的身份不是 name，而是 <code>skillId</code></strong>。它由 <code>getName() + "_" + getSource()</code> 拼成<span class="src" data-src="agentscope-core/src/main/java/io/agentscope/core/skill/AgentSkill.java:263-269">AgentSkill.java:263-269</span>。同一个 <code>code-reviewer</code> 从 Git 仓库来是 <code>code-reviewer_git-owner/repo</code>，从工作区来是 <code>code-reviewer_workspace-namespaced</code>；但目录按 name 合并，同名技能不会共存，高优先级仓库会覆盖低优先级。调用工具时第一个参数是最终的 <code>skillId</code>，不是目录名。</li>
           <li><strong>正文里只写相对路径</strong>。绝对路径在沙箱里会失效；框架会为每个技能算出自己的 <code>&lt;files-root&gt;</code>，模型用这个前缀拼 shell 命令。</li>
         </ul>
 
@@ -995,7 +995,7 @@ description: 当用户要求代码评审、风格反馈或 PR 审核时使用。
           <div class="pf-h">1. SKILL.md 写了，模型却完全看不到</div>
           <dl>
             <dt>你会看到</dt>
-            <dd><code>&lt;available_skills&gt;</code> 里没有这个技能，也没有任何异常；只有 DEBUG 日志里一行 <code>Failed to load skill from ...</code>。</dd>
+            <dd><code>&lt;available_skills&gt;</code> 里没有这个技能，也没有任何异常；只有 WARN 日志里一行 <code>Failed to load skill from ...</code>。</dd>
             <dt>因为</dt>
             <dd>单个技能解析失败会被 catch 后跳过，不阻断整批<span class="src" data-src="agentscope-harness/src/main/java/io/agentscope/harness/agent/skill/WorkspaceSkillRepository.java:172-184">:172-184</span>。常见原因：缺 <code>description</code>、正文为空、文件放在了 <code>_drafts/</code> 或 <code>.archive/</code> 下被元数据过滤掉。</dd>
             <dt>改成</dt>

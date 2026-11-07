@@ -205,7 +205,7 @@ public class HitlDemo {
               <tr><td><code>ACCEPT_EDITS</code></td><td><strong>只放行 <code>isReadOnly()==true</code> 的工具</strong>，其余继续走规则 → 默认仍然是 <code>ASK</code></td><td>想减少只读确认的编码场景（别指望它自动允许写入）</td></tr>
               <tr><td><code>EXPLORE</code></td><td><code>isReadOnly()==true</code> → 放行；<strong>否则直接 DENY</strong>，连 allow 规则都不看</td><td>代码探索、只读分析</td></tr>
               <tr><td><code>BYPASS</code></td><td>规则与工具自检之后仍然没有结论时，一律放行</td><td>完全可信的沙箱；<strong>不是</strong>「关掉权限系统」</td></tr>
-              <tr><td><code>DONT_ASK</code></td><td>把本该 <code>ASK</code> 的结果降级成 <code>DENY</code></td><td>无人值守、CI、定时任务</td></tr>
+              <tr><td><code>DONT_ASK</code></td><td>只把<strong>默认 ASK</strong> 降级成 <code>DENY</code>；显式 <code>addAskRule(...)</code> 命中的 ASK 与工具自检的 safety ASK 仍会暂停</td><td>无人值守、CI、定时任务</td></tr>
             </tbody>
           </table>
         </div>
@@ -253,7 +253,7 @@ public class HitlDemo {
         <p>
           <code>PermissionContextState</code> 有一个 <code>isTrivial()</code>：<strong>模式是 DEFAULT、没有工作目录、
           三张规则表全空</strong>时为 <code>true</code>。此时 agent 不走完整的 <code>PermissionEngine</code>，而是退回轻量路径——
-          只调工具的 <code>checkPermissions()</code>，返回 ASK 才拦，其余的 <code>PASSTHROUGH</code> 直接放行<span
+          只调工具的 <code>checkPermissions()</code>，返回 ASK 或 DENY 都会拦，只有 <code>PASSTHROUGH</code>/<code>ALLOW</code> 直接放行<span
             class="src"
             data-src="agentscope-core/src/main/java/io/agentscope/core/ReActAgent.java:3336"
             >ReActAgent.java:3336</span
@@ -698,7 +698,7 @@ agent.replacePermissionContext("alice", "s-001", next);</pre>
               <tr><td>某个工具每次都要人确认</td><td><code>addAskRule(...ASK...)</code>；注意它会盖过 allow 规则</td></tr>
               <tr><td>常用工具免确认</td><td><code>addAllowRule(...ALLOW...)</code>，但要接受「工具自检 DENY 仍然优先」</td></tr>
               <tr><td>整个会话只读</td><td><code>setPermissionMode(ctx, EXPLORE)</code>，并给只读工具标 <code>readOnly = true</code></td></tr>
-              <tr><td>无人值守跑批</td><td><code>DONT_ASK</code>：本该问人的一律变 DENY，<strong>不会卡住</strong></td></tr>
+              <tr><td>无人值守跑批</td><td><code>DONT_ASK</code>：只把默认 ASK 降级成 DENY；显式 <code>addAskRule</code> 命中的仍会暂停</td></tr>
               <tr><td>只放行某些路径</td><td><code>ruleContent</code> + 工具里重写 <code>matchRule</code>（默认只认 <code>null</code>）</td></tr>
               <tr><td>读完就走的临时提权</td><td><code>setPermissionMode(..., BYPASS)</code>，用完立刻切回 <code>DEFAULT</code></td></tr>
               <tr><td>把确认结果做成前端卡片</td><td>订阅 <code>RequireUserConfirmEvent</code>，拿 <code>getToolCalls()</code> 渲染</td></tr>

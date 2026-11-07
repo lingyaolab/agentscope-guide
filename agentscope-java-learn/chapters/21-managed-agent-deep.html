@@ -446,7 +446,8 @@
             class="src"
             data-src="agentscope-service/aistio/internal/product/handlers_env.go:245-266"
             >handlers_env.go:245-266</span
-          >。这与第 20 章 Endpoint 的 <code>asep_</code> key 是同一套设计：平台只回显一次，之后只说「前缀 + 哈希」。
+          >。注意不要把它和 Endpoint 的 <code>asep_</code> key 混为一谈：<code>ek_</code> 创建时只回显一次并只存哈希；
+          <code>asep_</code> 存的是 AES-GCM 密文，授权后还能通过 reveal 接口再次查看；<code>asreg_</code> 才是一次性注册凭据。
         </p>
         <p>Worker 侧启动命令不长，关键在三处参数：key、Gateway 地址、工作目录<span class="src" data-src="docs/v2/zh/service/environments.md:84-94">environments.md:84-94</span>：</p>
         <pre data-lang="bash" data-file="service environments（节选）">docker run --rm \
@@ -895,7 +896,8 @@ static Map&lt;String, String&gt; sharedKnowledgeAccess(List&lt;String&gt; memory
           <span class="src" data-src="docs/v2/zh/service/environments.md:61">environments.md:61</span>。现象是文件工具正常、命令工具永远拿不到结果。
         </p>
         <p>
-          <strong>坑五：把 Environment 的 <code>ek_</code> key 当 Endpoint 的 key。</strong>两者都是平台凭据、都只回显一次，但用途完全不同：
+          <strong>坑五：把 Environment 的 <code>ek_</code> key 当 Endpoint 的 key。</strong>两者都是平台凭据，但生命周期不同：
+          <code>ek_</code> 只回显一次，<code>asep_</code> 可授权再次 reveal；用途也完全不同：
           <code>ek_</code> 是 Worker 连 Gateway 的环境凭据，<code>asep_</code> 才是调用 Endpoint 的凭据。现象是 401，而且换多少次 key 都没用——
           因为你在拿错的凭据打错的接口。
         </p>
