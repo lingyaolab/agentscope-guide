@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="AgentScope Java 2.0.4 教程各章动手练习的参考实现与检查点：装配、Agent、Reactor、消息事件、模型、工具、状态、权限、中间件、Harness、工作区、沙箱、子 Agent、压缩、技能、计划模式、网关、Service、协议、渠道、存储、RAG、基础设施与生产化。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="AgentScope Java 2.0.4 学习站" />
+    <meta property="og:title" content="G 动手练习答案：每章做完怎么对照 · AgentScope Java 2.0.4 学习站" />
+    <meta property="og:description" content="各章练习的参考实现与检查点。" />
+    <title>G 动手练习答案：每章做完怎么对照 · AgentScope Java 2.0.4 学习站</title>
+    <script>
+      try {
+        var t = localStorage.getItem("as-learn-theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
+    <link rel="stylesheet" href="../assets/base.css" />
+    <link rel="stylesheet" href="../assets/diagrams.css" />
+  </head>
+  <body data-page="exercises" data-root="..">
+    <main>
+      <article class="article">
+        <h1>附录 G · 动手练习答案</h1>
+        <p class="lede">
+          这不是唯一答案，而是「参考做法 + 检查点」。同一道练习可以有不同的实现，
+          重点是你能不能解释每一步为什么这样做、失败时该看哪里。建议先自己写，再对照。
+        </p>
+
+        <h2 id="how">怎么用这份答案</h2>
+        <ul class="goals">
+          <li>先跑通自己的版本，再对照参考做法，不要直接抄。</li>
+          <li>重点看「检查点」：它们比代码更能说明你有没有理解。</li>
+          <li>如果代码能跑但检查点答不上来，回到对应章节重读。</li>
+        </ul>
+
+        <h2 id="ch01-04">第 01–04 章：装配、第一个 Agent、Reactor 与消息事件</h2>
+        <p>
+          01 的三个观察可以放在同一个工程里：先加模块看 <code>canResolve</code>，
+          再写错模型名看「解析成功、调用失败」，最后去掉 key 看两层异常。
+        </p>
+        <pre data-lang="java" data-file="模型解析">ModelRegistry.resolve("dashscope:qwen-plus");
+// 前缀能匹配不等于服务端有这个模型；key 缺失时异常在 resolve 之后才出现</pre>
+        <pre data-lang="java" data-file="流式事件">agent.streamEvents(msg, ctx)
+        .doOnNext(event -&gt; {
+            if (event instanceof TextBlockDeltaEvent delta) {
+                System.out.print(delta.getDelta());
+            }
+        })
+        .blockLast();</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li><code>canResolve</code> 只做前缀/注册表匹配；<code>dashscope:qwen-not-exist</code> 仍可能返回 true，真正报错在服务端。</li>
+          <li>缺 key 的异常是两层：外层 <code>Failed to create model for id</code>，内层才是环境变量缺失；先看 <code>getCause()</code>。</li>
+          <li>02 的记忆来自磁盘状态，不是进程内存；换一个 <code>sessionId</code> 就应该「失忆」。</li>
+          <li>工作区里的 <code>AGENTS.md</code> 会参与系统提示拼装；写完要重跑，不是热更新。</li>
+          <li>03 的两种「没输出」不同：没有订阅（没有 <code>blockLast</code>）与没有副作用（没有 <code>doOnNext</code>）。</li>
+          <li>04 的事件普查里，带工具的问题会让 <code>MODEL_CALL_START</code> 从 1 变 2；首字延迟看第一个 <code>TextBlockDeltaEvent</code>。</li>
+        </ul>
+
+        <h2 id="ch05-08">第 05–08 章：模型、工具、状态与权限</h2>
+        <p>
+          05 的关键是分清「字符串 id 的缓存」与「自己 builder 的新实例」；
+          07 的关键是看清 <code>agent_state.json</code> 里到底存了什么。
+        </p>
+        <pre data-lang="java" data-file="状态落盘">AgentStateStore store = new JsonFileAgentStateStore(Path.of("state"));
+// 跑一轮后打开 state/&lt;uid&gt;/&lt;sid&gt;/agent_state.json
+// 对照 context、tool_context 与 summary 三段</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li><code>ModelRegistry.resolve</code> 连续两次返回同一对象；自己 <code>builder()</code> 每次都新建。</li>
+          <li>无效 key + <code>maxRetries(2)</code> 如果「立刻失败」，说明是鉴权错误，不是可重试错误。</li>
+          <li>工具方法里不带 <code>@ToolParam</code> 的参数不会进 schema，运行时值是 <code>null</code>。</li>
+          <li>两个类注册同名 <code>@Tool(name="search")</code> 会静默覆盖，没有警告；多 MCP server 必须加前缀。</li>
+          <li><code>ToolGroup(active=false)</code> 要等模型调用 <code>reset_equipped_tools</code> 后才可见。</li>
+          <li>不传 <code>sessionId</code> 会落到 <code>__anon__</code> 桶；不同 <code>userId</code> 仍隔离，去掉 <code>userId</code> 才会串号。</li>
+          <li><code>clearContext(uid, sid)</code> 清对话但保留工具组与 todo；换 <code>sessionId</code> 则是全新会话。</li>
+          <li>拒绝是一次正常工具结果，不是异常；带理由的拒绝会让模型换方案。</li>
+          <li>确认时附带的 <code>PermissionRule</code> 只在当前会话内存里；<code>setPermissionMode</code> 重建引擎后规则消失。</li>
+          <li><code>EXPLORE</code> 对非只读工具直接 DENY；<code>BYPASS</code> 也不会绕过工具自检的 DENY。</li>
+        </ul>
+
+        <h2 id="ch09-11">第 09–11 章：中间件、ReAct vs Harness 与综合案例</h2>
+        <p>
+          09 的「总账」中间件只做观察：<code>order()</code> 越小越靠外，
+          用 <code>doFinally</code> 统计算子耗时，用事件类型统计模型调用次数。
+        </p>
+        <pre data-lang="java" data-file="总账中间件">public int order() {
+    return 10;
+}
+
+// onAgent 里挂 doFinally，统计整次 call 的耗时与 ModelCallEndEvent 数
+// maxIters=1 时，触顶后还会多一次摘要调用，所以事件数比预期多 1</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li>预算守卫返回 <code>MIDDLEWARE_STOP_REQUESTED</code>；计数存在 <code>RuntimeContext</code> 里，换 ctx 才会重置。</li>
+          <li><code>StopOnAllDeniedMiddleware</code> 只在「全部工具被拒」时触发；只拒一部分不会触发 <code>AllToolsDeniedEvent</code>。</li>
+          <li>10 章触顶时：正常推理 2 次、<code>ExceedMaxItersEvent</code> 1 次、摘要调用 1 次；摘要不经过 <code>onReasoning</code>。</li>
+          <li>无参 <code>interrupt()</code> 已废弃，原因是无法指定上下文；用带 <code>RuntimeContext</code> 的重载。</li>
+          <li>11 章的综合案例把工具、状态、权限、流式四块接缝都跑了一遍；先跑通再换 Harness。</li>
+          <li>11 章的只读工具在 <code>DEFAULT</code> 下直接执行；切到 <code>EXPLORE</code> 后它仍能跑，<code>delete_note</code> 则从 ASK 变成直接拒绝。</li>
+          <li>「本会话免问」的规则存在会话槽位里；<code>/new</code> 之后会恢复询问。</li>
+        </ul>
+
+        <h2 id="ch12-15">第 12–15 章：工作区、沙箱、子 Agent 与压缩</h2>
+        <p>
+          12 的 namespace 真相：宿主侧有 <code>alice/</code>、<code>bob/</code> 两层，
+          模型侧只看到自己的桶；<code>workspaceFor</code> 返回的是带身份的文件系统视图。
+        </p>
+        <pre data-lang="java" data-file="工作区视角">var ws = agent.workspaceFor("alice", "alice-s1");
+ws.getFilesystem().ls(RuntimeContext.empty(), "/");
+// 即便传 empty，BakedContextFilesystem 仍会把 alice 的身份盖回去</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li>overlay 的读是并集、写是单层；第一次 edit 会把文件复制到 workspace 上层。</li>
+          <li>空 <code>AGENTS.md</code> 不算「不存在」，回落只发生在读出空串那一支。</li>
+          <li><code>maxContextTokens</code> 只截 <code>MEMORY.md</code> 那一段，不截 <code>AGENTS.md</code> 与 knowledge。</li>
+          <li>13 章默认没有快照；<code>docker rm -f</code> 后重建容器，文件就没了。加 <code>snapshotSpec</code> 才会恢复。</li>
+          <li><code>SESSION</code> / <code>USER</code> / <code>AGENT</code> / <code>GLOBAL</code> 四种 scope 对应 3 / 2 / 1 / 1 个容器。</li>
+          <li>workspace spec 由 applier 写宿主，投影才进容器；<code>timeout=0</code> 仍会按 30 秒被杀。</li>
+          <li>14 章 <code>workspace.mode: shared</code> 的子 Agent 不新建目录，直接用主工作区。</li>
+          <li>任务记录在 <code>&lt;workspace&gt;/agents/&lt;name&gt;/tasks/&lt;sessionId&gt;.json</code>，重启后仍可读。</li>
+          <li>15 章 prune 在压缩之前；日志顺序是先 <code>Pruned ...</code> 再 <code>Compaction triggered</code>。</li>
+          <li><code>reserved(100_000)</code> 配 32K 模型会被 clamp；逐出与压缩可以独立关闭。</li>
+        </ul>
+
+        <h2 id="ch16-18">第 16–18 章：技能、计划模式与网关</h2>
+        <p>
+          16 的技能 ID 与 files-root 都能从 DEBUG 日志里抄出来；
+          <code>skill_manage</code> 创建的文件先落在草稿区，下一轮 prompt 里看不到。
+        </p>
+        <pre data-lang="java" data-file="技能晋升">agent.promoteSkill(name, "me", ctx).block();
+// 默认闸门返回 deferred，目录仍在 skills/_drafts/
+// 自定义 gate 返回 Approve 后才会 move 到 skills/&lt;name&gt;/</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li>四层技能合并按 namespaced upper → project → workspace → overlay；同名时 alice 的覆盖共用版。</li>
+          <li>curator 只归档不删除；<code>.curator_reports</code> 里没有 LLM 结论，只有前缀聚类与空的 consolidations。</li>
+          <li>17 章 plan 模式的拦截发生在 <code>onActing</code>；被拒的调用会合成一条 DENIED 工具结果。</li>
+          <li><code>allowShellInPlanMode</code> 只放行 <code>execute</code>，并追加一段 system-reminder。</li>
+          <li><code>tools.json</code> 的 allow/deny 与平台默认名单交叉；拼错的名字只会在日志里 warn 一次。</li>
+          <li>未声明 <code>readOnlyHint</code> 的 MCP 工具在 plan 阶段默认非只读，会被 DENIED。</li>
+          <li>18 章 <code>previewRoute</code> 能提前看到 <code>canonicalKey</code>、<code>agentId</code> 与 <code>matchedBy</code>。</li>
+          <li><code>extra</code> 里的 traceId 会打散会话；要保留记忆就放 <code>RuntimeContext</code>。</li>
+          <li>异步工具超时先返回占位结果；成功会回灌 <code>HintBlockEvent</code>，失败只有 warn，没有唤醒。</li>
+        </ul>
+
+        <h2 id="ch19-21">第 19–21 章：Service 入门、Endpoint/SSE 与 Managed Agent</h2>
+        <p>
+          19 先验证端口映射与「restart 不重建」这两件事：宿主 18080 映射到容器 8080，
+          改 <code>GATEWAY_PORT</code> 后只 restart 不会生效，必须 <code>up -d --wait</code>。
+        </p>
+        <pre data-lang="bash" data-file="起站验收">docker compose ps
+curl http://localhost:18080/actuator/health
+docker compose port gateway 8080
+docker compose up -d --wait</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li><code>restart</code> 只重启容器，不重新读取 <code>.env</code>；改端口要重建。</li>
+          <li>容器端口与宿主端口可以不同；改端口后 <code>BUILDER_OAUTH_PUBLIC_URL</code> 也要跟着改。</li>
+          <li>20 章一条 job 要保存 <code>invocationId</code>、<code>statusUrl</code>、<code>eventsUrl</code> 与凭据四个值。</li>
+          <li>SSE 断线用最后一条事件 <code>id</code> 作为 <code>Last-Event-ID</code> 续传，不需要重新提交 job。</li>
+          <li>同一个 <code>Idempotency-Key</code> 重发返回同一个 invocation；输入变化后重发才是 409。</li>
+          <li>21 章按「模型 → Instructions/迭代上限 → Workspace/Environment → Memory → Vault」逐层加，一次只改一层。</li>
+          <li>Memory 是按需读取，不是自动塞进上下文；要从工具记录里确认 <code>memory_store_read</code>。</li>
+          <li>Vault 变量必须在 MCP header 里显式引用；配了 Vault 不会自动替代模型 provider 的连接配置。</li>
+        </ul>
+
+        <h2 id="ch22-23">第 22–23 章：External Agent 与 Hosted Agent</h2>
+        <p>
+          22 的验收顺序是「先合约、再注册、再会话、最后任务」；
+          23 的顺序是「先 provider 自己跑、再 connect、再创建 Agent、最后派 Issue」。
+        </p>
+        <pre data-lang="text" data-file="身份三件套">agentId      → 同一个 Agent
+bindingId    → 同一个注册绑定
+instanceId   → 同一个进程实例
+generation   → 每次重启递增</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li>不注册时，<code>/agentscope/health</code> 与 <code>/agentscope/info</code> 仍可访问，但目录里没有卡片。</li>
+          <li>重启保持 <code>instanceKey</code> 不变：<code>agentId</code> / <code>bindingId</code> 不变，<code>generation</code> 变化。</li>
+          <li>扩副本只改 <code>instanceKey</code>：同一个 Agent 下多一个实例，不是多一个 Agent。</li>
+          <li>23 章 Host 离线约 45 秒后标 offline；期间提交的 Issue 保持 queued。</li>
+          <li>容量降到 1 时第二个任务排队；drain 后不再领取新任务，resume 恢复。</li>
+          <li>能力不被 provider 支持时，会在 provider 启动前以能力错误结束，不会跑到一半才失败。</li>
+        </ul>
+
+        <h2 id="ch24-26">第 24–26 章：团队、工作流与生产运维</h2>
+        <p>
+          24 的团队练习先单独验证三个 Agent，再建队；重点是「Leader 按需委派」，
+          不是一次叫齐所有人。
+        </p>
+        <pre data-lang="text" data-file="四种「完成」">Run succeeded   ≠ Task succeeded
+Task succeeded  ≠ Issue done
+Execution 完成  ≠ 验收通过
+Inbox 读到消息  ≠ 做出决策</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li>成员被禁用时 Team 变 Degraded；恢复后回到 Ready。</li>
+          <li><code>maxChildIssues=1</code> 时创建第二个子 Issue 会得到预算错误。</li>
+          <li>根 Issue 进入 <code>in_review</code> 不等于完成，还要在 Inbox 接受。</li>
+          <li>25 章先故意留一个未知边引用，确认发布校验会失败；修复后才能发布 revision。</li>
+          <li>Workflow 的 <code>draft</code> 可改，<code>revision</code> 不可变；新启动可以继续选旧 revision。</li>
+          <li>审批先拒绝一次，确认节点失败并按 <code>fail_fast</code> 收敛；再用新幂等键 Rerun。</li>
+          <li>Acceptance 要求 artifact 但没上传时，Accept 会被阻断。</li>
+          <li>Webhook 同一幂等键两次，第二次是 duplicate；事件筛选不匹配则 delivery ignored。</li>
+          <li>26 章备份必须同批：数据库、两个卷、Secret 与版本号缺一不可。</li>
+          <li>恢复要在空库上做，用同批卷与密钥；恢复验收不是「Pod Ready」。</li>
+          <li>升级演练要记录 Chart 与镜像版本；故意用不存在的 tag 验证 ImagePullBackOff 与恢复时间。</li>
+        </ul>
+
+        <h2 id="ch27-29">第 27–29 章：扩展选型、模型 provider 与记忆接入</h2>
+        <p>
+          27 的产出不是「装了多少模块」，而是一份三行选型记录：
+          接口选了什么、后端为什么是它、部署形态还缺什么。
+        </p>
+        <pre data-lang="text" data-file="选型三行">接口：AgentStateStore / Knowledge / Channel / Model
+后端：JDBC / Redis / 外部平台，为什么
+部署：单机 / 多副本 / 托管，还缺什么</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li>先选接口层，再看后端；不要从「我想用 Redis」倒推架构。</li>
+          <li>加一个 provider artifact 后，用 <code>ModelRegistry.resolve</code> 跑最小调用；手写 builder 与 starter 只差装配。</li>
+          <li>换模型时 Agent 代码不变，变的是 id、artifact、凭证与能力开关。</li>
+          <li>28 章至少对比两家：工具调用、结构化输出、思考模式、流式四项能力逐项记录。</li>
+          <li>两个不同 apiKey context 解析同一个 id，不应复用同一个模型实例。</li>
+          <li>29 章先分三层：当前对话、长期偏好、任务结论；不要把三者都塞进长期记忆。</li>
+          <li>STATIC_CONTROL 与 AGENT_CONTROL 的差异是「自动记录/检索」还是「模型主动调工具」。</li>
+          <li>记忆注入是 <code>role=USER</code>、<code>name=long_term_memory</code>，追加在消息末尾。</li>
+          <li>记忆后端失败通常静默降级：Agent 仍回复，检索变空；要看日志而不是等报错。</li>
+        </ul>
+
+        <h2 id="ch30-32">第 30–32 章：分布式存储、Agent 状态与 RAG</h2>
+        <p>
+          30 先把「状态、文件 KV、快照、锁」四件东西分开画，再选后端；
+          31 先看一次 <code>agent_state.json</code> 的加载与写回，再谈 CAS。
+        </p>
+        <pre data-lang="java" data-file="两种 store">var redis = RedisDistributedStore.fromJedis(jedis);
+var jdbc = JdbcDistributedStore.create(dataSource);
+var state = new RedisAgentStateStore(jedis);</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li>OSS 适合大快照，但不做锁；多副本要把锁补到 Redis / JDBC / Mongo。</li>
+          <li>混合后端只要求「状态 + 基础 KV」在同一个 store，其余能力可以拆。</li>
+          <li>同一个 key 连续两次 <code>putIfVersion</code>：第一次成功，第二次失败；OSS 没有版本化。</li>
+          <li>31 章 Redis key 是 <code>agentscope:session:&lt;user&gt;/&lt;session&gt;:agent_state</code> 与 <code>_keys</code>。</li>
+          <li>第二轮回写拿第一轮版本做 CAS；冲突策略 OVERWRITE / FAIL / APPEND_MERGE 行为不同。</li>
+          <li>压缩轮不能用 APPEND_MERGE，因为它不是简单追加消息。</li>
+          <li>32 章先决定索引归谁：Simple 自建，还是百炼/Dify/HayStack/RAGFlow 托管。</li>
+          <li>GENERIC 模式把 <code>&lt;retrieved_knowledge&gt;</code> 注入消息末尾；AGENTIC 模式让模型主动调 <code>retrieve_knowledge</code>。</li>
+          <li>空结果时 Hook 会静默，工具会返回字符串；这是两种不同的失败形态。</li>
+          <li>不是所有后端都支持 <code>addDocuments</code>；写入前先确认能力。</li>
+        </ul>
+
+        <h2 id="ch33-35">第 33–35 章：协议、渠道与技能仓库</h2>
+        <p>
+          33 先列调用方，再选协议：浏览器聊天 UI 看 AG-UI，
+          CI/任务系统看 Agent Protocol，另一个 Agent 平台看 A2A。
+        </p>
+        <pre data-lang="text" data-file="协议选型">AG-UI            → 浏览器事件流 + HITL
+Agent Protocol   → /tasks 任务 API + 轮询/等待
+A2A              → AgentCard + 远端 Agent</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li>AG-UI 要确认 <code>RUN_STARTED</code> / <code>TEXT</code> / <code>RUN_FINISHED</code> 三类事件都到。</li>
+          <li>Agent Protocol 的 task 有 pending / running / success / error / cancelled 五态。</li>
+          <li>SSE 续传用 <code>from_seq</code> 或 <code>Last-Event-ID</code>；断线后补发范围要验证。</li>
+          <li>34 章 GitHub 渠道要同时验证验签、<code>comment.id</code> 去重、bot 自激过滤与回复 API。</li>
+          <li>peer id 是 <code>owner/repo#number</code>，不同线程会话独立。</li>
+          <li>多副本要把默认 JVM 内去重存储换成共享存储。</li>
+          <li>35 章 Git 仓库只读；<code>save</code> 返回 false，不会提交。</li>
+          <li>MySQL / PostgreSQL 仓库有两张表，删除技能要确认级联。</li>
+          <li><code>metadata_json</code> 有完整模式与兼容模式；旧表没有该列时要走兼容。</li>
+          <li>多仓库同名技能后注册的覆盖先注册的；<code>writeable=false</code> 时 save/delete 都返回 false。</li>
+        </ul>
+
+        <h2 id="ch36-36a">第 36 / 36A 章：基础设施与集成落地</h2>
+        <p>
+          36 的产出是一张边界图：请求入口、工具出口、状态存放、观测点，
+          分别标出「本进程」还是「外部服务」。
+        </p>
+        <pre data-lang="text" data-file="四个问题">谁触发：Scheduler / Webhook / Chat / CLI
+谁治理：Higress / Nacos / 自建网关
+谁观测：Studio / OTel / 日志
+谁兜底：Agent、网关，还是调用方</pre>
+        <p><strong>检查点：</strong></p>
+        <ul>
+          <li>Nacos A2A 注册的是 AgentCard 与端点，不是进程实例。</li>
+          <li>Nacos Prompt 的缓存键只有 <code>promptKey</code>；第二次换 version/label 仍返回旧值。</li>
+          <li>Nacos Skill 不传 <code>knownSkillNames</code> 时列表为空。</li>
+          <li>Higress 工具最终要进 <code>Toolkit</code> 才生效；网关只负责治理与转发。</li>
+          <li>Quartz 默认 <code>autoStart</code>，但默认调度模式 <code>NONE</code> 什么也不做。</li>
+          <li>XXL-Job 只注册 JobHandler，排程要在控制台做。</li>
+          <li>Studio 初始化会自动挂 Hook 与 Tracer；它推的是 PostCall 最终消息，不是每条 token。</li>
+          <li>Training 是影子流量，生产响应不等待影子 Agent；默认 10% 采样、300 秒 commit。</li>
+          <li>Chat Completions Web 只提供适配器，HTTP/SSE 路由由 starter 或自写 Controller 提供。</li>
+          <li>36A 每条链路只看一个硬指标：A2A 能解析、Higress 工具进 Toolkit、Scheduler 真触发、Studio 收到最终消息、Training 只采到该采的样本。</li>
+        </ul>
+
+        <h2 id="next">下一步</h2>
+        <p>
+          做完练习后，回到 <a href="../chapters/00-study-map.html">00 学习地图</a>
+          选一条主线做自己的项目；或者从 <a href="../chapters/11-capstone.html">11 综合案例</a>
+          开始，把 Notes Agent 换成你的业务。
+        </p>
+      </article>
+    </main>
+    <script src="../assets/nav.js"></script>
+    <script src="../assets/mini-highlight.js"></script>
+    <script src="../assets/site.js"></script>
+  </body>
+</html>

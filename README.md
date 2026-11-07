@@ -2,6 +2,8 @@
 
 这是学习站的源码仓库。站点本体在 [`agentscope-java-learn/`](agentscope-java-learn/)，可以直接当静态网站部署。
 
+**内容状态**：00–36 章 + 00A + 36A（含 5 个深挖子页）+ 附录 A–G，共 51 个内容页，对应站点版本 v1.2.0。
+
 - **本地看站**：双击 [`agentscope-java-learn/index.html`](agentscope-java-learn/index.html)，或在仓库根执行 `python -m http.server 8080` 后访问 <http://localhost:8080/agentscope-java-learn/>
 - **部署**：见 [DEPLOY.md](DEPLOY.md)（GitHub Pages / Vercel / Netlify / 自建服务器）
 - **更新记录**：见 [CHANGELOG.md](CHANGELOG.md)
@@ -15,7 +17,7 @@ agentscope-java-learn/     站点本体（发布时把这个目录作为站点�
 ├── 404.html               站内 404（自包含样式，任意深度可用）
 ├── robots.txt
 ├── chapters/              第 00–36 章 + 00A 信息流实验室 + 36A（含 5 个深挖子页）
-├── appendix/              附录 A–F
+├── appendix/              附录 A–G
 └── assets/                base.css / site.js / nav.js / search-index.js / favicon.svg
 
 tools/                     零依赖 Node 脚本
