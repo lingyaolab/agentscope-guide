@@ -2,6 +2,14 @@
 
 本站内容对应 **AgentScope Java 2.0.4**。日期为发布日，站点版本与框架版本分开记。
 
+## v1.3.0 — 2026-11-07
+
+新增可运行的 Java 配套示例。
+
+- `samples/`：AgentScope Java 2.0.4 + JDK 17 的 Maven 工程。
+- 包含 `OpenAIChatModel` + `ReActAgent` + `Toolkit`，以及离线工具 / `RuntimeContext` 测试。
+- `mvn test` 不需要 API Key；`mvn exec:java` 已用 DeepSeek 跑通带工具调用的 Agent。
+
 ## v1.2.0 — 2026-11-07
 
 新增附录 G「动手练习答案」。
